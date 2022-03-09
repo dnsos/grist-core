@@ -67,7 +67,7 @@ export const PREVIEWER_EMAIL = 'thumbnail@getgrist.com';
 const NON_LOGIN_EMAILS = [PREVIEWER_EMAIL, EVERYONE_EMAIL, ANONYMOUS_USER_EMAIL];
 
 // Name of a special workspace with examples in it.
-export const EXAMPLE_WORKSPACE_NAME = 'Examples & Templates';
+export const EXAMPLE_WORKSPACE_NAME = 'Beispiele & Templates';
 
 // A TTL in milliseconds for caching the result of looking up access level for a doc,
 // which is a burden under heavy traffic.

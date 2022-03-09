@@ -37,7 +37,7 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
       cssPageEntry(
         cssPageEntry.cls('-selected', (use) => use(home.currentPage) === "all"),
         cssPageLink(cssPageIcon('Home'),
-          cssLinkText('All Documents'),
+          cssLinkText('Alle Dokumente'),
           urlState().setLinkUrl({ws: undefined, homePage: undefined}),
           testId('dm-all-docs'),
         ),
@@ -97,14 +97,14 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
       cssTools(
         cssPageEntry(
           cssPageEntry.cls('-selected', (use) => use(home.currentPage) === "templates"),
-          cssPageLink(cssPageIcon('FieldTable'), cssLinkText("Examples & Templates"),
+          cssPageLink(cssPageIcon('FieldTable'), cssLinkText("Beispiele & Templates"),
             urlState().setLinkUrl({homePage: "templates"}),
             testId('dm-templates-page'),
           ),
         ),
         cssPageEntry(
           cssPageEntry.cls('-selected', (use) => use(home.currentPage) === "trash"),
-          cssPageLink(cssPageIcon('Remove'), cssLinkText("Trash"),
+          cssPageLink(cssPageIcon('Remove'), cssLinkText("Papierkorb"),
             urlState().setLinkUrl({homePage: "trash"}),
             testId('dm-trash'),
           ),
@@ -163,11 +163,11 @@ function addMenu(home: HomeModel, creating: Observable<boolean>): DomElementArg[
   const needUpgrade = home.app.currentFeatures.maxWorkspacesPerOrg === 1;
 
   return [
-    menuItem(() => createDocAndOpen(home), menuIcon('Page'), "Create Empty Document",
+    menuItem(() => createDocAndOpen(home), menuIcon('Page'), "Leeres Dokument erstellen",
       dom.cls('disabled', !home.newDocWorkspace.get()),
       testId("dm-new-doc")
     ),
-    menuItem(() => importDocAndOpen(home), menuIcon('Import'), "Import Document",
+    menuItem(() => importDocAndOpen(home), menuIcon('Import'), "Dokument importieren",
       dom.cls('disabled', !home.newDocWorkspace.get()),
       testId("dm-import")
     ),

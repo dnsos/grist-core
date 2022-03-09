@@ -32,7 +32,7 @@ export class AccountWidget extends Disposable {
           cssUserIcon(createUserImage(user, 'medium', testId('user-icon')),
             menu(() => this._makeAccountMenu(user), {placement: 'bottom-end'}),
           ) :
-          cssSignInButton('Sign in', icon('Collapse'), testId('user-signin'),
+          cssSignInButton('Anmelden', icon('Collapse'), testId('user-signin'),
             menu(() => this._makeAccountMenu(user), {placement: 'bottom-end'}),
           )
         )
@@ -82,10 +82,10 @@ export class AccountWidget extends Disposable {
 
     if (!user) {
       return [
-        menuItemLink({href: getLoginOrSignupUrl()}, 'Sign in'),
+        menuItemLink({href: getLoginOrSignupUrl()}, 'Anmelden'),
         menuDivider(),
         documentSettingsItem,
-        menuItemLink({href: commonUrls.plans}, 'Pricing'),
+        //menuItemLink({href: commonUrls.plans}, 'Pricing'),
         mobileModeToggle,
       ];
     }

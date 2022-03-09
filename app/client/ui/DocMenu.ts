@@ -91,12 +91,12 @@ function createLoadedDocMenu(home: HomeModel) {
               null :
               css.docListHeader(
                 (
-                  page === 'all' ? 'All Documents' :
+                  page === 'all' ? 'Alle Dokumente' :
                   page === 'templates' ?
                     dom.domComputed(use => use(home.featuredTemplates).length > 0, (hasFeaturedTemplates) =>
-                      hasFeaturedTemplates ? 'More Examples & Templates' : 'Examples & Templates'
+                      hasFeaturedTemplates ? 'Mehr Beispiele & Templates' : 'Beispiele & Templates'
                   ) :
-                  page === 'trash' ? 'Trash' :
+                  page === 'trash' ? 'Papierkorb' :
                   workspace && [css.docHeaderIcon('Folder'), workspaceName(home.app, workspace)]
                 ),
                 testId('doc-header'),
@@ -111,9 +111,9 @@ function createLoadedDocMenu(home: HomeModel) {
                 ) :
               (page === 'trash') ?
                 dom('div',
-                  css.docBlock('Documents stay in Trash for 30 days, after which they get deleted permanently.'),
+                  css.docBlock('Dokumente bleiben für 30 Tage im Papierkorb. Danach werden sie automatisch gelöscht.'),
                   dom.maybe((use) => use(home.trashWorkspaces).length === 0, () =>
-                    css.docBlock('Trash is empty.')
+                    css.docBlock('Papierkorb ist leer.')
                   ),
                   buildAllDocsBlock(home, home.trashWorkspaces, false, flashDocId, viewSettings),
                 ) :
@@ -188,7 +188,7 @@ function buildAllDocsTemplates(home: HomeModel, viewSettings: ViewSettings) {
     return css.templatesDocBlock(
       dom.autoDispose(hideTemplatesObs),
       css.templatesHeader(
-        'Examples & Templates',
+        'Beispiele & Templates',
         dom.domComputed(hideTemplatesObs, (collapsed) =>
           collapsed ? css.templatesHeaderIcon('Expand') : css.templatesHeaderIcon('Collapse')
         ),

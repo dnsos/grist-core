@@ -13,7 +13,7 @@ export function buildHomeIntro(homeModel: HomeModel): DomContents {
   const user = homeModel.app.currentValidUser;
   if (user) {
     return [
-      css.docListHeader(`Welcome to Grist, ${user.name}!`, testId('welcome-title')),
+      css.docListHeader(`Willkommen bei Grist, ${user.name}!`, testId('welcome-title')),
       cssIntroSplit(
         cssIntroLeft(
           cssIntroImage({src: 'https://www.getgrist.com/themes/grist/assets/images/empty-folder.png'}),
@@ -21,10 +21,10 @@ export function buildHomeIntro(homeModel: HomeModel): DomContents {
         ),
         cssIntroRight(
           cssParagraph(
-            'Watch video on ',
-            cssLink({href: 'https://support.getgrist.com/creating-doc/', target: '_blank'}, 'creating a document'),
+            'Schaue das Video, wie man ',
+            cssLink({href: 'https://support.getgrist.com/creating-doc/', target: '_blank'}, 'ein Dokument erstellt'),
             '.', dom('br'),
-            'Learn more in our ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
+            'Finde weitere Infos im ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
             testId('welcome-text')
           ),
           makeCreateButtons(homeModel),
@@ -41,12 +41,12 @@ export function buildHomeIntro(homeModel: HomeModel): DomContents {
           testId('intro-image'),
         ),
         cssIntroRight(
-          css.docListHeader('Welcome to Grist!', testId('welcome-title')),
+          css.docListHeader('Willkommen bei Grist!', testId('welcome-title')),
           cssParagraph(
-            'You can explore and experiment without logging in. ',
-            'To save your work, however, you’ll need to ',
-            cssLink({href: getLoginOrSignupUrl()}, 'sign up'), '.', dom('br'),
-            'Learn more in our ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
+            'Dies ist eine Test-Instanz der Software Grist, adaptiert und bereitgestellt vom CityLAB Berlin. ',
+            'Um deine Arbeit zu speichern musst du dich aber ',
+            cssLink({href: getLoginOrSignupUrl()}, 'anmelden'), '.', dom('br'),
+            'Hier geht\'s zum ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
             testId('welcome-text')
           ),
           makeCreateButtons(homeModel),
@@ -58,10 +58,10 @@ export function buildHomeIntro(homeModel: HomeModel): DomContents {
 
 function makeCreateButtons(homeModel: HomeModel) {
   return cssBtnGroup(
-    cssBtn(cssBtnIcon('Import'), 'Import Document', testId('intro-import-doc'),
+    cssBtn(cssBtnIcon('Import'), 'Dokument importieren', testId('intro-import-doc'),
       dom.on('click', () => importDocAndOpen(homeModel)),
     ),
-    cssBtn(cssBtnIcon('Page'), 'Create Empty Document', testId('intro-create-doc'),
+    cssBtn(cssBtnIcon('Page'), 'Leeres Dokument erstellen', testId('intro-create-doc'),
       dom.on('click', () => createDocAndOpen(homeModel)),
     ),
   );

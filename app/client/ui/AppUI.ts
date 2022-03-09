@@ -84,8 +84,8 @@ function pagePanelsHome(owner: IDisposableOwner, appModel: AppModel, app: App) {
   // Set document title to strings like "Home - Grist" or "Org Name - Grist".
   owner.autoDispose(subscribe(pageModel.currentPage, pageModel.currentWS, (use, page, ws) => {
     const name = (
-      page === 'trash' ? 'Trash' :
-      page === 'templates' ? 'Examples & Templates' :
+      page === 'trash' ? 'Papierkorb' :
+      page === 'templates' ? 'Beispiele & Templates' :
       ws ? ws.name : appModel.currentOrgName
     );
     document.title = `${name} - Grist`;
