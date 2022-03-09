@@ -1,4 +1,18 @@
-# Grist
+# Grist @ CityLAB Berlin
+
+First, a note: I've had to make some changes for local development:
+
+1. Following the instructions in "Building from source" created a directory `/sandbox_venv3`. I've had to add this to the `.gitignore`
+2. For some reason the app crashed initially after following the installation instructions. After some digging I've found that `yarn add @gristlabs/sqlite3` resolved this. Don't ask me why.
+3. Building the app created two files `grist-sessions.db` and `landing.db`, starting it created several `*.grist` DB files. Presumably these should be added to the `.gitignore` as well.
+
+## Start development
+
+Use `npm run start` to setup a local dev server.
+
+_Original README below:_
+
+## Grist
 
 Grist is a modern relational spreadsheet. It combines the flexibility of a spreadsheet with the
 robustness of a database to organize your data and make you more productive.
