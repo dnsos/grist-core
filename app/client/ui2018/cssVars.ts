@@ -26,23 +26,23 @@ class CustomProp {
 }
 
 export const colors = {
-  lightGrey: new CustomProp('color-light-grey', '#F7F7F7'),
-  mediumGrey: new CustomProp('color-medium-grey', 'rgba(217,217,217,0.6)'),
-  mediumGreyOpaque: new CustomProp('color-medium-grey-opaque', '#E8E8E8'),
-  darkGrey: new CustomProp('color-dark-grey', '#D9D9D9'),
+  lightGrey: new CustomProp('color-light-grey', '#f5f5f7'),
+  mediumGrey: new CustomProp('color-medium-grey', '#d7d8df'),
+  mediumGreyOpaque: new CustomProp('color-medium-grey-opaque', '#b0b0bf'),
+  darkGrey: new CustomProp('color-dark-grey', '#616180'),
 
   light: new CustomProp('color-light', '#FFFFFF'),
-  dark: new CustomProp('color-dark', '#262633'),
-  darkBg: new CustomProp('color-dark-bg', '#262633'),
+  dark: new CustomProp('color-dark', '#2e2e4d'),
+  darkBg: new CustomProp('color-dark-bg', '#22233a'),
   slate: new CustomProp('color-slate', '#929299'),
 
-  lightGreen: new CustomProp('color-light-green', '#16B378'),
-  darkGreen: new CustomProp('color-dark-green', '#009058'),
-  darkerGreen: new CustomProp('color-darker-green', '#007548'),
-  lighterGreen: new CustomProp('color-lighter-green', '#b1ffe2'),
+  lightGreen: new CustomProp('color-light-green', '#f54c72'),
+  darkGreen: new CustomProp('color-dark-green', '#c53d5b'),
+  darkerGreen: new CustomProp('color-darker-green', '#942e44'),
+  lighterGreen: new CustomProp('color-lighter-green', '#f8708e'),
 
-  lighterBlue: new CustomProp('color-lighter-blue', '#87b2f9'),
-  lightBlue: new CustomProp('color-light-blue', '#3B82F6'),
+  lighterBlue: new CustomProp('color-lighter-blue', '#8282c7'),
+  lightBlue: new CustomProp('color-light-blue', '#5959b5'),
 
   cursor: new CustomProp('color-cursor', '#16B378'),   // cursor is lightGreen
   selection: new CustomProp('color-selection', 'rgba(22,179,120,0.15)'),
@@ -98,19 +98,19 @@ export const vars = {
   loosePadding:   new CustomProp('loose-padding',  '5px 15px'),
 
   /* Control colors and borders */
-  primaryBg:        new CustomProp('primary-fg', '#16B378'),
-  primaryBgHover:   new CustomProp('primary-fg-hover', '#009058'),
+  primaryBg:        new CustomProp('primary-fg', '#2f2fa2'),
+  primaryBgHover:   new CustomProp('primary-fg-hover', '#262682'),
   primaryFg:        new CustomProp('primary-bg', '#ffffff'),
 
   controlBg:      new CustomProp('control-bg', '#ffffff'),
-  controlFg:      new CustomProp('control-fg', '#16B378'),
-  controlFgHover: new CustomProp('primary-fg-hover', '#009058'),
+  controlFg:      new CustomProp('control-fg', '#f64c72'),
+  controlFgHover: new CustomProp('primary-fg-hover', '#c53d5b'),
 
-  controlBorder:        new CustomProp('control-border', '1px solid #11B683'),
-  controlBorderRadius:  new CustomProp('border-radius', '4px'),
+  controlBorder:        new CustomProp('control-border', '1px solid #f64c72'),
+  controlBorderRadius:  new CustomProp('border-radius', '0px'),
 
   logoBg: new CustomProp('logo-bg', '#040404'),
-  toastBg: new CustomProp('toast-bg', '#040404'),
+  toastBg: new CustomProp('toast-bg', '#eaeaf6'),
 };
 
 const cssColors = values(colors).map(v => v.decl()).join('\n');

@@ -22,7 +22,7 @@ export const cssAddNewButton = styled('div', `
   height: 40px;
   color: ${colors.light};
   border: none;
-  border-radius: 4px;
+  border-radius: 0px;
 
   cursor: default;
   text-align: left;

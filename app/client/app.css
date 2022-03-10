@@ -1,9 +1,9 @@
 /* global variables */
 :root {
-  --color-logo-row:  #F9AE41;
-  --color-logo-col:  #2CB0AF;
-  --color-logo-cell: #DEDDDD;
-  --color-logo-bg:   #42494B;
+  --color-logo-row: #2f2fa2;
+  --color-logo-col: #616180;
+  --color-logo-cell: #f5f5f7;
+  --color-logo-bg: #f54c72;
 
   --color-link-default: #336;
   --color-link-visited: #336;
@@ -169,7 +169,7 @@ div.dev_warning {
   display: none;
 }
 .browser-check-wrapper a {
-  color: #16B378;
+  color: #16b378;
   text-decoration: underline;
 }
 .browser-check-wrapper a:hover {
