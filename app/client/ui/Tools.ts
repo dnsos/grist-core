@@ -32,7 +32,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
   updateCanViewAccessRules();
   return cssTools(
     cssTools.cls('-collapsed', (use) => !use(leftPanelOpen)),
-    cssSectionHeader("TOOLS"),
+    cssSectionHeader("Werkzeuge"),
 
     cssPageEntry(
       cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'acl'),
@@ -40,7 +40,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       dom.domComputed(canViewAccessRules, (_canViewAccessRules) => {
         return cssPageLink(
           cssPageIcon('EyeShow'),
-          cssLinkText('Access Rules',
+          cssLinkText('Zugriffsregeln',
             menuAnnotate('Beta', cssBetaTag.cls(''))
           ),
           _canViewAccessRules ? urlState().setLinkUrl({docPage: 'acl'}) : null,
@@ -51,7 +51,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
     ),
 
     cssPageEntry(
-      cssPageLink(cssPageIcon('Log'), cssLinkText('Document History'), testId('log'),
+      cssPageLink(cssPageIcon('Log'), cssLinkText('Dokument-Historie'), testId('log'),
         dom.on('click', () => gristDoc.showTool('docHistory')))
     ),
     // TODO: polish validation and add it back
@@ -63,7 +63,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
     cssPageEntry(
       cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'code'),
       cssPageLink(cssPageIcon('Code'),
-        cssLinkText('Code View'),
+        cssLinkText('Code-Ansicht'),
         urlState().setLinkUrl({docPage: 'code'})
       ),
       testId('code'),

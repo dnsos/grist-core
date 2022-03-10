@@ -119,7 +119,7 @@ export async function createDocAndOpen(home: HomeModel) {
   const destWS = home.newDocWorkspace.get();
   if (!destWS) { return; }
   try {
-    const docId = await home.createDoc("Untitled document", destWS === "unsaved" ? "unsaved" : destWS.id);
+    const docId = await home.createDoc("Unbenanntes Dokument", destWS === "unsaved" ? "unsaved" : destWS.id);
     // Fetch doc information including urlId.
     // TODO: consider changing API to return same response as a GET when creating an
     // object, which is a semi-standard.

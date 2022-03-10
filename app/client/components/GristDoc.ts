@@ -805,7 +805,7 @@ export class GristDoc extends DisposableWithEvents {
   private _getToolContent(tool: typeof RightPanelTool.type): IExtraTool | null {
     switch (tool) {
       case 'docHistory': {
-        return {icon: 'Log', label: 'Document History', content: this._docHistory};
+        return {icon: 'Log', label: 'Dokument-Historie', content: this._docHistory};
       }
       case 'validations': {
         const content = this._rightPanelTabs.get("Validate Data");
