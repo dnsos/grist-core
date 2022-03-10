@@ -10,6 +10,16 @@ First, a note: I've had to make some changes for local development:
 
 Use `npm run start` to setup a local dev server.
 
+## Modifications of the original software
+
+> These notes are necessary in order to comply with the Apache License 2.0 whcih states that modifications of the original software must be documented.
+
+This fork of `grist-core` modifies the original software in the following ways:
+
+- UI text is changed (from English to German)
+- elements that are connected to the commercial Grist product are removed (such as links to the pricing page of Grist)
+- color and branding changes
+
 _Original README below:_
 
 ## Grist
