@@ -6,9 +6,9 @@ on:
     # workflow whenever tests pass on main - but events don't chain without using
     # personal access tokens so we just use a cron job.
     branches: [ latest_candidate ]
-  schedule:
+#   schedule:
     # Run at 5:41 UTC daily
-    - cron:  '41 5 * * *'
+#     - cron:  '41 5 * * *'
   workflow_dispatch:
 
 jobs:
