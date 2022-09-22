@@ -10,7 +10,7 @@ import {primaryButton} from 'app/client/ui2018/buttons';
 import {mediaDeviceNotSmall, testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {menu, menuDivider, menuItem, menuItemLink, menuSubHeader} from 'app/client/ui2018/menus';
-import {commonUrls, shouldHideUiElement} from 'app/common/gristUrls';
+import {shouldHideUiElement} from 'app/common/gristUrls';
 import {FullUser} from 'app/common/LoginSessionAPI';
 import * as roles from 'app/common/roles';
 import {Disposable, dom, DomElementArg, styled} from 'grainjs';
