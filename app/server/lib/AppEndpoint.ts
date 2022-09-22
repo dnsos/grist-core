@@ -19,7 +19,7 @@ import {DocStatus, IDocWorkerMap} from 'app/server/lib/DocWorkerMap';
 import {expressWrap} from 'app/server/lib/expressWrap';
 import {DocTemplate, GristServer} from 'app/server/lib/GristServer';
 import {getAssignmentId} from 'app/server/lib/idUtils';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {adaptServerUrl, addOrgToPathIfNeeded, pruneAPIResult, trustOrigin} from 'app/server/lib/requestUtils';
 import {ISendAppPageOptions} from 'app/server/lib/sendAppPage';
 
@@ -152,6 +152,13 @@ async function getWorker(docWorkerMap: IDocWorkerMap, assignmentId: string,
       }
       // This is a 404 with the expected content for a missing worker.
     } catch (e) {
+      log.rawDebug(`AppEndpoint.getWorker failure`, {
+        url: fullUrl,
+        docId: assignmentId,
+        status: e.status,
+        message: String(e),
+        workerId: docStatus.docWorker.id,
+      });
       // If workers are managed, no errors merit continuing except a 404.
       // Otherwise, we continue if we see a system error (e.g. ECONNREFUSED).
       // We don't accept timeouts since there is too much potential to

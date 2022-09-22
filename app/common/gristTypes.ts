@@ -56,6 +56,9 @@ export function getDefaultForType(colType: string, options: {sqlFormatted?: bool
  * object.
  */
 export function extractInfoFromColType(colType: string): GristTypeInfo {
+  if (colType === "Attachments") {
+    return {type: "RefList", tableId: "_grist_Attachments"};
+  }
   const colon = colType.indexOf(':');
   const [type, arg] = (colon === -1) ? [colType] : [colType.slice(0, colon), colType.slice(colon + 1)];
   return (type === 'Ref') ? {type, tableId: String(arg)} :
@@ -197,19 +200,7 @@ const rightType: {[key in GristType]: (value: CellValue) => boolean} = {
   ManualSortPos:  isNumber,
   Ref:            isNumber,
   RefList:        isListOrNull,
-  Choice:         (v: CellValue, options?: any) => {
-    // TODO widgets options should not be used outside of the client. They are an instance of
-    // modelUtil.jsonObservable, passed in by FieldBuilder.
-    if (v === '') {
-      // Accept empty-string values as valid
-      return true;
-    } else if (options) {
-      const choices = options().choices;
-      return Array.isArray(choices) && choices.includes(v);
-    } else {
-      return false;
-    }
-  },
+  Choice:         isString,
   ChoiceList:     isListOrNull,
 };
 
@@ -221,17 +212,6 @@ export function extractTypeFromColType(type: string): string {
   if (!type) { return type; }
   const colon = type.indexOf(':');
   return (colon === -1 ? type : type.slice(0, colon));
-}
-
-/**
- * Convert pureType to Grist python type name, e.g. 'Ref' to 'Reference'.
- */
-export function getGristType(pureType: string): string {
-  switch (pureType) {
-    case 'Ref': return 'Reference';
-    case 'RefList': return 'ReferenceList';
-    default: return pureType;
-  }
 }
 
 /**
@@ -331,13 +311,36 @@ export function sequelizeToGristType(sqlType: string): GristType {
 }
 
 export function getReferencedTableId(type: string) {
+  if (type === "Attachments") {
+    return "_grist_Attachments";
+  }
   return removePrefix(type, "Ref:") || removePrefix(type, "RefList:");
 }
 
 export function isRefListType(type: string) {
-  return type.startsWith('RefList:');
+  return type === "Attachments" || type?.startsWith('RefList:');
+}
+
+export function isListType(type: string) {
+  return type === "ChoiceList" || isRefListType(type);
+}
+
+export function isNumberType(type: string|undefined) {
+  return ['Numeric', 'Int'].includes(type || '');
+}
+
+export function isDateLikeType(type: string) {
+  return type === 'Date' || type.startsWith('DateTime');
 }
 
 export function isFullReferencingType(type: string) {
   return type.startsWith('Ref:') || isRefListType(type);
 }
+
+export function isValidRuleValue(value: CellValue|undefined) {
+  // We want to strictly test if a value is boolean, when the value is 0 or 1 it might
+  // indicate other number in the future.
+  return value === null || typeof value === 'boolean';
+}
+
+export type RefListValue = [GristObjCode.List, ...number[]]|null;

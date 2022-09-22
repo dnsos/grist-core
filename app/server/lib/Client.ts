@@ -1,25 +1,35 @@
 import {ApiError} from 'app/common/ApiError';
 import {BrowserSettings} from 'app/common/BrowserSettings';
+import {delay} from 'app/common/delay';
+import {CommClientConnect, CommMessage, CommResponse, CommResponseError} from 'app/common/CommTypes';
 import {ErrorWithCode} from 'app/common/ErrorWithCode';
 import {UserProfile} from 'app/common/LoginSessionAPI';
-import {getLoginState, LoginState} from 'app/common/LoginState';
 import {ANONYMOUS_USER_EMAIL} from 'app/common/UserAPI';
 import {User} from 'app/gen-server/entity/User';
 import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
 import {Authorizer} from 'app/server/lib/Authorizer';
 import {ScopedSession} from 'app/server/lib/BrowserSession';
+import type {Comm} from 'app/server/lib/Comm';
 import {DocSession} from 'app/server/lib/DocSession';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {LogMethods} from "app/server/lib/LogMethods";
 import {shortDesc} from 'app/server/lib/shortDesc';
+import {fromCallback} from 'app/server/lib/serverUtils';
 import * as crypto from 'crypto';
-import * as moment from 'moment';
+import moment from 'moment';
+import * as WebSocket from 'ws';
 
 /// How many messages to accumulate for a disconnected client before booting it.
 const clientMaxMissedMessages = 100;
 
-export type ClientMethod = (client: Client, ...args: any[]) => Promise<any>;
+export type ClientMethod = (client: Client, ...args: any[]) => Promise<unknown>;
+
+// How long the client state persists after a disconnect.
+const clientRemovalTimeoutMs = 300 * 1000;   // 300s = 5 minutes.
+
+// A hook for dependency injection.
+export const Deps = {clientRemovalTimeoutMs};
 
 /**
  * Generates and returns a random string to use as a clientId. This is better
@@ -42,9 +52,6 @@ function generateClientId(): string {
  */
 const MESSAGE_TYPES_NO_AUTH = new Set([
   'clientConnect',
-  'profileFetch',
-  'userSettings',
-  'clientLogout',
 ]);
 
 // tslint:disable-next-line:no-unused-expression Silence "unused variable" warning.
@@ -56,7 +63,7 @@ void(MESSAGE_TYPES_NO_AUTH);
  * TODO: this could provide a cleaner interface.
  *
  * @param comm: parent Comm object
- * @param websocket: websocket connection, promisified to have a sendAsync method
+ * @param websocket: websocket connection
  * @param methods: a mapping from method names to server methods (must return promises)
  */
 export class Client {
@@ -66,55 +73,48 @@ export class Client {
 
   private _session: ScopedSession|null = null;
 
-  private _log = new LogMethods('Client ', (s: null) => this.getLogMeta());
+  private _log = new LogMethods('Client ', (extra?: object|null) => this.getLogMeta(extra || {}));
 
   // Maps docFDs to DocSession objects.
   private _docFDs: Array<DocSession|null> = [];
 
-  private _missedMessages: any = [];
+  private _missedMessages = new Map<number, string>();
   private _destroyTimer: NodeJS.Timer|null = null;
   private _destroyed: boolean = false;
-  private _websocket: any;
-  private _loginState: LoginState|null = null;
+  private _websocket: WebSocket|null;
   private _org: string|null = null;
   private _profile: UserProfile|null = null;
   private _userId: number|null = null;
+  private _userName: string|null = null;
   private _firstLoginAt: Date|null = null;
   private _isAnonymous: boolean = false;
+  private _nextSeqId: number = 0;     // Next sequence-ID for messages sent to the client
+
   // Identifier for the current GristWSConnection object connected to this client.
   private _counter: string|null = null;
 
   constructor(
-    private _comm: any,
-    private _methods: any,
-    private _host: string,
-    private _locale?: string,
+    private _comm: Comm,
+    private _methods: Map<string, ClientMethod>,
+    private _locale: string,
   ) {
     this.clientId = generateClientId();
   }
 
   public toString() { return `Client ${this.clientId} #${this._counter}`; }
 
-  // Returns the LoginState object that's encoded and passed via login pages to login-connect.
-  public getLoginState(): LoginState|null { return this._loginState; }
-
-  public setCounter(counter: string) {
-    this._counter = counter;
-  }
-
-  public get host(): string {
-    return this._host;
-  }
-
   public get locale(): string|undefined {
     return this._locale;
   }
 
-  public setConnection(websocket: any, reqHost: string, browserSettings: BrowserSettings) {
+  public setConnection(websocket: WebSocket, counter: string|null, browserSettings: BrowserSettings) {
     this._websocket = websocket;
-    // Set this._loginState, used by CognitoClient to construct login/logout URLs.
-    this._loginState = getLoginState(reqHost);
+    this._counter = counter;
     this.browserSettings = browserSettings;
+
+    websocket.on('error', (err) => this._onError(err));
+    websocket.on('close', () => this._onClose());
+    websocket.on('message', (msg: string) => this._onMessage(msg));
   }
 
   /**
@@ -141,25 +141,10 @@ export class Client {
     this._docFDs[fd] = null;
   }
 
-  // Check that client still has access to all documents.  Used to determine whether
-  // a Comm client can be safely reused after a reconnect.  Without this check, the client
-  // would be reused even if access to a document has been lost (although an error would be
-  // issued later, on first use of the document).
-  public async isAuthorized(): Promise<boolean> {
-    for (const docFD of this._docFDs) {
-      try {
-        if (docFD !== null) { await docFD.authorizer.assertAccess('viewers'); }
-      } catch (e) {
-        return false;
-      }
-    }
-    return true;
-  }
-
   /**
-   * Closes all docs.
+   * Closes all docs. Returns the number of documents closed.
    */
-  public closeAllDocs() {
+  public closeAllDocs(): number {
     let count = 0;
     for (let fd = 0; fd < this._docFDs.length; fd++) {
       const docSession = this._docFDs[fd];
@@ -171,7 +156,7 @@ export class Client {
       }
       this._docFDs[fd] = null;
     }
-    this._log.debug(null, "closeAllDocs() closed %d doc(s)", count);
+    return count;
   }
 
   public interruptConnection() {
@@ -185,44 +170,141 @@ export class Client {
   /**
    * Sends a message to the client, queuing it up on failure or if the client is disconnected.
    */
-  public async sendMessage(messageObj: any): Promise<void> {
+  public async sendMessage(messageObj: CommMessage|CommResponse|CommResponseError): Promise<void> {
     if (this._destroyed) {
       return;
     }
 
-    const message: string = JSON.stringify(messageObj);
+    const seqId = this._nextSeqId++;
+    const message: string = JSON.stringify({...messageObj, seqId});
 
     // Log something useful about the message being sent.
-    if (messageObj.error) {
+    if ('error' in messageObj && messageObj.error) {
       this._log.warn(null, "responding to #%d ERROR %s", messageObj.reqId, messageObj.error);
     }
 
     if (this._websocket) {
       // If we have a websocket, send the message.
       try {
-        await this._websocket.sendAsync(message);
+        await this._sendToWebsocket(message);
       } catch (err) {
-        // Sending failed. Presumably we should be getting onClose around now too.
-        // NOTE: if this handler is run after onClose, we could have messages end up out of order.
-        // Let's check to make sure. If this can happen, we need to refactor for correct ordering.
-        if (!this._websocket) {
-          this._log.error(null, "sendMessage: UNEXPECTED ORDER OF CALLBACKS");
-        }
-        this._log.warn(null, "sendMessage: queuing after send error: %s", err.toString());
-        this._missedMessages.push(message);
+        // Sending failed. Add the message to missedMessages.
+        this._log.warn(null, "sendMessage: queuing after send error:", err.toString());
+        this._missedMessages.set(seqId, message);
+
+        // NOTE: A successful send does NOT mean the message was received. For a better system, see
+        // https://docs.microsoft.com/en-us/azure/azure-web-pubsub/howto-develop-reliable-clients
+        // (keeping a copy of messages until acked). With our system, we are more likely to be
+        // lacking the needed messages on reconnect, and having to reset the client.
       }
-    } else if (this._missedMessages.length < clientMaxMissedMessages) {
+    } else if (this._missedMessages.size < clientMaxMissedMessages) {
       // Queue up the message.
-      this._missedMessages.push(message);
+      this._missedMessages.set(seqId, message);
     } else {
       // Too many messages queued. Boot the client now, to make it reset when/if it reconnects.
-      this._log.error(null, "sendMessage: too many messages queued; booting client");
-      if (this._destroyTimer) {
-        clearTimeout(this._destroyTimer);
-        this._destroyTimer = null;
-      }
-      this._comm._destroyClient(this);
+      this._log.warn(null, "sendMessage: too many messages queued; booting client");
+      this.destroy();
     }
+  }
+
+  /**
+   * Called from Comm.ts to decide whether this Client is available to accept a new connection
+   * that requests the same clientId.
+   */
+  public canAcceptConnection(): boolean {
+    // Refuse reconnect if another websocket is currently active. It may be a new browser tab
+    // (which may reuse clientId from a copy of sessinStorage). It will need its own Client object.
+    return !this._websocket;
+  }
+
+  /**
+   * Complete initialization of a new connection, and send the initial 'clientConnect' message.
+   * See comments at the top of app/server/lib/Comm.ts for some relevant notes.
+   */
+  public async sendConnectMessage(
+    newClient: boolean, reuseClient: boolean, lastSeqId: number|null, parts: Partial<CommClientConnect>
+  ): Promise<void> {
+    if (this._destroyTimer) {
+      clearTimeout(this._destroyTimer);
+      this._destroyTimer = null;
+    }
+
+    let missedMessages: string[]|undefined = undefined;
+    let seamlessReconnect = false;
+    if (!newClient && reuseClient && await this._isAuthorized()) {
+      // Websocket-level reconnect: existing browser tab reconnected to an existing Client object.
+      // We also check that the Client is still authorized to access all open docs. If not, we'll
+      // close the docs and tell the Client to reload the app.
+      missedMessages = this.getMissedMessages(lastSeqId);
+      if (missedMessages) {
+        // We have all the needed messages (possibly an empty array); can do a seamless reconnect.
+        seamlessReconnect = true;
+      }
+    }
+
+    // We collected any missed messages we need; clear the stored map of them.
+    this._missedMessages.clear();
+
+    let docsClosed: number|null = null;
+    if (!seamlessReconnect) {
+      // The browser client can't recover from missed messages and will need to reopen docs. Close
+      // all docs we kept open. If it's a new Client object, this is a no-op.
+      docsClosed = this.closeAllDocs();
+    }
+
+    // An existing browser client that can't recover, or that connected to a new Client object,
+    // will need to reopen docs. Tell it to reload.
+    const needReload = !newClient && !seamlessReconnect;
+
+    this._log.debug({newClient, needReload, docsClosed, missedMessages: missedMessages?.length},
+      'sending clientConnect');
+
+    // Don't use sendMessage here, since we don't want to queue up this message on failure.
+    const clientConnectMsg: CommClientConnect = {
+      ...parts,
+      type: 'clientConnect',
+      clientId: this.clientId,
+      profile: this._profile,
+      missedMessages,
+      needReload,
+    };
+
+    try {
+      await this._sendToWebsocket(JSON.stringify(clientConnectMsg));
+
+      if (needReload) {
+        // If the client should reload, close the socket without waiting. This connection should
+        // not be used anyway, and we want it released by the time the new connection comes in.
+        this._websocket?.close();
+        return;
+      }
+
+      // A heavy-handed fix to T396, since 'clientConnect' is sometimes not seen in the browser,
+      // (seemingly when the 'message' event is triggered before 'open' on the native WebSocket.)
+      // See also my report at https://stackoverflow.com/a/48411315/328565
+      await delay(250);
+
+      if (!this._destroyed && this._websocket?.readyState === WebSocket.OPEN) {
+        await this._sendToWebsocket(JSON.stringify({...clientConnectMsg, dup: true}));
+      }
+    } catch (err) {
+      // It's possible that the connection was closed while we were preparing this response.
+      // We just warn, and let _onClose() take care of cleanup.
+      this._log.warn(null, "failed to prepare or send clientConnect:", err.toString());
+    }
+  }
+
+  // Get messages in order of their key in the _missedMessages map.
+  public getMissedMessages(lastSeqId: number|null): string[]|undefined {
+    const result: string[] = [];
+    if (lastSeqId !== null) {
+      for (let i = lastSeqId + 1; i < this._nextSeqId; i++) {
+        const m = this._missedMessages.get(i);
+        if (m === undefined) { return; }
+        result.push(m);
+      }
+    }
+    return result;
   }
 
   // Assigns the given ScopedSession to the client.
@@ -238,59 +320,20 @@ export class Client {
     return this._session?.getAltSessionId();
   }
 
-  public destroy() {
-    this._destroyed = true;
-  }
-
   /**
-   * Processes a request from a client. All requests from a client get a response, at least to
-   * indicate success or failure.
+   * Destroys a client. If the same browser window reconnects later, it will get a new Client
+   * object and clientId.
    */
-  public async onMessage(message: string): Promise<void> {
-    const request = JSON.parse(message);
-    if (request.beat) {
-      // this is a heart beat, to keep the websocket alive.  No need to reply.
-      log.rawInfo('heartbeat', {
-        ...this.getLogMeta(),
-        url: request.url,
-        docId: request.docId,  // caution: trusting client for docId for this purpose.
-      });
-      return;
-    } else {
-      this._log.info(null, "onMessage", shortDesc(message));
+  public destroy() {
+    const docsClosed = this.closeAllDocs();
+    this._log.info({docsClosed}, "client gone");
+    if (this._destroyTimer) {
+      clearTimeout(this._destroyTimer);
+      this._destroyTimer = null;
     }
-    const response: any = {reqId: request.reqId};
-    const method = this._methods[request.method];
-    if (!method) {
-      response.error = `Unknown method ${request.method}`;
-    } else {
-      try {
-        response.data = await method(this, ...request.args);
-      } catch (error) {
-        const err: ErrorWithCode = error;
-        // Print the error stack, except for SandboxErrors, for which the JS stack isn't that useful.
-        // Also not helpful is the stack of AUTH_NO_VIEW|EDIT errors produced by the Authorizer.
-        const code: unknown = err.code;
-        const skipStack = (
-          !err.stack ||
-          err.stack.match(/^SandboxError:/) ||
-          (typeof code === 'string' && code.startsWith('AUTH_NO'))
-        );
-
-        this._log.warn(null, "Error %s %s", skipStack ? err : err.stack, code || '');
-        response.error = err.message;
-        if (err.code) {
-          response.errorCode = err.code;
-        }
-        if (err.details) {
-          response.details = err.details;
-        }
-        if (typeof code === 'string' && code === 'AUTH_NO_EDIT' && err.accessMode === 'fork') {
-          response.shouldFork = true;
-        }
-      }
-    }
-    await this.sendMessage(response);
+    this._missedMessages.clear();
+    this._comm.removeClient(this);
+    this._destroyed = true;
   }
 
   public setOrg(org: string): void {
@@ -306,6 +349,7 @@ export class Client {
     // Unset userId, so that we look it up again on demand. (Not that userId could change in
     // practice via a change to profile, but let's not make any assumptions here.)
     this._userId = null;
+    this._userName = null;
     this._firstLoginAt = null;
     this._isAnonymous = !profile;
   }
@@ -318,23 +362,20 @@ export class Client {
         anonymous: true,
       };
     }
-    return this._profile;
-  }
-
-  public async getSessionProfile(): Promise<UserProfile|null|undefined> {
-    return this._session?.getSessionProfile();
-  }
-
-  public async getSessionEmail(): Promise<string|null> {
-    return (await this.getSessionProfile())?.email || null;
+    // If we have a database, the user id and name will have been
+    // fetched before we start using the Client, so we take this
+    // opportunity to update the user name to use the latest user name
+    // in the database (important since user name is now exposed via
+    // user.Name in granular access support). TODO: might want to
+    // subscribe to changes in user name while the document is open.
+    return this._profile ? {
+      ...this._profile,
+      ...(this._userName && { name: this._userName }),
+    } : null;
   }
 
   public getCachedUserId(): number|null {
     return this._userId;
-  }
-
-  public isAnonymous(): boolean {
-    return this._isAnonymous;
   }
 
   // Returns the userId for profile.email, or null when profile is not set; with caching.
@@ -343,10 +384,12 @@ export class Client {
       if (this._profile) {
         const user = await this._fetchUser(dbManager);
         this._userId = (user && user.id) || null;
+        this._userName = (user && user.name) || null;
         this._isAnonymous = this._userId && dbManager.getAnonymousUserId() === this._userId || false;
         this._firstLoginAt = (user && user.firstLoginAt) || null;
       } else {
         this._userId = dbManager.getAnonymousUserId();
+        this._userName = 'Anonymous';
         this._isAnonymous = true;
         this._firstLoginAt = null;
       }
@@ -361,8 +404,7 @@ export class Client {
     throw new ApiError(this._profile ? `user not known: ${this._profile.email}` : 'user not set', 403);
   }
 
-  public getLogMeta() {
-    const meta: {[key: string]: any} = {};
+  public getLogMeta(meta: {[key: string]: any} = {}) {
     if (this._profile) { meta.email = this._profile.email; }
     // We assume the _userId has already been cached, which will be true always (for all practical
     // purposes) because it's set when the Authorizer checks this client.
@@ -372,9 +414,63 @@ export class Client {
       meta.age = Math.floor(moment.duration(moment().diff(this._firstLoginAt)).asDays());
     }
     if (this._org) { meta.org = this._org; }
+    const altSessionId = this.getAltSessionId();
+    if (altSessionId) { meta.altSessionId = altSessionId; }
     meta.clientId = this.clientId;    // identifies a client connection, essentially a websocket
     meta.counter = this._counter;     // identifies a GristWSConnection in the connected browser tab
     return meta;
+  }
+
+  /**
+   * Processes a request from a client. All requests from a client get a response, at least to
+   * indicate success or failure.
+   */
+  private async _onMessage(message: string): Promise<void> {
+    const request = JSON.parse(message);
+    if (request.beat) {
+      // this is a heart beat, to keep the websocket alive.  No need to reply.
+      log.rawInfo('heartbeat', {
+        ...this.getLogMeta(),
+        url: request.url,
+        docId: request.docId,  // caution: trusting client for docId for this purpose.
+      });
+      return;
+    } else {
+      this._log.info(null, "onMessage", shortDesc(message));
+    }
+    let response: CommResponse|CommResponseError;
+    const method = this._methods.get(request.method);
+    if (!method) {
+      response = {reqId: request.reqId, error: `Unknown method ${request.method}`};
+    } else {
+      try {
+        response = {reqId: request.reqId, data: await method(this, ...request.args)};
+      } catch (error) {
+        const err: ErrorWithCode = error;
+        // Print the error stack, except for SandboxErrors, for which the JS stack isn't that useful.
+        // Also not helpful is the stack of AUTH_NO_VIEW|EDIT errors produced by the Authorizer.
+        const code: unknown = err.code;
+        const skipStack = (
+          !err.stack ||
+          err.stack.match(/^SandboxError:/) ||
+          (typeof code === 'string' && code.startsWith('AUTH_NO'))
+        );
+
+        this._log.warn(null, "Responding to method %s with error: %s %s",
+          request.method, skipStack ? err : err.stack, code || '');
+        response = {reqId: request.reqId, error: err.message};
+        if (err.code) {
+          response.errorCode = err.code;
+        }
+        if (err.details) {
+          response.details = err.details;
+        }
+        if (typeof code === 'string' && code === 'AUTH_NO_EDIT' && err.accessMode === 'fork') {
+          response.shouldFork = true;
+        }
+      }
+    }
+    await this.sendMessage(response);
   }
 
   // Fetch the user database record from profile.email, or null when profile is not set.
@@ -384,10 +480,56 @@ export class Client {
       undefined;
   }
 
+  // Check that client still has access to all documents.  Used to determine whether
+  // a Comm client can be safely reused after a reconnect.  Without this check, the client
+  // would be reused even if access to a document has been lost (although an error would be
+  // issued later, on first use of the document).
+  private async _isAuthorized(): Promise<boolean> {
+    for (const docFD of this._docFDs) {
+      try {
+        if (docFD !== null) { await docFD.authorizer.assertAccess('viewers'); }
+      } catch (e) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   // Returns the next unused docFD number.
   private _getNextDocFD(): number {
     let fd = 0;
     while (this._docFDs[fd]) { fd++; }
     return fd;
+  }
+
+  private _sendToWebsocket(message: string): Promise<void> {
+    return fromCallback(cb => this._websocket!.send(message, cb));
+  }
+
+  /**
+   * Processes an error on the websocket.
+   */
+  private _onError(err: unknown) {
+    this._log.warn(null, "onError", err);
+    // TODO Make sure that this is followed by onClose when the connection is lost.
+  }
+
+  /**
+   * Processes the closing of a websocket.
+   */
+  private _onClose() {
+    this._websocket?.removeAllListeners();
+
+    // Remove all references to the websocket.
+    this._websocket = null;
+
+    // Schedule the client to be destroyed after a timeout. The timer gets cleared if the same
+    // client reconnects in the interim.
+    if (this._destroyTimer) {
+      this._log.warn(null, "clearing previously scheduled destruction");
+      clearTimeout(this._destroyTimer);
+    }
+    this._log.info(null, "websocket closed; will discard client in %s sec", Deps.clientRemovalTimeoutMs / 1000);
+    this._destroyTimer = setTimeout(() => this.destroy(), Deps.clientRemovalTimeoutMs);
   }
 }

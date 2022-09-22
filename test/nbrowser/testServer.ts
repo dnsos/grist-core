@@ -12,7 +12,7 @@
  */
 import {encodeUrl, IGristUrlState, parseSubdomain} from 'app/common/gristUrls';
 import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {getAppRoot} from 'app/server/lib/places';
 import {makeGristConfig} from 'app/server/lib/sendAppPage';
 import {exitPromise} from 'app/server/lib/serverUtils';
@@ -23,7 +23,9 @@ import {driver, IMochaServer, WebDriver} from 'mocha-webdriver';
 import fetch from 'node-fetch';
 import {tmpdir} from 'os';
 import * as path from 'path';
+import {removeConnection} from 'test/gen-server/seed';
 import {HomeUtil} from 'test/nbrowser/homeUtil';
+import {getDatabase} from 'test/testUtils';
 
 export class TestServerMerged implements IMochaServer {
   public testDir: string;
@@ -35,10 +37,11 @@ export class TestServerMerged implements IMochaServer {
   public removeLogin: HomeUtil["removeLogin"];
 
   private _serverUrl: string;
+  private _proxyUrl: string|null = null;
   private _server: ChildProcess;
   private _exitPromise: Promise<number|string>;
   private _starts: number = 0;
-  private _dbManager: HomeDBManager;
+  private _dbManager?: HomeDBManager;
   private _driver: WebDriver;
 
   // The name is used to name the directory for server logs and data.
@@ -84,12 +87,15 @@ export class TestServerMerged implements IMochaServer {
     const stubCmd = '_build/stubs/app/server/server';
     const isCore = await fse.pathExists(stubCmd + '.js');
     const cmd = isCore ? stubCmd : '_build/core/app/server/devServerMain';
+    // If a proxy is set, use a single port - otherwise we'd need a lot of
+    // proxies.
+    const useSinglePort = this._proxyUrl !== null;
 
     // The reason we fork a process rather than start a server within the same process is mainly
     // logging. Server code uses a global logger, so it's hard to separate out (especially so if
     // we ever run different servers for different tests).
     const serverLog = process.env.VERBOSE ? 'inherit' : nodeLogFd;
-    const env = {
+    const env: Record<string, string> = {
       TYPEORM_DATABASE: this._getDatabaseFile(),
       TEST_CLEAN_DATABASE: reset ? 'true' : '',
       GRIST_DATA_DIR: this.testDocDir,
@@ -104,7 +110,10 @@ export class TestServerMerged implements IMochaServer {
       GRIST_SERVE_SAME_ORIGIN: 'true',
       APP_UNTRUSTED_URL : "http://localhost:18096",
       // Run with HOME_PORT, STATIC_PORT, DOC_PORT, DOC_WORKER_COUNT in the environment to override.
-      ...(isCore ? {
+      ...(useSinglePort ? {
+        APP_HOME_URL: this.getHost(),
+        GRIST_SINGLE_PORT: 'true',
+      } : (isCore ? {
         HOME_PORT: '8095',
         STATIC_PORT: '8095',
         DOC_PORT: '8095',
@@ -116,7 +125,7 @@ export class TestServerMerged implements IMochaServer {
         DOC_PORT: '8100',
         DOC_WORKER_COUNT: '5',
         PORT: '0',
-      }),
+      })),
       // This skips type-checking when running server, but reduces startup time a lot.
       TS_NODE_TRANSPILE_ONLY: 'true',
       ...process.env,
@@ -167,6 +176,9 @@ export class TestServerMerged implements IMochaServer {
    * request takes a long time.
    */
   public async pauseUntil(callback: () => Promise<void>) {
+    if (this.isExternalServer()) {
+      throw new Error("Can't pause external server");
+    }
     log.info("Pausing node server");
     this._server.kill('SIGSTOP');
     try {
@@ -184,7 +196,7 @@ export class TestServerMerged implements IMochaServer {
 
   public getHost(): string {
     if (this.isExternalServer()) { return process.env.HOME_URL!; }
-    return this._serverUrl;
+    return this._proxyUrl || this._serverUrl;
   }
 
   public getUrl(team: string, relPath: string) {
@@ -196,6 +208,12 @@ export class TestServerMerged implements IMochaServer {
     const gristConfig = makeGristConfig(this.getHost(), {}, baseDomain);
     const url = encodeUrl(gristConfig, state, new URL(this.getHost())).replace(/\/$/, "");
     return `${url}${relPath}`;
+  }
+
+  // Configure the server to be accessed via a proxy. You'll need to
+  // restart the server after changing this setting.
+  public updateProxy(proxyUrl: string|null) {
+    this._proxyUrl = proxyUrl;
   }
 
   /**
@@ -224,24 +242,14 @@ export class TestServerMerged implements IMochaServer {
    */
   public async getDatabase(): Promise<HomeDBManager> {
     if (!this._dbManager) {
-      const origTypeormDB = process.env.TYPEORM_DATABASE;
-      process.env.TYPEORM_DATABASE = this._getDatabaseFile();
-      this._dbManager = new HomeDBManager();
-      await this._dbManager.connect();
-      await this._dbManager.initializeSpecialIds();
-      if (origTypeormDB) {
-        process.env.TYPEORM_DATABASE = origTypeormDB;
-      }
-      // If this is Sqlite, we are making a separate connection to the database,
-      // so could get busy errors. We bump up our timeout. The rest of Grist could
-      // get busy errors if we do slow writes though.
-      const connection = this._dbManager.connection;
-      const sqlite = connection.driver.options.type === 'sqlite';
-      if (sqlite) {
-        await this._dbManager.connection.query('PRAGMA busy_timeout = 3000');
-      }
+      this._dbManager = await getDatabase(this._getDatabaseFile());
     }
     return this._dbManager;
+  }
+
+  public async closeDatabase() {
+    this._dbManager = undefined;
+    await removeConnection();
   }
 
   public get driver() {

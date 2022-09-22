@@ -16,12 +16,12 @@ import {SortedRowSet} from 'app/client/models/rowset';
 import {buildHighlightedCode} from 'app/client/ui/CodeHighlight';
 import {openFilePicker} from 'app/client/ui/FileDialog';
 import {bigBasicButton, bigPrimaryButton} from 'app/client/ui2018/buttons';
-import {colors, testId, vars} from 'app/client/ui2018/cssVars';
+import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {IOptionFull, linkSelect, menu, menuDivider, menuItem, multiSelect} from 'app/client/ui2018/menus';
 import {cssModalButtons, cssModalTitle} from 'app/client/ui2018/modals';
 import {loadingSpinner} from 'app/client/ui2018/loaders';
-import {openFormulaEditor} from 'app/client/widgets/FieldEditor';
+import {openFormulaEditor} from 'app/client/widgets/FormulaEditor';
 import {DataSourceTransformed, DestId, ImportResult, ImportTableResult, MergeOptions,
         MergeOptionsMap, MergeStrategy, NEW_TABLE, SKIP_TABLE,
         TransformColumn, TransformRule, TransformRuleMap} from 'app/common/ActiveDocAPI';
@@ -182,7 +182,7 @@ export class Importer extends DisposableWithEvents {
   private _destTables = Computed.create<Array<IOptionFull<DestId>>>(this, (use) => [
     {value: NEW_TABLE, label: 'New Table'},
     ...(use(this._sourceInfoArray).length > 1 ? [{value: SKIP_TABLE, label: 'Skip'}] : []),
-    ...use(this._gristDoc.docModel.allTableIds.getObservable()).map((t) => ({value: t, label: t})),
+    ...use(this._gristDoc.docModel.visibleTableIds.getObservable()).map((id) => ({value: id, label: id})),
   ]);
 
   // Source column labels for the selected import source, keyed by column id.
@@ -193,17 +193,22 @@ export class Importer extends DisposableWithEvents {
     return new Map(fields.map(f => [use(use(f.column).colId), use(use(f.column).label)]));
   });
 
-  // List of destination fields that aren't mapped to a source column.
-  private _unmatchedFields = Computed.create(this, this._sourceInfoSelected, (use, info) => {
+  // Transform section columns of the selected source.
+  private _transformSectionCols = Computed.create(this, this._sourceInfoSelected, (use, info) => {
     if (!info) { return null; }
 
     const transformSection = use(info.transformSection);
     if (!transformSection || use(transformSection._isDeleted)) { return null; }
 
     const fields = use(use(transformSection.viewFields).getObservable());
-    return fields
-      .filter(f => use(use(f.column).formula).trim() === '')
-      .map(f => f.column().label());
+    return fields.map(f => use(f.column));
+  });
+
+  // List of destination fields that aren't mapped to a source column.
+  private _unmatchedFields = Computed.create(this, this._transformSectionCols, (use, cols) => {
+    if (!cols) { return null; }
+
+    return cols.filter(c => use(c.formula).trim() === '').map(c => c.label());
   });
 
   // null tells to use the built-in file picker.
@@ -446,10 +451,8 @@ export class Importer extends DisposableWithEvents {
     this._resetImportDiffState();
     // Formula editor cleanup needs to happen before the hidden tables are removed.
     this._formulaEditorHolder.dispose();
-
     if (this._uploadResult) {
-      await this._docComm.cancelImportFiles(
-        this._getTransformedDataSource(this._uploadResult), this._getHiddenTableIds());
+      await this._docComm.cancelImportFiles(this._uploadResult.uploadId, this._getHiddenTableIds());
     }
     this._screen.close();
     this.dispose();
@@ -492,6 +495,20 @@ export class Importer extends DisposableWithEvents {
    * @param {SourceInfo} info The source to update the diff for.
    */
   private async _updateImportDiff(info: SourceInfo) {
+    const {updateExistingRecords, mergeCols} = this._mergeOptions[info.hiddenTableId]!;
+    const isMerging = info.destTableId && updateExistingRecords.get() && mergeCols.get().length > 0;
+    if (!isMerging && this._gristDoc.comparison) {
+      // If we're not merging but diffing is enabled, disable it; since `comparison` isn't
+      // currently observable, we'll wrap the modification around the `_isLoadingDiff`
+      // flag, which will force the preview table to re-render with diffing disabled.
+      this._isLoadingDiff.set(true);
+      this._gristDoc.comparison = null;
+      this._isLoadingDiff.set(false);
+    }
+
+    // If we're not merging, no diff is shown, so don't schedule an update for one.
+    if (!isMerging) { return; }
+
     this._hasScheduledDiffUpdate = true;
     this._isLoadingDiff.set(true);
     await this._debouncedUpdateDiff(info);
@@ -510,23 +527,17 @@ export class Importer extends DisposableWithEvents {
     // Reset the flag tracking scheduled updates since the debounced update has started.
     this._hasScheduledDiffUpdate = false;
 
-    const mergeOptions = this._mergeOptions[info.hiddenTableId]!;
-    if (!mergeOptions.updateExistingRecords.get() || mergeOptions.mergeCols.get().length === 0) {
-      // We can simply disable document comparison mode when merging isn't configured.
-      this._gristDoc.comparison = null;
-    } else {
-      // Request a diff of the current source and wait for a response.
-      const genImportDiffPromise = this._docComm.generateImportDiff(info.hiddenTableId,
-        this._createTransformRule(info), this._getMergeOptionsForSource(info)!);
-      this._lastGenImportDiffPromise = genImportDiffPromise;
-      const diff = await genImportDiffPromise;
+    // Request a diff of the current source and wait for a response.
+    const genImportDiffPromise = this._docComm.generateImportDiff(info.hiddenTableId,
+      this._createTransformRule(info), this._getMergeOptionsForSource(info)!);
+    this._lastGenImportDiffPromise = genImportDiffPromise;
+    const diff = await genImportDiffPromise;
 
-      // If the request is superseded by a newer request, or the Importer is disposed, do nothing.
-      if (this.isDisposed() || genImportDiffPromise !== this._lastGenImportDiffPromise) { return; }
+    // If the request is superseded by a newer request, or the Importer is disposed, do nothing.
+    if (this.isDisposed() || genImportDiffPromise !== this._lastGenImportDiffPromise) { return; }
 
-      // Otherwise, put the document in comparison mode with the diff data.
-      this._gristDoc.comparison = diff;
-    }
+    // Put the document in comparison mode with the diff data.
+    this._gristDoc.comparison = diff;
 
     // If more updates where scheduled since we started the update, leave the loading spinner up.
     if (!this._hasScheduledDiffUpdate) {
@@ -597,7 +608,7 @@ export class Importer extends DisposableWithEvents {
 
                 this._cancelPendingDiffRequests();
                 this._sourceInfoSelected.set(info);
-                await this._updateDiff(info);
+                await this._updateImportDiff(info);
               }),
               testId('importer-source'),
             );
@@ -652,7 +663,7 @@ export class Importer extends DisposableWithEvents {
                     fields && fields.length > 0 ?
                       cssUnmatchedFields(
                         dom('div',
-                          cssGreenText(
+                          cssAccentText(
                             `${fields.length} unmatched ${fields.length > 1 ? 'fields' : 'field'}`
                           ),
                           ' in import:'
@@ -677,14 +688,20 @@ export class Importer extends DisposableWithEvents {
                                 const sourceColIdsAndLabels = [...this._sourceColLabelsById.get()!.entries()];
                                 return [
                                   menuItem(
-                                    () => this._gristDoc.clearColumns([sourceColId]),
+                                    async () => {
+                                      await this._gristDoc.clearColumns([sourceColId]);
+                                      await this._updateImportDiff(info);
+                                    },
                                     'Skip',
                                     testId('importer-column-match-menu-item')
                                   ),
                                   menuDivider(),
                                   ...sourceColIdsAndLabels.map(([id, label]) =>
                                     menuItem(
-                                      () => this._setColumnFormula(sourceColId, '$' + id),
+                                      async () => {
+                                        await this._setColumnFormula(sourceColId, '$' + id);
+                                        await this._updateImportDiff(info);
+                                      },
                                       label,
                                       testId('importer-column-match-menu-item')
                                     ),
@@ -701,7 +718,11 @@ export class Importer extends DisposableWithEvents {
                         dom.domComputed(use => dom.create(
                           this._buildColMappingFormula.bind(this),
                           use(field.column),
-                          (elem: Element) => this._activateFormulaEditor(elem, field),
+                          (elem: Element) => this._activateFormulaEditor(
+                            elem,
+                            field,
+                            () => this._updateImportDiff(info),
+                          ),
                           'Skip'
                         )),
                         testId('importer-column-match-source-destination'),
@@ -721,18 +742,6 @@ export class Importer extends DisposableWithEvents {
                 }
 
                 const gridView = this._createPreview(previewSection);
-
-                // When changes are made to the preview table, update the import diff.
-                gridView.listenTo(gridView.sortedRows, 'rowNotify', async () => {
-                  // If we aren't showing a diff, there is no need to do anything.
-                  if (!info.destTableId || !updateExistingRecords.get() || mergeCols.get().length === 0) {
-                    return;
-                  }
-
-                  // Otherwise, update the diff and rebuild the preview table.
-                  await this._updateImportDiff(info);
-                });
-
                 return cssPreviewGrid(
                   dom.maybe(use1 => SKIP_TABLE === use1(info.destTableId),
                     () => cssOverlay(testId("importer-preview-overlay"))),
@@ -784,13 +793,22 @@ export class Importer extends DisposableWithEvents {
   /**
    * Opens a formula editor for `field` over `refElem`.
    */
-  private _activateFormulaEditor(refElem: Element, field: ViewFieldRec) {
-    // TODO: Set active section to hidden table section, so editor autocomplete is accurate.
+  private _activateFormulaEditor(refElem: Element, field: ViewFieldRec, onSave: () => Promise<void>) {
+    const vsi = this._gristDoc.viewModel.activeSection().viewInstance();
+    const editRow = vsi?.moveEditRowToCursor();
     const editorHolder = openFormulaEditor({
       gristDoc: this._gristDoc,
-      field,
+      column: field.column(),
+      editingFormula: field.editingFormula,
       refElem,
+      editRow,
       setupCleanup: this._setupFormulaEditorCleanup.bind(this),
+      onSave: async (column, formula) => {
+        if (formula === column.formula.peek()) { return; }
+
+        await column.updateColValues({formula});
+        await onSave();
+      }
     });
     this._formulaEditorHolder.autoDispose(editorHolder);
   }
@@ -802,7 +820,7 @@ export class Importer extends DisposableWithEvents {
    * focus.
    */
   private _setupFormulaEditorCleanup(
-    owner: MultiHolder, _doc: GristDoc, field: ViewFieldRec, _saveEdit: () => Promise<unknown>
+    owner: MultiHolder, _doc: GristDoc, editingFormula: ko.Computed<boolean>, _saveEdit: () => Promise<unknown>
   ) {
     const saveEdit = () => _saveEdit().catch(reportError);
 
@@ -811,7 +829,7 @@ export class Importer extends DisposableWithEvents {
 
     owner.onDispose(() => {
       this.off('importer_focus', saveEdit);
-      field.editingFormula(false);
+      editingFormula(false);
     });
   }
 
@@ -921,11 +939,11 @@ const cssActionLink = styled('div', `
   display: inline-flex;
   align-items: center;
   cursor: pointer;
-  color: ${colors.lightGreen};
-  --icon-color: ${colors.lightGreen};
+  color: ${theme.controlFg};
+  --icon-color: ${theme.controlFg};
   &:hover {
-    color: ${colors.darkGreen};
-    --icon-color: ${colors.darkGreen};
+    color: ${theme.controlHoverFg};
+    --icon-color: ${theme.controlHoverFg};
   }
 `);
 
@@ -954,7 +972,7 @@ const cssPreviewWrapper = styled('div', `
 // This partly duplicates cssSectionHeader from HomeLeftPane.ts
 const cssSectionHeader = styled('div', `
   margin-bottom: 8px;
-  color: ${colors.slate};
+  color: ${theme.lightText};
   text-transform: uppercase;
   font-weight: 500;
   font-size: ${vars.xsmallFontSize};
@@ -976,9 +994,9 @@ const cssTableInfo = styled('div', `
   margin: 4px 0px;
   width: 300px;
   border-radius: 3px;
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.importerTableInfoBorder};
   &:hover, &-selected {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.hover};
   }
 `);
 
@@ -991,7 +1009,7 @@ const cssTableLine = styled('div', `
 const cssToFrom = styled('span', `
   flex: none;
   margin-right: 8px;
-  color: ${colors.slate};
+  color: ${theme.lightText};
   text-transform: uppercase;
   font-weight: 500;
   font-size: ${vars.xsmallFontSize};
@@ -1044,11 +1062,11 @@ const cssOverlay = styled('div', `
   height: 100%;
   width: 100%;
   z-index: 10;
-  background: ${colors.mediumGrey};
+  background: ${theme.importerSkippedTableOverlay};
 `);
 
 const cssPreviewGrid = styled(cssPreview, `
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.importerPreviewBorder};
   position: relative;
 `);
 
@@ -1061,7 +1079,7 @@ const cssMergeOptionsToggle = styled('div', `
 `);
 
 const cssMergeOptionsMessage = styled('div', `
-  color: ${colors.slate};
+  color: ${theme.lightText};
   margin-bottom: 8px;
 `);
 
@@ -1081,14 +1099,14 @@ const cssFieldFormula = styled(buildHighlightedCode, `
   cursor: pointer;
   margin-top: 1px;
   padding-left: 4px;
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.accentIcon};
 `);
 
 const cssColumnMatchIcon = styled(icon, `
   flex-shrink: 0;
   width: 20px;
   height: 32px;
-  background-color: ${colors.darkGrey};
+  background-color: ${theme.importerMatchIcon};
   margin-right: 4px;
 `);
 
@@ -1120,10 +1138,10 @@ const cssDestinationFieldSettings = styled('div', `
   line-height: 0px;
   border-radius: 3px;
   cursor: pointer;
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.lightText};
 
   &:hover, &.weasel-popup-open {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.hover};
   }
 `);
 
@@ -1136,9 +1154,9 @@ const cssUnmatchedFieldsList = styled('div', `
   text-overflow: ellipsis;
   overflow: hidden;
   padding-right: 16px;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
-const cssGreenText = styled('span', `
-  color: ${colors.lightGreen};
+const cssAccentText = styled('span', `
+  color: ${theme.accentText};
 `);

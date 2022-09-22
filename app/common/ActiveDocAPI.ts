@@ -4,6 +4,7 @@ import {FormulaProperties} from 'app/common/GranularAccessClause';
 import {FetchUrlOptions, UploadResult} from 'app/common/uploads';
 import {DocStateComparison, PermissionData, UserAccessData} from 'app/common/UserAPI';
 import {ParseOptions} from 'app/plugin/FileParserAPI';
+import {AccessTokenOptions, AccessTokenResult} from 'app/plugin/GristAPI';
 import {IMessage} from 'grain-rpc';
 
 export interface ApplyUAOptions {
@@ -121,7 +122,10 @@ export interface QueryFilters {
   [colId: string]: any[];
 }
 
-export type QueryOperation = "in" | "intersects";
+// - in: value should be contained in filters array
+// - intersects: value should be a list with some overlap with filters array
+// - empty: value should be falsy (e.g. null) or an empty list, filters is ignored
+export type QueryOperation = "in" | "intersects" | "empty";
 
 /**
  * Response from useQuerySet(). A query returns data AND creates a subscription to receive
@@ -151,6 +155,27 @@ export interface ForkResult {
 export interface PermissionDataWithExtraUsers extends PermissionData {
   attributeTableUsers: UserAccessData[];
   exampleUsers: UserAccessData[];
+}
+
+/**
+ * Basic metadata about a table returned by `getAclResources()`.
+ */
+export interface AclTableDescription {
+  title: string;  // Raw data widget title
+  colIds: string[];  // IDs of all columns in table
+  groupByColLabels: string[] | null;  // Labels of groupby columns for summary tables, or null.
+}
+
+export function getTableTitle(table: AclTableDescription): string {
+  let {title} = table;
+  if (table.groupByColLabels) {
+    title += ' ' + summaryGroupByDescription(table.groupByColLabels);
+  }
+  return title;
+}
+
+export function summaryGroupByDescription(groupByColumnLabels: string[]): string {
+  return `[${groupByColumnLabels.length ? 'by ' + groupByColumnLabels.join(", ") : "Totals"}]`;
 }
 
 export interface ActiveDocAPI {
@@ -209,7 +234,7 @@ export interface ActiveDocAPI {
   /**
    * Cancels import files, cleans up temporary hidden tables and uploads.
    */
-  cancelImportFiles(dataSource: DataSourceTransformed, prevTableIds: string[]): Promise<void>;
+  cancelImportFiles(uploadId: number, prevTableIds: string[]): Promise<void>;
 
   /**
    * Returns a diff of changes that will be applied to the destination table from `transformRule`
@@ -293,11 +318,16 @@ export interface ActiveDocAPI {
   checkAclFormula(text: string): Promise<FormulaProperties>;
 
   /**
+   * Get a token for out-of-band access to the document.
+   */
+  getAccessToken(options: AccessTokenOptions): Promise<AccessTokenResult>;
+
+  /**
    * Returns the full set of tableIds, with the list of colIds for each table. This is intended
    * for editing ACLs. It is only available to users who can edit ACLs, and lists all resources
    * regardless of rules that may block access to them.
    */
-  getAclResources(): Promise<{[tableId: string]: string[]}>;
+  getAclResources(): Promise<{[tableId: string]: AclTableDescription}>;
 
   /**
    * Wait for document to finish initializing.

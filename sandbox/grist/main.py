@@ -3,10 +3,12 @@ This module defines what sandbox functions are made available to the Node contro
 and starts the grist sandbox. See engine.py for the API documentation.
 """
 import os
+import random
 import sys
 sys.path.append('thirdparty')
 # pylint: disable=wrong-import-position
 
+import logging
 import marshal
 import functools
 
@@ -24,6 +26,9 @@ from imports.register import register_import_parsers
 
 import logger
 log = logger.Logger(__name__, logger.INFO)
+
+# Configure logging module to behave similarly to logger. (It may be OK to get rid of logger.)
+logging.basicConfig(format="[%(levelname)s] [%(name)s] %(message)s")
 
 def table_data_from_db(table_name, table_data_repr):
   if table_data_repr is None:
@@ -64,10 +69,13 @@ def run(sandbox):
   @export
   def apply_user_actions(action_reprs, user=None):
     action_group = eng.apply_user_actions([useractions.from_repr(u) for u in action_reprs], user)
-    return dict(
+    result = dict(
       rowCount=eng.count_rows(),
       **eng.acl_split(action_group).to_json_obj()
     )
+    if action_group.requests:
+      result["requests"] = action_group.requests
+    return result
 
   @export
   def fetch_table(table_id, formulas=True, query=None):
@@ -114,8 +122,14 @@ def run(sandbox):
     return schema.SCHEMA_VERSION
 
   @export
-  def set_doc_url(doc_url):
-    os.environ['DOC_URL'] = doc_url
+  def initialize(doc_url):
+    if os.environ.get("DETERMINISTIC_MODE"):
+      random.seed(1)
+    else:
+      # Make sure we have randomness, even if we are being cloned from a checkpoint
+      random.seed()
+    if doc_url:
+      os.environ['DOC_URL'] = doc_url
 
   @export
   def get_formula_error(table_id, col_id, row_id):

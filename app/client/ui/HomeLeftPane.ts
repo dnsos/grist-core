@@ -6,12 +6,14 @@ import {HomeModel} from 'app/client/models/HomeModel';
 import {getWorkspaceInfo, workspaceName} from 'app/client/models/WorkspaceInfo';
 import {addNewButton, cssAddNewButton} from 'app/client/ui/AddNewButton';
 import {docImport, importFromPlugin} from 'app/client/ui/HomeImports';
-import {cssLinkText, cssPageEntry, cssPageIcon, cssPageLink} from 'app/client/ui/LeftPanelCommon';
+import {cssLinkText, cssPageEntry, cssPageIcon, cssPageLink, cssSpacer} from 'app/client/ui/LeftPanelCommon';
+import {createVideoTourToolsButton} from 'app/client/ui/OpenVideoTour';
 import {transientInput} from 'app/client/ui/transientInput';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {menu, menuIcon, menuItem, upgradableMenuItem, upgradeText} from 'app/client/ui2018/menus';
 import {confirmModal} from 'app/client/ui2018/modals';
+import {shouldHideUiElement} from 'app/common/gristUrls';
 import * as roles from 'app/common/roles';
 import {Workspace} from 'app/common/UserAPI';
 import {computed, dom, domComputed, DomElementArg, observable, Observable, styled} from 'grainjs';
@@ -50,6 +52,7 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
       ),
       dom.forEach(home.workspaces, (ws) => {
         if (ws.isSupportWorkspace) { return null; }
+        const info = getWorkspaceInfo(home.app, ws);
         const isTrivial = computed((use) => Boolean(getWorkspaceInfo(home.app, ws).isDefault &&
                                                     use(home.singleWorkspace)));
         // TODO: Introduce a "SwitchSelector" pattern to avoid the need for N computeds (and N
@@ -63,7 +66,10 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
           cssPageLink(cssPageIcon('Folder'), cssLinkText(workspaceName(home.app, ws)),
             dom.hide(isRenaming),
             urlState().setLinkUrl({ws: ws.id}),
-            cssMenuTrigger(icon('Dots'),
+            // Don't show menu if workspace is personal and shared by another user; we could
+            // be a bit more nuanced here, but as of today the menu isn't particularly useful
+            // as all the menu options are disabled.
+            !info.self && info.owner ? null : cssMenuTrigger(icon('Dots'),
               menu(() => workspaceMenu(home, ws, renaming),
                 {placement: 'bottom-start', parentSelectorToMark: '.' + cssPageEntry.className}),
 
@@ -96,6 +102,7 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
       )),
       cssTools(
         cssPageEntry(
+          dom.hide(shouldHideUiElement("templates")),
           cssPageEntry.cls('-selected', (use) => use(home.currentPage) === "templates"),
           cssPageLink(cssPageIcon('FieldTable'), cssLinkText("Beispiele & Templates"),
             urlState().setLinkUrl({homePage: "templates"}),
@@ -109,6 +116,8 @@ export function createHomeLeftPane(leftPanelOpen: Observable<boolean>, home: Hom
             testId('dm-trash'),
           ),
         ),
+        cssSpacer(),
+        createVideoTourToolsButton(),
         createHelpTools(home.app),
       )
     )
@@ -186,7 +195,7 @@ function addMenu(home: HomeModel, creating: Observable<boolean>): DomElementArg[
              dom.cls('disabled', (use) => !roles.canEdit(orgAccess) || !use(home.available)),
              testId("dm-new-workspace")
     ),
-    upgradeText(needUpgrade),
+    upgradeText(needUpgrade, () => home.app.showUpgradeModal()),
   ];
 }
 
@@ -202,9 +211,10 @@ function workspaceMenu(home: HomeModel, ws: Workspace, renaming: Observable<Work
     const user = home.app.currentUser;
     (await loadUserManager()).showUserManagerModal(api, {
       permissionData: api.getWorkspaceAccess(ws.id),
-      activeEmail: user ? user.email : null,
+      activeUser: user,
       resourceType: 'workspace',
-      resourceId: ws.id
+      resourceId: ws.id,
+      resource: ws,
     });
   }
 
@@ -217,10 +227,13 @@ function workspaceMenu(home: HomeModel, ws: Workspace, renaming: Observable<Work
     upgradableMenuItem(needUpgrade, deleteWorkspace, "Delete",
       dom.cls('disabled', user => !roles.canEdit(ws.access)),
       testId('dm-delete-workspace')),
-    upgradableMenuItem(needUpgrade, manageWorkspaceUsers, "Manage Users",
-      dom.cls('disabled', !roles.canEditAccess(ws.access)),
+    // TODO: Personal plans can't currently share workspaces, but that restriction
+    // should formally be documented and defined in `Features`, with this check updated
+    // to look there instead.
+    home.app.isPersonal ? null : upgradableMenuItem(needUpgrade, manageWorkspaceUsers,
+      roles.canEditAccess(ws.access) ? "Manage Users" : "Access Details",
       testId('dm-workspace-access')),
-    upgradeText(needUpgrade),
+    upgradeText(needUpgrade, () => home.app.showUpgradeModal()),
   ];
 }
 
@@ -235,6 +248,7 @@ export const cssEditorInput = styled(transientInput, `
   flex: 1 1 0px;
   min-width: 0px;
   color: initial;
+  background-color: ${theme.inputBg};
   margin-right: 16px;
   font-size: inherit;
 `);
@@ -252,9 +266,9 @@ const cssMenuTrigger = styled('div', `
     display: block;
   }
   &:hover, &.weasel-popup-open {
-    background-color: ${colors.darkGrey};
+    background-color: ${theme.pageOptionsHoverBg};
   }
   .${cssPageEntry.className}-selected &:hover, .${cssPageEntry.className}-selected &.weasel-popup-open {
-    background-color: ${colors.slate};
+    background-color: ${theme.pageOptionsSelectedHoverBg};
   }
 `);

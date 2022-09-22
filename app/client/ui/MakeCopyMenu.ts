@@ -6,15 +6,16 @@
 import {AppModel, reportError} from 'app/client/models/AppModel';
 import {getLoginOrSignupUrl, urlState} from 'app/client/models/gristUrlState';
 import {getWorkspaceInfo, ownerName, workspaceName} from 'app/client/models/WorkspaceInfo';
+import {cssInput} from 'app/client/ui/cssInput';
 import {bigBasicButton, bigPrimaryButtonLink} from 'app/client/ui2018/buttons';
 import {labeledSquareCheckbox} from 'app/client/ui2018/checkbox';
-import {colors, testId, vars} from 'app/client/ui2018/cssVars';
+import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {loadingSpinner} from 'app/client/ui2018/loaders';
 import {select} from 'app/client/ui2018/menus';
 import {confirmModal, cssModalBody, cssModalButtons, cssModalWidth, modal, saveModal} from 'app/client/ui2018/modals';
 import {FullUser} from 'app/common/LoginSessionAPI';
 import * as roles from 'app/common/roles';
-import {Document, Organization, Workspace} from 'app/common/UserAPI';
+import {Document, isTemplatesOrg, Organization, Workspace} from 'app/common/UserAPI';
 import {Computed, Disposable, dom, input, Observable, styled, subscribe} from 'grainjs';
 import sortBy = require('lodash/sortBy');
 
@@ -99,10 +100,9 @@ export async function makeCopy(doc: Document, app: AppModel, modalTitle: string)
   }
   let orgs = allowOtherOrgs(doc, app) ? await app.api.getOrgs(true) : null;
   if (orgs) {
-    // TODO: Need a more robust way to detect and exclude the templates org.
     // Don't show the templates org since it's selected by default, and
     // is not writable to.
-    orgs = orgs.filter(o => o.domain !== 'templates' && o.domain !== 'templates-s');
+    orgs = orgs.filter(o => !isTemplatesOrg(o));
   }
 
   // Show a dialog with a form to select destination.
@@ -276,16 +276,6 @@ class SaveCopyModal extends Disposable {
   }
 }
 
-export const cssInput = styled('input', `
-  height: 30px;
-  width: 100%;
-  font-size: ${vars.mediumFontSize};
-  border-radius: 3px;
-  padding: 5px;
-  border: 1px solid ${colors.darkGrey};
-  outline: none;
-`);
-
 export const cssField = styled('div', `
   margin: 16px 0;
   display: flex;
@@ -294,7 +284,7 @@ export const cssField = styled('div', `
 export const cssLabel = styled('label', `
   font-weight: normal;
   font-size: ${vars.mediumFontSize};
-  color: ${colors.dark};
+  color: ${theme.text};
   margin: 8px 16px 0 0;
   white-space: nowrap;
   width: 80px;
@@ -302,7 +292,7 @@ export const cssLabel = styled('label', `
 `);
 
 const cssWarningText = styled('div', `
-  color: red;
+  color: ${theme.errorText};
   margin-top: 8px;
 `);
 

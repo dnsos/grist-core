@@ -9,11 +9,13 @@ import {isDesktop} from 'app/client/lib/browserInfo';
 import {FocusLayer} from 'app/client/lib/FocusLayer';
 import * as koUtil from 'app/client/lib/koUtil';
 import {reportError, TopAppModel, TopAppModelImpl} from 'app/client/models/AppModel';
+import {DocPageModel} from 'app/client/models/DocPageModel';
 import {setUpErrorHandling} from 'app/client/models/errors';
 import {createAppUI} from 'app/client/ui/AppUI';
 import {addViewportTag} from 'app/client/ui/viewport';
 import {attachCssRootVars} from 'app/client/ui2018/cssVars';
 import {BaseAPI} from 'app/common/BaseAPI';
+import {CommDocError} from 'app/common/CommTypes';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
 import {fetchFromHome} from 'app/common/urlUtils';
 import {ISupportedFeatures} from 'app/common/UserConfig';
@@ -31,7 +33,7 @@ export class App extends DisposableWithEvents {
   // Used by #newui code to avoid a dependency on commands.js, and by tests to issue commands.
   public allCommands = commands.allCommands;
 
-  public comm = this.autoDispose(Comm.create());
+  public comm = this.autoDispose(Comm.create(this._checkError.bind(this)));
   public clientScope: ClientScope;
   public features: ko.Computed<ISupportedFeatures>;
   public topAppModel: TopAppModel;    // Exposed because used by test/nbrowser/gristUtils.
@@ -41,6 +43,9 @@ export class App extends DisposableWithEvents {
   // Track the version of the server we are communicating with, so that if it changes
   // we can choose to refresh the client also.
   private _serverVersion: string|null = null;
+
+  // Track the most recently created DocPageModel, for some error handling.
+  private _mostRecentDocPageModel?: DocPageModel;
 
   constructor() {
     super();
@@ -129,7 +134,7 @@ export class App extends DisposableWithEvents {
     }, this, isHelpPaneVisible));
 
     this.listenTo(this.comm, 'clientConnect', (message) => {
-      console.log(`App clientConnect event: resetClientId ${message.resetClientId} version ${message.serverVersion}`);
+      console.log(`App clientConnect event: needReload ${message.needReload} version ${message.serverVersion}`);
       this._settings(message.settings);
       if (message.serverVersion === 'dead' || (this._serverVersion && this._serverVersion !== message.serverVersion)) {
         console.log("Upgrading...");
@@ -137,9 +142,9 @@ export class App extends DisposableWithEvents {
         return this.reload();
       }
       this._serverVersion = message.serverVersion;
-      // If the clientId changed, then we need to reload any open documents. We'll simply reload the
-      // active component of the App regardless of what it is.
-      if (message.resetClientId) {
+      // Reload any open documents if needed (if clientId changed, or client can't get all missed
+      // messages). We'll simply reload the active component of the App regardless of what it is.
+      if (message.needReload) {
         this.reloadPane();
       }
     });
@@ -152,6 +157,10 @@ export class App extends DisposableWithEvents {
       console.log("Received docShutdown");
       // Reload on next tick, to let other objects process 'docShutdown' before they get disposed.
       setTimeout(() => this.reloadPane(), 0);
+    });
+
+    this.listenTo(this.comm, 'docError', (msg: CommDocError) => {
+      this._checkError(new Error(msg.data.message));
     });
 
     // When the document is unloaded, dispose the app, allowing it to do any needed
@@ -202,6 +211,10 @@ export class App extends DisposableWithEvents {
     return true;
   }
 
+  public setDocPageModel(pageModel: DocPageModel) {
+    this._mostRecentDocPageModel = pageModel;
+  }
+
   // Get the user profile for testing purposes
   public async testGetProfile(): Promise<any> {
     const resp = await fetchFromHome('/api/profile/user', {credentials: 'include'});
@@ -210,5 +223,17 @@ export class App extends DisposableWithEvents {
 
   public testNumPendingApiRequests(): number {
     return BaseAPI.numPendingRequests();
+  }
+
+  private _checkError(err: Error) {
+    const message = String(err);
+    // Take special action on any error that suggests a memory problem.
+    if (message.match(/MemoryError|unmarshallable object/)) {
+      if (err.message.length > 30) {
+        // TLDR
+        err.message = 'Memory Error';
+      }
+      this._mostRecentDocPageModel?.offerRecovery(err);
+    }
   }
 }

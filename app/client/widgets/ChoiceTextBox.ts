@@ -1,26 +1,23 @@
-import {ChoiceListEntry} from 'app/client/widgets/ChoiceListEntry';
 import {DataRowModel} from 'app/client/models/DataRowModel';
 import {ViewFieldRec} from 'app/client/models/entities/ViewFieldRec';
 import {KoSaveableObservable} from 'app/client/models/modelUtil';
-import {cssLabel, cssRow} from 'app/client/ui/RightPanel';
+import {Style} from 'app/client/models/Styles';
+import {cssLabel, cssRow} from 'app/client/ui/RightPanelStyles';
 import {testId} from 'app/client/ui2018/cssVars';
+import {ChoiceListEntry} from 'app/client/widgets/ChoiceListEntry';
+import {choiceToken, DEFAULT_FILL_COLOR, DEFAULT_TEXT_COLOR} from 'app/client/widgets/ChoiceToken';
 import {NTextBox} from 'app/client/widgets/NTextBox';
 import {Computed, dom, fromKo, styled} from 'grainjs';
-import {choiceToken, DEFAULT_FILL_COLOR, DEFAULT_TEXT_COLOR} from 'app/client/widgets/ChoiceToken';
 
-export interface IChoiceOptions {
-  textColor: string;
-  fillColor: string;
-}
-
+export type IChoiceOptions = Style
 export type ChoiceOptions = Record<string, IChoiceOptions | undefined>;
 export type ChoiceOptionsByName = Map<string, IChoiceOptions | undefined>;
 
-export function getFillColor(choiceOptions?: IChoiceOptions) {
+export function getRenderFillColor(choiceOptions?: IChoiceOptions) {
   return choiceOptions?.fillColor ?? DEFAULT_FILL_COLOR;
 }
 
-export function getTextColor(choiceOptions?: IChoiceOptions) {
+export function getRenderTextColor(choiceOptions?: IChoiceOptions) {
   return choiceOptions?.textColor ?? DEFAULT_TEXT_COLOR;
 }
 
@@ -30,14 +27,16 @@ export function getTextColor(choiceOptions?: IChoiceOptions) {
 export class ChoiceTextBox extends NTextBox {
   private _choices: KoSaveableObservable<string[]>;
   private _choiceValues: Computed<string[]>;
+  private _choiceValuesSet: Computed<Set<string>>;
   private _choiceOptions: KoSaveableObservable<ChoiceOptions | null | undefined>;
-  private _choiceOptionsByName: Computed<ChoiceOptionsByName>
+  private _choiceOptionsByName: Computed<ChoiceOptionsByName>;
 
   constructor(field: ViewFieldRec) {
     super(field);
     this._choices = this.options.prop('choices');
     this._choiceOptions = this.options.prop('choiceOptions');
     this._choiceValues = Computed.create(this, (use) => use(this._choices) || []);
+    this._choiceValuesSet = Computed.create(this, this._choiceValues, (_use, values) => new Set(values));
     this._choiceOptionsByName = Computed.create(this, (use) => toMap(use(this._choiceOptions)));
   }
 
@@ -52,12 +51,14 @@ export class ChoiceTextBox extends NTextBox {
           const formattedValue = use(this.valueFormatter).formatAny(use(value));
           if (formattedValue === '') { return null; }
 
-          const choiceOptions = use(this._choiceOptionsByName).get(formattedValue);
           return choiceToken(
             formattedValue,
-            choiceOptions || {},
+            {
+              ...(use(this._choiceOptionsByName).get(formattedValue) || {}),
+              invalid: !use(this._choiceValuesSet).has(formattedValue),
+            },
             dom.cls(cssChoiceText.className),
-            testId('choice-text')
+            testId('choice-token')
           );
         }),
       ),
@@ -84,8 +85,8 @@ export class ChoiceTextBox extends NTextBox {
     return this.buildConfigDom();
   }
 
-  protected getChoiceValues(): Computed<string[]> {
-    return this._choiceValues;
+  protected getChoiceValuesSet(): Computed<Set<string>> {
+    return this._choiceValuesSet;
   }
 
   protected getChoiceOptions(): Computed<ChoiceOptionsByName> {

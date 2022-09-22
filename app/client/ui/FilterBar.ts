@@ -3,7 +3,7 @@ import { ColumnRec, ViewFieldRec, ViewSectionRec } from "app/client/models/DocMo
 import { FilterInfo } from "app/client/models/entities/ViewSectionRec";
 import { attachColumnFilterMenu } from "app/client/ui/ColumnFilterMenu";
 import { cssButton, cssButtonGroup } from "app/client/ui2018/buttons";
-import { colors, testId } from "app/client/ui2018/cssVars";
+import { testId, theme } from "app/client/ui2018/cssVars";
 import { icon } from "app/client/ui2018/icons";
 import { menu, menuItemAsync } from "app/client/ui2018/menus";
 import { dom, IDisposableOwner, IDomArgs, styled } from "grainjs";
@@ -25,7 +25,7 @@ function makeFilterField(viewSection: ViewSectionRec, filterInfo: FilterInfo,
     primaryButton(
       testId('btn'),
       cssIcon('FilterSimple'),
-      cssMenuTextLabel(dom.text(filterInfo.fieldOrColumn.label)),
+      cssMenuTextLabel(dom.text(filterInfo.fieldOrColumn.origCol().label)),
       cssBtn.cls('-grayed', filterInfo.filter.isSaved),
       attachColumnFilterMenu(viewSection, filterInfo, {
         placement: 'bottom-start', attach: 'body',
@@ -48,7 +48,7 @@ export function addFilterMenu(filters: FilterInfo[], viewSection: ViewSectionRec
       ...filters.map((filterInfo) => (
         menuItemAsync(
           () => turnOnAndOpenFilter(filterInfo.fieldOrColumn, viewSection, popupControls),
-          filterInfo.fieldOrColumn.label.peek(),
+          filterInfo.fieldOrColumn.origCol().label.peek(),
           dom.cls('disabled', filterInfo.isFiltered),
           testId('add-filter-item'),
         )
@@ -117,14 +117,14 @@ const cssBtn = styled('div', `
     margin: 0 4px;
   }
   &-grayed {
-    color:        ${colors.light};
-    --icon-color: ${colors.light};
-    background-color: ${colors.slate};
-    border-color: ${colors.slate};
+    color:        ${theme.filterBarButtonSavedFg};
+    --icon-color: ${theme.filterBarButtonSavedFg};
+    background-color: ${theme.filterBarButtonSavedBg};
+    border-color: ${theme.filterBarButtonSavedBg};
   }
   &-grayed:hover {
-    background-color: ${colors.darkGrey};
-    border-color: ${colors.darkGrey};
+    background-color: ${theme.filterBarButtonSavedHoverBg};
+    border-color: ${theme.filterBarButtonSavedHoverBg};
   }
 `);
 const primaryButton = (...args: IDomArgs<HTMLDivElement>) => (

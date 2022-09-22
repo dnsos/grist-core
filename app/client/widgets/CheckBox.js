@@ -28,14 +28,8 @@ CheckBox.prototype.buildDom = function(row) {
       }),
       dom('div.widget_checkmark',
         kd.show(value),
-        dom('div.checkmark_kick',
-          kd.style('background-color', this.field.textColor),
-          kd.style('border-color', this.field.textColor)
-        ),
-        dom('div.checkmark_stem',
-          kd.style('background-color', this.field.textColor),
-          kd.style('border-color', this.field.textColor)
-        )
+        dom('div.checkmark_kick'),
+        dom('div.checkmark_stem')
       )
     )
   );

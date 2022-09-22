@@ -6,6 +6,7 @@
 
 import {isAffirmative} from 'app/common/gutil';
 import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
+import {TEAM_FREE_PLAN} from 'app/common/Features';
 
 const debugging = isAffirmative(process.env.DEBUG) || isAffirmative(process.env.VERBOSE);
 
@@ -59,12 +60,13 @@ export async function main() {
   await fse.mkdirp(process.env.GRIST_DATA_DIR!);
   // Make a blank db if needed.
   await updateDb();
+  const db = new HomeDBManager();
+  await db.connect();
+  await db.initializeSpecialIds({skipWorkspaces: true});
+
   // If a team/organization is specified, make sure it exists.
   const org = process.env.GRIST_SINGLE_ORG;
   if (org && org !== 'docs') {
-    const db = new HomeDBManager();
-    await db.connect();
-    await db.initializeSpecialIds({skipWorkspaces: true});
     try {
       db.unwrapQueryResult(await db.getOrg({
         userId: db.getPreviewerUserId(),
@@ -78,10 +80,8 @@ export async function main() {
       if (!email) {
         throw new Error('need GRIST_DEFAULT_EMAIL to create site');
       }
-      const user = await db.getUserByLogin(email, {
-        email,
-        name: email,
-      });
+      const profile = {email, name: email};
+      const user = await db.getUserByLogin(email, {profile});
       if (!user) {
         // This should not happen.
         throw new Error('failed to create GRIST_DEFAULT_EMAIL user');
@@ -92,10 +92,11 @@ export async function main() {
       }, {
         setUserAsOwner: false,
         useNewPlan: true,
-        planType: 'free'
+        planType: TEAM_FREE_PLAN
       });
     }
   }
+
   // Launch single-port, self-contained version of Grist.
   const server = await mergedServerMain(G.port, ["home", "docs", "static"]);
   if (process.env.GRIST_TESTING_SOCKET) {

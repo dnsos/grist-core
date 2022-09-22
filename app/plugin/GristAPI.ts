@@ -69,40 +69,104 @@ export interface GristAPI {
 }
 
 /**
- * GristDocAPI interface is implemented by Grist, and allows getting information from and
- * interacting with the Grist document to which a plugin is attached.
+ * Allows getting information from and interacting with the Grist document to which a plugin or widget is attached.
  */
 export interface GristDocAPI {
-  // Returns the docName that identifies the document.
+  /**
+   * Returns an identifier for the document.
+   */
   getDocName(): Promise<string>;
 
-  // Returns a sorted list of table IDs.
+  /**
+   * Returns a sorted list of table IDs.
+   */
   listTables(): Promise<string[]>;
 
-  // Returns a complete table of data in the format {colId: [values]}, including the 'id' column.
-  // Do not modify the returned arrays in-place, especially if used directly (not over RPC).
-  // TODO: return type is Promise{[colId: string]: CellValue[]}> but cannot be specified because
-  // ts-interface-builder does not properly support index-signature.
+  /**
+   * Returns a complete table of data as [[RowRecords]], including the
+   * 'id' column. Do not modify the returned arrays in-place, especially if used
+   * directly (not over RPC).
+   */
   fetchTable(tableId: string): Promise<any>;
+  // TODO: return type is Promise{[colId: string]: CellValue[]}> but cannot be specified
+  // because ts-interface-builder does not properly support index-signature.
 
-  // Applies an array of user actions.
-  // todo: return type should be Promise<ApplyUAResult>, but this requires importing modules from
-  // `app/common` which is not currently supported by the build.
-  applyUserActions(actions: any[][]): Promise<any>;
+  /**
+   * Applies an array of user actions.
+   */
+  applyUserActions(actions: any[][], options?: any): Promise<any>;
+  // TODO: return type should be Promise<ApplyUAResult>, but this requires importing
+  // modules from `app/common` which is not currently supported by the build.
+
+  /**
+   * Get a token for out-of-band access to the document.
+   */
+  getAccessToken(options: AccessTokenOptions): Promise<AccessTokenResult>;
 }
 
+/**
+ * Interface for the data backing a single widget.
+ */
 export interface GristView {
-  // Like fetchTable, but gets data for the custom section specifically, if there is any.
-  // TODO: return type is Promise{[colId: string]: CellValue[]}> but cannot be specified because
-  // ts-interface-builder does not properly support index-signature.
+  /**
+   * Like [[GristDocAPI.fetchTable]], but gets data for the custom section specifically, if there is any.
+   */
   fetchSelectedTable(): Promise<any>;
+  // TODO: return type is Promise{[colId: string]: CellValue[]}> but cannot be specified
+  // because ts-interface-builder does not properly support index-signature.
 
-  // Similar TODO to fetchSelectedTable for return type.
+  /**
+   * Fetches selected record by its `rowId`.
+   */
   fetchSelectedRecord(rowId: number): Promise<any>;
+  // TODO: return type is Promise{[colId: string]: CellValue}> but cannot be specified
+  // because ts-interface-builder does not properly support index-signature.
 
-  // Allow custom widget to be listed as a possible source for linking with SELECT BY.
+  /**
+   * Allow custom widget to be listed as a possible source for linking with SELECT BY.
+   */
   allowSelectBy(): Promise<void>;
 
-  // Set the list of selected rows to be used against any linked widget. Requires `allowSelectBy()`.
+  /**
+   * Set the list of selected rows to be used against any linked widget. Requires `allowSelectBy()`.
+   */
   setSelectedRows(rowIds: number[]): Promise<void>;
+}
+
+/**
+ * Options when creating access tokens.
+ */
+export interface AccessTokenOptions {
+  /** Restrict use of token to reading only */
+  readOnly?: boolean;
+}
+
+/**
+ * Access token information, including the token string itself, a base URL for
+ * API calls for which the access token can be used, and the time-to-live the
+ * token was created with.
+ */
+export interface AccessTokenResult {
+  /**
+   * The token string, which can currently be provided in an api call as a
+   * query parameter called "auth"
+   */
+  token: string;
+
+  /**
+   * The base url of the API for which the token can be used. Currently tokens
+   * are associated with a single document, so the base url will be something
+   * like `https://..../api/docs/DOCID`
+   *
+   * Access tokens currently only grant access to endpoints dealing with the
+   * internal content of a document (such as tables and cells) and not its
+   * metadata (such as the document name or who it is shared with).
+   */
+  baseUrl: string;
+
+  /**
+   * Number of milliseconds the access token will remain valid for
+   * after creation. This will be several minutes.
+   */
+  ttlMsecs: number;
 }

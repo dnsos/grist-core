@@ -1,14 +1,13 @@
 import {IToken, TokenField} from 'app/client/lib/TokenField';
-import {cssBlockedCursor} from 'app/client/ui/RightPanel';
+import {cssBlockedCursor} from 'app/client/ui/RightPanelStyles';
 import {basicButton, primaryButton} from 'app/client/ui2018/buttons';
-import {colorButton} from 'app/client/ui2018/ColorSelect';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {colorButton, ColorOption} from 'app/client/ui2018/ColorSelect';
+import {colors, testId, theme} from 'app/client/ui2018/cssVars';
 import {editableLabel} from 'app/client/ui2018/editableLabel';
 import {icon} from 'app/client/ui2018/icons';
 import {ChoiceOptionsByName, IChoiceOptions} from 'app/client/widgets/ChoiceTextBox';
-import {DEFAULT_TEXT_COLOR} from 'app/client/widgets/ChoiceToken';
 import {Computed, Disposable, dom, DomContents, DomElementArg, Holder, Observable, styled} from 'grainjs';
-import {createCheckers, iface, ITypeSuite, opt} from 'ts-interface-checker';
+import {createCheckers, iface, ITypeSuite, opt, union} from 'ts-interface-checker';
 import isEqual = require('lodash/isEqual');
 import uniqBy = require('lodash/uniqBy');
 
@@ -33,7 +32,7 @@ class ChoiceItem implements IToken {
     public label: string,
     // We will keep the previous label value for a token, to tell us which token
     // was renamed. For new tokens this should be null.
-    public readonly previousLabel: string | null,
+    public previousLabel: string | null,
     public options?: IChoiceOptions
   ) {}
 
@@ -41,19 +40,24 @@ class ChoiceItem implements IToken {
     return new ChoiceItem(label, this.previousLabel, this.options);
   }
 
-  public changeColors(options: IChoiceOptions) {
+  public changeStyle(options: IChoiceOptions) {
     return new ChoiceItem(this.label, this.previousLabel, {...this.options, ...options});
   }
 }
 
 const ChoiceItemType = iface([], {
   label: "string",
+  previousLabel: union("string", "null"),
   options: opt("ChoiceOptionsType"),
 });
 
 const ChoiceOptionsType = iface([], {
-  textColor: "string",
-  fillColor: "string",
+  textColor: opt("string"),
+  fillColor: opt("string"),
+  fontBold: opt("boolean"),
+  fontUnderline: opt("boolean"),
+  fontItalic: opt("boolean"),
+  fontStrikethrough: opt("boolean"),
 });
 
 const choiceTypes: ITypeSuite = {
@@ -62,8 +66,6 @@ const choiceTypes: ITypeSuite = {
 };
 
 const {ChoiceItemType: ChoiceItemChecker} = createCheckers(choiceTypes);
-
-const UNSET_COLOR = '#ffffff';
 
 /**
  * ChoiceListEntry - Editor for choices and choice colors.
@@ -127,7 +129,8 @@ export class ChoiceListEntry extends Disposable {
           keyBindings: {
             previous: 'ArrowUp',
             next: 'ArrowDown'
-          }
+          },
+          variant: 'vertical',
         });
 
         return cssVerticalFlex(
@@ -166,17 +169,29 @@ export class ChoiceListEntry extends Disposable {
               dom.forEach(someValues, val => {
                 return row(
                   cssTokenColorInactive(
-                    dom.style('background-color', getFillColor(choiceOptions.get(val))),
+                    dom.style('background-color', getFillColor(choiceOptions.get(val)) || '#FFFFFF'),
+                    dom.style('color', getTextColor(choiceOptions.get(val)) || '#000000'),
+                    dom.cls('font-bold', choiceOptions.get(val)?.fontBold ?? false),
+                    dom.cls('font-underline', choiceOptions.get(val)?.fontUnderline ?? false),
+                    dom.cls('font-italic', choiceOptions.get(val)?.fontItalic ?? false),
+                    dom.cls('font-strikethrough', choiceOptions.get(val)?.fontStrikethrough ?? false),
+                    'T',
                     testId('choice-list-entry-color')
                   ),
-                  cssTokenLabel(val)
+                  cssTokenLabel(
+                    val,
+                    testId('choice-list-entry-label')
+                  )
                 );
               }),
             ),
             // Show description row for any remaining rows
             dom.maybe(use => use(this._values).length > maxRows, () =>
               row(
-                dom.text((use) => `+${use(this._values).length - (maxRows - 1)} more`)
+                dom('span',
+                  testId('choice-list-entry-label'),
+                  dom.text((use) => `+${use(this._values).length - (maxRows - 1)} more`)
+                )
               )
             ),
             dom.on('click', () => this._startEditing()),
@@ -215,12 +230,15 @@ export class ChoiceListEntry extends Disposable {
     const newTokens = uniqBy(tokens, t => t.label);
     const newValues = newTokens.map(t => t.label);
     const newOptions: ChoiceOptionsByName = new Map();
+    const keys: Array<keyof IChoiceOptions> = [
+      'fillColor', 'textColor', 'fontBold', 'fontItalic', 'fontStrikethrough', 'fontUnderline'
+    ];
     for (const t of newTokens) {
       if (t.options) {
-        newOptions.set(t.label, {
-          fillColor: t.options.fillColor,
-          textColor: t.options.textColor
-        });
+        const options: IChoiceOptions = {};
+        keys.filter(k => t.options![k] !== undefined)
+            .forEach(k => options[k] = t.options![k] as any);
+        newOptions.set(t.label, options);
       }
     }
 
@@ -245,6 +263,10 @@ export class ChoiceListEntry extends Disposable {
   private _renderToken(token: ChoiceItem) {
     const fillColorObs = Observable.create(null, getFillColor(token.options));
     const textColorObs = Observable.create(null, getTextColor(token.options));
+    const fontBoldObs = Observable.create(null, token.options?.fontBold);
+    const fontItalicObs = Observable.create(null, token.options?.fontItalic);
+    const fontUnderlineObs = Observable.create(null, token.options?.fontUnderline);
+    const fontStrikethroughObs = Observable.create(null, token.options?.fontStrikethrough);
     const choiceText = Observable.create(null, token.label);
 
     const rename = async (to: string) => {
@@ -271,35 +293,69 @@ export class ChoiceListEntry extends Disposable {
       focus(tokenField.getTextInput());
     };
 
-    return cssColorAndLabel(
+    const tokenColorAndLabel: HTMLDivElement = cssColorAndLabel(
       dom.autoDispose(fillColorObs),
       dom.autoDispose(textColorObs),
       dom.autoDispose(choiceText),
-      colorButton(textColorObs,
-        fillColorObs,
+      colorButton({
+          textColor: new ColorOption({color: textColorObs, defaultColor: '#000000'}),
+          fillColor: new ColorOption(
+            {color: fillColorObs, allowsNone: true, noneText: 'none', defaultColor: '#FFFFFF'}),
+          fontBold: fontBoldObs,
+          fontItalic: fontItalicObs,
+          fontUnderline: fontUnderlineObs,
+          fontStrikethrough: fontStrikethroughObs
+        },
         async () => {
           const tokenField = this._tokenFieldHolder.get();
           if (!tokenField) { return; }
 
           const fillColor = fillColorObs.get();
           const textColor = textColorObs.get();
-          tokenField.replaceToken(token.label, ChoiceItem.from(token).changeColors({fillColor, textColor}));
+          const fontBold = fontBoldObs.get();
+          const fontItalic = fontItalicObs.get();
+          const fontUnderline = fontUnderlineObs.get();
+          const fontStrikethrough = fontStrikethroughObs.get();
+          tokenField.replaceToken(token.label, ChoiceItem.from(token).changeStyle({
+            fillColor,
+            textColor,
+            fontBold,
+            fontItalic,
+            fontUnderline,
+            fontStrikethrough,
+          }));
         }
       ),
-      editableLabel(choiceText,
-        rename,
-        testId('token-label'),
-        // Don't bubble up keyboard events, use them for editing the text.
-        // Without this keys like Backspace, or Mod+a will propagate and modify all tokens.
-        dom.on('keydown', stopPropagation),
-        // On enter, focus on the input element.
-        dom.onKeyDown({
-          Enter : focusOnNew
-        }),
-        // Don't bubble up click, as it would change focus.
-        dom.on('click', stopPropagation),
-        dom.cls(cssTokenLabel.className)),
+      editableLabel(choiceText, {
+        save: rename,
+        inputArgs: [
+          testId('token-label'),
+          // Don't bubble up keyboard events, use them for editing the text.
+          // Without this keys like Backspace, or Mod+a will propagate and modify all tokens.
+          dom.on('keydown', stopPropagation),
+          dom.on('copy', stopPropagation),
+          dom.on('cut', stopPropagation),
+          dom.on('paste', stopPropagation),
+          dom.onKeyDown({
+            // On enter, focus on the input element.
+            Enter : focusOnNew,
+            // On escape, focus on the token (i.e. the parent node of this element). That way
+            // the browser will scroll the view if needed, and a subsequent escape will close
+            // the editor.
+            Escape: () => tokenColorAndLabel.parentElement?.focus(),
+          }),
+          // Don't bubble up click, as it would change focus.
+          dom.on('click', stopPropagation),
+          dom.cls(cssEditableLabelInput.className),
+        ],
+        args: [dom.cls(cssEditableLabel.className)],
+      }),
     );
+
+    return [
+      tokenColorAndLabel,
+      dom.onKeyDown({Escape$: () => this._cancel()}),
+    ];
   }
 }
 
@@ -320,11 +376,11 @@ function row(...domArgs: DomElementArg[]): Element {
 }
 
 function getTextColor(choiceOptions?: IChoiceOptions) {
-  return choiceOptions?.textColor ?? DEFAULT_TEXT_COLOR;
+  return choiceOptions?.textColor;
 }
 
 function getFillColor(choiceOptions?: IChoiceOptions) {
-  return choiceOptions?.fillColor ?? UNSET_COLOR;
+  return choiceOptions?.fillColor;
 }
 
 /**
@@ -336,8 +392,9 @@ function getFillColor(choiceOptions?: IChoiceOptions) {
 function clipboardToChoices(clipboard: DataTransfer): ChoiceItem[] {
   const maybeTokens = clipboard.getData('application/json');
   if (maybeTokens && isJSON(maybeTokens)) {
-    const tokens = JSON.parse(maybeTokens);
+    const tokens: ChoiceItem[] = JSON.parse(maybeTokens);
     if (Array.isArray(tokens) && tokens.every((t): t is ChoiceItem => ChoiceItemChecker.test(t))) {
+      tokens.forEach(t => t.previousLabel = null);
       return tokens;
     }
   }
@@ -365,17 +422,17 @@ const cssListBox = styled('div', `
   line-height: 1.5;
   padding-left: 4px;
   padding-right: 4px;
-  border: 1px solid ${colors.hover};
+  border: 1px solid ${theme.choiceEntryBorderHover};
   border-radius: 4px;
-  background-color: white;
+  background-color: ${theme.choiceEntryBg};
 `);
 
 const cssListBoxInactive = styled(cssListBox, `
   cursor: pointer;
-  border: 1px solid ${colors.darkGrey};
+  border: 1px solid ${theme.choiceEntryBorder};
 
   &:hover:not(&-disabled) {
-    border: 1px solid ${colors.hover};
+    border: 1px solid ${theme.choiceEntryBorderHover};
   }
   &-disabled {
     opacity: 0.6;
@@ -388,9 +445,8 @@ const cssListRow = styled('div', `
   margin-bottom: 4px;
   padding: 4px 8px;
   color: ${colors.dark};
-  background-color: ${colors.mediumGrey};
+  background-color: ${colors.mediumGreyOpaque};
   border-radius: 3px;
-  overflow: hidden;
   text-overflow: ellipsis;
 `);
 
@@ -418,12 +474,17 @@ const cssToken = styled(cssListRow, `
   .${cssTokenField.className}.token-dragactive & {
     cursor: unset;
   }
+  &:focus {
+    outline: none;
+  }
 `);
 
 const cssTokenColorInactive = styled('div', `
   flex-shrink: 0;
   width: 18px;
   height: 18px;
+  display: grid;
+  place-items: center;
 `);
 
 const cssTokenLabel = styled('span', `
@@ -434,7 +495,22 @@ const cssTokenLabel = styled('span', `
   overflow: hidden;
 `);
 
+const cssEditableLabelInput = styled('input', `
+  display: inline-block;
+  text-overflow: ellipsis;
+  white-space: pre;
+  overflow: hidden;
+`);
+
+const cssEditableLabel = styled('div', `
+  margin-left: 6px;
+  text-overflow: ellipsis;
+  white-space: pre;
+  overflow: hidden;
+`);
+
 const cssTokenInput = styled('input', `
+  background-color: ${theme.choiceEntryBg};
   padding-top: 4px;
   padding-bottom: 4px;
   overflow: hidden;
@@ -459,7 +535,7 @@ const cssFlex = styled('div', `
 `);
 
 const cssColorAndLabel = styled(cssFlex, `
-  max-width: calc(100% - 16px);
+  max-width: calc(100% - 20px);
 `);
 
 const cssVerticalFlex = styled('div', `
@@ -477,7 +553,8 @@ const cssButtonRow = styled('div', `
 
 const cssDeleteButton = styled('div', `
   display: inline;
-  float:right;
+  float: right;
+  margin-left: 4px;
   cursor: pointer;
   .${cssTokenField.className}.token-dragactive & {
     cursor: unset;

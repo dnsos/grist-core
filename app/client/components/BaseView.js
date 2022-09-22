@@ -3,6 +3,8 @@ var ko = require('knockout');
 var moment = require('moment-timezone');
 var {getSelectionDesc} = require('app/common/DocActions');
 var {nativeCompare, roundDownToMultiple, waitObs} = require('app/common/gutil');
+var gutil = require('app/common/gutil');
+const MANUALSORT  = require('app/common/gristTypes').MANUALSORT;
 var gristTypes = require('app/common/gristTypes');
 var tableUtil = require('../lib/tableUtil');
 var {DataRowModel} = require('../models/DataRowModel');
@@ -60,7 +62,7 @@ function BaseView(gristDoc, viewSectionModel, options) {
   if (this.viewSection.table().summarySourceTable()) {
     const groupGetter = this.tableModel.tableData.getRowPropFunc('group');
     this._mainRowSource = rowset.BaseFilteredRowSource.create(this,
-      rowId => !gristTypes.isEmptyList(groupGetter(rowId)));
+      rowId => !groupGetter || !gristTypes.isEmptyList(groupGetter(rowId)));
     this._mainRowSource.subscribeTo(this._queryRowSource);
   } else {
     this._mainRowSource = this._queryRowSource;
@@ -229,6 +231,11 @@ BaseView.commonCommands = {
   insertCurrentDateTime: function() { this.insertCurrentDate(true); },
 
   copyLink: function() { this.copyLink().catch(reportError); },
+
+  showRawData: function() { this.showRawData().catch(reportError); },
+
+  filterByThisCellValue: function() { this.filterByThisCellValue(); },
+  duplicateRows: function() { this._duplicateRows().catch(reportError); }
 };
 
 /**
@@ -236,6 +243,9 @@ BaseView.commonCommands = {
  * loading.
  */
 BaseView.prototype.setCursorPos = function(cursorPos) {
+  if (this.isDisposed()) {
+    return;
+  }
   if (!this._isLoading.peek()) {
     this.cursor.setCursorPos(cursorPos);
   } else {
@@ -287,19 +297,64 @@ BaseView.prototype.moveEditRowToCursor = function() {
   return this.editRowModel;
 };
 
+// Get an anchor link for the current cell and a given view section to the clipboard.
+BaseView.prototype.getAnchorLinkForSection = function(sectionId) {
+  const rowId = this.viewData.getRowId(this.cursor.rowIndex())
+      // If there are no visible rows (happens in some widget linking situations),
+      // pick an arbitrary row which will hopefully be close to the top of the table.
+      || this.tableModel.tableData.findMatchingRowId({})
+      // If there are no rows at all, return the 'new record' row ID.
+      // Note that this case only happens in combination with the widget linking mentioned.
+      // If the table is empty but the 'new record' row is selected, the `viewData.getRowId` line above works.
+      || 'new';
+  const colRef = this.viewSection.viewFields().peek()[this.cursor.fieldIndex.peek()].colRef.peek();
+  return {hash: {sectionId, rowId, colRef}};
+}
+
 // Copy an anchor link for the current row to the clipboard.
 BaseView.prototype.copyLink = async function() {
-  const rowId = this.viewData.getRowId(this.cursor.rowIndex());
-  const colRef = this.viewSection.viewFields().peek()[this.cursor.fieldIndex()].colRef();
   const sectionId = this.viewSection.getRowId();
+  const anchorUrlState = this.getAnchorLinkForSection(sectionId);
   try {
-    const link = urlState().makeUrl({ hash: { sectionId, rowId, colRef } });
+    const link = urlState().makeUrl(anchorUrlState);
     await copyToClipboard(link);
     setTestState({clipboard: link});
     reportSuccess('Link copied to clipboard', {key: 'clipboard'});
   } catch (e) {
     throw new Error('cannot copy to clipboard');
   }
+};
+
+BaseView.prototype.showRawData = async function() {
+  const sectionId = this.schemaModel.rawViewSectionRef.peek();
+  const anchorUrlState = this.getAnchorLinkForSection(sectionId);
+  anchorUrlState.hash.popup = true;
+  await urlState().pushUrl(anchorUrlState, {replace: true, avoidReload: true});
+}
+
+BaseView.prototype.filterByThisCellValue = function() {
+  const rowId = this.viewData.getRowId(this.cursor.rowIndex());
+  const col = this.viewSection.viewFields().peek()[this.cursor.fieldIndex()].column();
+  let value = this.tableModel.tableData.getValue(rowId, col.colId.peek());
+
+  // This mimics the logic in ColumnFilterMenu.addCountsToMap
+  // ChoiceList and Reflist values get 'flattened' out so we filter by each element within.
+  // In any other column type, complex values (even lists) get converted to JSON.
+  let filterValues;
+  const colType = col.type.peek();
+  if (gristTypes.isList(value) && gristTypes.isListType(colType)) {
+    filterValues = value.slice(1);
+    if (!filterValues.length) {
+      // If the list is empty, filter instead by an empty value for the whole list
+      filterValues = [colType === "ChoiceList" ? "" : null];
+    }
+  } else {
+    if (Array.isArray(value)) {
+      value = JSON.stringify(value);
+    }
+    filterValues = [value];
+  }
+  this.viewSection.setFilter(col.getRowId(), JSON.stringify({included: filterValues}));
 };
 
 /**
@@ -322,59 +377,6 @@ BaseView.prototype.insertRow = function(index) {
     }
     return rowId;
   });
-};
-
-/**
- * Given a 2-d paste column-oriented paste data and target cols, transform the data to omit
- * fields that shouldn't be pasted over and extract rich paste data if available.
- * @param {Array<Array<(RichPasteObject|string)>>} data - Column-oriented 2-d array of either
- *    plain strings or rich paste data returned by `tableUtil.parsePasteHtml` with `displayValue`
- *    and, optionally, `colType` and `rawValue` attributes.
- * @param {Array<MetaRowModel>} cols - Array of target column objects
- * @returns {Object} - Object mapping colId to array of column values, suitable for use in Bulk
- *                     actions.
- */
-BaseView.prototype._parsePasteForView = function(data, fields) {
-  const updateCols = fields.map(field => {
-    const col = field && field.column();
-    if (col && !col.isRealFormula() && !col.disableEditData()) {
-      return col;
-    } else {
-      return null; // Don't include formulas and missing columns
-    }
-  });
-  const updateColIds = updateCols.map(c => c && c.colId());
-  const updateColTypes = updateCols.map(c => c && c.type());
-  const parsers = fields.map(field => field && field.createValueParser() || (x => x));
-  const docIdHash = tableUtil.getDocIdHash();
-
-  const richData = data.map((col, idx) => {
-    if (!col.length) {
-      return col;
-    }
-    const typeMatches = col[0] && col[0].colType === updateColTypes[idx] && (
-        // When copying references, only use the row ID (raw value) when copying within the same document
-        // to avoid referencing the wrong rows.
-        col[0].docIdHash === docIdHash || !gristTypes.isFullReferencingType(updateColTypes[idx])
-    );
-    const parser = parsers[idx];
-    return col.map(v => {
-      if (v) {
-        if (typeMatches && v.hasOwnProperty('rawValue')) {
-          return v.rawValue;
-        }
-        if (v.hasOwnProperty('displayValue')) {
-          return parser(v.displayValue);
-        }
-        if (typeof v === "string") {
-          return parser(v);
-        }
-      }
-      return v;
-    });
-  });
-
-  return _.omit(_.object(updateColIds, richData), null);
 };
 
 BaseView.prototype._getDefaultColValues = function() {
@@ -675,5 +677,62 @@ BaseView.prototype.scrollToCursor = function() {
   // to override
   return Promise.resolve();
 };
+
+/**
+ * Return a list of manual sort positions so that inserting {numInsert} rows
+ * with the returned positions will place them in between index-1 and index.
+ * when the GridView is sorted by MANUALSORT
+ **/
+BaseView.prototype._getRowInsertPos = function(index, numInserts) {
+  var rowId = this.viewData.getRowId(index);
+  var insertPos = this.tableModel.tableData.getValue(rowId, MANUALSORT);
+  return Array(numInserts).fill(insertPos);
+};
+
+/**
+ * Duplicates selected row(s) and returns inserted rowIds
+ */
+BaseView.prototype._duplicateRows = async function() {
+  if (this.viewSection.disableAddRemoveRows() || this.disableEditing()) {
+    return;
+  }
+  // Get current selection (we need only rowIds).
+  const selection = this.getSelection();
+  const rowIds = selection.rowIds;
+  const length = rowIds.length;
+  // Start assembling action.
+  const action = ['BulkAddRecord'];
+  // Put nulls as rowIds.
+  action.push(gutil.arrayRepeat(length, null));
+  const columns = {};
+  action.push(columns);
+  // Calculate new positions for rows using helper function. It requires
+  // index where we want to put new rows (it accepts new row index).
+  const lastSelectedIndex = this.viewData.getRowIndex(rowIds[length-1]);
+  columns.manualSort = this._getRowInsertPos(lastSelectedIndex + 1, length);
+  // Now copy all visible data.
+  for(const col of this.viewSection.columns.peek()) {
+    // But omit all formula columns (and empty ones).
+    const colId = col.colId.peek();
+    if (col.isFormula.peek()) {
+      continue;
+    }
+    columns[colId] = rowIds.map(id => this.tableModel.tableData.getValue(id, colId));
+    // If all values in a column are censored, remove this column,
+    if (columns[colId].every(gristTypes.isCensored)) {
+      delete columns[colId]
+    } else {
+      // else remove only censored values
+      columns[colId].forEach((val, i) => {
+        if (gristTypes.isCensored(val)) {
+          columns[colId][i] = null;
+        }
+      })
+    }
+  }
+  const result = await this.sendTableAction(action, `Duplicated rows ${rowIds}`);
+  return result;
+}
+
 
 module.exports = BaseView;

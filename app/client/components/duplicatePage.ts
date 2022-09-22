@@ -1,6 +1,7 @@
 import { GristDoc } from 'app/client/components/GristDoc';
 import { ViewFieldRec, ViewSectionRec } from 'app/client/models/DocModel';
-import { cssField, cssInput, cssLabel} from 'app/client/ui/MakeCopyMenu';
+import { cssInput } from 'app/client/ui/cssInput';
+import { cssField, cssLabel } from 'app/client/ui/MakeCopyMenu';
 import { IPageWidget, toPageWidget } from 'app/client/ui/PageWidgetPicker';
 import { confirmModal } from 'app/client/ui2018/modals';
 import { BulkColValues, getColValues, RowRecord, UserAction } from 'app/common/DocActions';
@@ -186,7 +187,7 @@ async function createNewViewSections(docData: GristDoc['docData'], viewSections:
 
 // Helper to create an action that add widget to the view with viewId.
 function newViewSectionAction(widget: IPageWidget, viewId: number) {
-  return ['CreateViewSection', widget.table, viewId, widget.type, widget.summarize ? widget.columns : null];
+  return ['CreateViewSection', widget.table, viewId, widget.type, widget.summarize ? widget.columns : null, null];
 }
 
 /**

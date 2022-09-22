@@ -1,12 +1,15 @@
-import * as pidusage from '@gristlabs/pidusage';
+import pidusage from '@gristlabs/pidusage';
+import {Document} from 'app/gen-server/entity/Document';
+import {getScope} from 'app/server/lib/requestUtils';
 import * as bluebird from 'bluebird';
 import {EventEmitter} from 'events';
 import * as path from 'path';
 
 import {ApiError} from 'app/common/ApiError';
-import {mapSetOrClear} from 'app/common/AsyncCreate';
+import {mapSetOrClear, MapWithTTL} from 'app/common/AsyncCreate';
 import {BrowserSettings} from 'app/common/BrowserSettings';
 import {DocCreationInfo, DocEntry, DocListAPI, OpenDocMode, OpenLocalDocResult} from 'app/common/DocListAPI';
+import {FilteredDocUsageSummary} from 'app/common/DocUsage';
 import {Invite} from 'app/common/sharing';
 import {tbind} from 'app/common/tbind';
 import {NEW_DOCUMENT_CODE} from 'app/common/UserAPI';
@@ -24,7 +27,7 @@ import {GristServer} from 'app/server/lib/GristServer';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
 import {makeForkIds, makeId} from 'app/server/lib/idUtils';
 import {checkAllegedGristDoc} from 'app/server/lib/serverUtils';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {ActiveDoc} from './ActiveDoc';
 import {PluginManager} from './PluginManager';
 import {getFileUploadInfo, globalUploadSet, makeAccessId, UploadInfo} from './uploads';
@@ -34,6 +37,10 @@ import noop = require('lodash/noop');
 // but is a bit of a burden under heavy traffic.
 export const DEFAULT_CACHE_TTL = 10000;
 
+// How long to remember that a document has been explicitly set in a
+// recovery mode.
+export const RECOVERY_CACHE_TTL = 30000;
+
 /**
  * DocManager keeps track of "active" Grist documents, i.e. those loaded
  * in-memory, with clients connected to them.
@@ -42,14 +49,20 @@ export class DocManager extends EventEmitter {
   // Maps docName to promise for ActiveDoc object. Most of the time the promise
   // will be long since resolved, with the resulting document cached.
   private _activeDocs: Map<string, Promise<ActiveDoc>> = new Map();
+  // Remember recovery mode of documents.
+  private _inRecovery = new MapWithTTL<string, boolean>(RECOVERY_CACHE_TTL);
 
   constructor(
     public readonly storageManager: IDocStorageManager,
-    public readonly pluginManager: PluginManager,
+    public readonly pluginManager: PluginManager|null,
     private _homeDbManager: HomeDBManager|null,
     public gristServer: GristServer
   ) {
     super();
+  }
+
+  public setRecovery(docId: string, recovery: boolean) {
+    this._inRecovery.set(docId, recovery);
   }
 
   // attach a home database to the DocManager.  During some tests, it
@@ -311,19 +324,28 @@ export class DocManager extends EventEmitter {
         }
       }
 
-      const [metaTables, recentActions] = await Promise.all([
+      const [metaTables, recentActions, userOverride] = await Promise.all([
         activeDoc.fetchMetaTables(docSession),
-        activeDoc.getRecentMinimalActions(docSession)
+        activeDoc.getRecentMinimalActions(docSession),
+        activeDoc.getUserOverride(docSession),
       ]);
 
-      const result = {
+      let docUsage: FilteredDocUsageSummary | undefined;
+      try {
+        docUsage = await activeDoc.getFilteredDocUsageSummary(docSession);
+      } catch (e) {
+        log.warn("DocManager.openDoc failed to get doc usage", e);
+      }
+
+      const result: OpenLocalDocResult = {
         docFD: docSession.fd,
         clientId: docSession.client.clientId,
         doc: metaTables,
         log: recentActions,
         recoveryMode: activeDoc.recoveryMode,
-        userOverride: await activeDoc.getUserOverride(docSession),
-      } as OpenLocalDocResult;
+        userOverride,
+        docUsage,
+      };
 
       if (!activeDoc.muted) {
         this.emit('open-doc', this.storageManager.getPath(activeDoc.docName));
@@ -447,7 +469,7 @@ export class DocManager extends EventEmitter {
     if (!this._activeDocs.has(docName)) {
       activeDoc = await mapSetOrClear(
         this._activeDocs, docName,
-        this._createActiveDoc(docSession, docName, wantRecoveryMode)
+        this._createActiveDoc(docSession, docName, wantRecoveryMode ?? this._inRecovery.get(docName))
           .then(newDoc => {
             // Propagate backupMade events from newly opened activeDocs (consolidate all to DocMan)
             newDoc.on('backupMade', (bakPath: string) => {
@@ -461,24 +483,54 @@ export class DocManager extends EventEmitter {
     return activeDoc;
   }
 
-  private async _createActiveDoc(docSession: OptDocSession, docName: string, safeMode?: boolean) {
-    // Get URL for document for use with SELF_HYPERLINK().
+  private async _getDoc(docSession: OptDocSession, docName: string) {
     const cachedDoc = getDocSessionCachedDoc(docSession);
-    let docUrl: string|undefined;
+    if (cachedDoc) {
+      return cachedDoc;
+    }
+
+    let db: HomeDBManager;
     try {
-      if (cachedDoc) {
-        docUrl = await this.gristServer.getResourceUrl(cachedDoc);
-      } else {
-        docUrl = await this.gristServer.getDocUrl(docName);
+      // For the sake of existing tests, get the db from gristServer where it may not exist and we should give up,
+      // rather than using this._homeDbManager which may exist and then it turns out the document itself doesn't.
+      db = this.gristServer.getHomeDBManager();
+    } catch (e) {
+      if (e.message === "no db") {
+        return;
       }
+      throw e;
+    }
+
+    if (docSession.req) {
+      const scope = getScope(docSession.req);
+      if (scope.urlId) {
+        return db.getDoc(scope);
+      }
+    }
+
+    return await db.getRawDocById(docName);
+  }
+
+  private async _getDocUrls(doc: Document) {
+    try {
+      return {
+        docUrl: await this.gristServer.getResourceUrl(doc),
+        docApiUrl: await this.gristServer.getResourceUrl(doc, 'api'),
+      };
     } catch (e) {
       // If there is no home url, we cannot construct links.  Accept this, for the benefit
       // of legacy tests.
-      if (!String(e).match(/need APP_HOME_URL/)) {
+      if (e.message !== "need APP_HOME_URL") {
         throw e;
       }
     }
-    return this.gristServer.create.ActiveDoc(this, docName, {docUrl, safeMode});
+  }
+
+  private async _createActiveDoc(docSession: OptDocSession, docName: string, safeMode?: boolean) {
+    const doc = await this._getDoc(docSession, docName);
+    // Get URL for document for use with SELF_HYPERLINK().
+    const docUrls = doc && await this._getDocUrls(doc);
+    return new ActiveDoc(this, docName, {...docUrls, safeMode, doc});
   }
 
   /**
@@ -561,7 +613,7 @@ export class DocManager extends EventEmitter {
       return docUtils.createExclusive(this.storageManager.getPath(name));
     });
     log.debug('DocManager._createNewDoc picked name', docName);
-    await this.pluginManager.pluginsLoaded;
+    await this.pluginManager?.pluginsLoaded;
     return docName;
   }
 }

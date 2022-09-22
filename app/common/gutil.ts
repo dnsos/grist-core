@@ -1,9 +1,10 @@
 import {delay} from 'app/common/delay';
 import {BindableValue, DomElementMethod, ISubscribable, Listener, Observable, subscribeElem, UseCB} from 'grainjs';
 import {Observable as KoObservable} from 'knockout';
-import constant = require('lodash/constant');
 import identity = require('lodash/identity');
-import times = require('lodash/times');
+
+// Some definitions have moved to be used by plugin API.
+export {arrayRepeat} from 'app/plugin/gutil';
 
 export const UP_TRIANGLE = '\u25B2';
 export const DOWN_TRIANGLE = '\u25BC';
@@ -47,6 +48,11 @@ export function padStart(str: string, targetLength: number, padString: string) {
 // Capitalizes every word in a string.
 export function capitalize(str: string): string {
   return str.replace(/\b[a-z]/gi, c => c.toUpperCase());
+}
+
+// Capitalizes the first word in a string.
+export function capitalizeFirstWord(str: string): string {
+  return str.replace(/\b[a-z]/i, c => c.toUpperCase());
 }
 
 // Returns whether the string n represents a valid number.
@@ -144,6 +150,17 @@ export function undef<T extends Array<any>>(...list: T): Undef<T> {
   return undefined as any;
 }
 
+/**
+ * Like undef, but each element of list is a method that is only called
+ * if needed, and promises are supported. No fancy type inference though, sorry.
+ */
+export async function firstDefined<T>(...list: Array<() => Promise<T>>): Promise<T | undefined> {
+  for(const op of list) {
+    const value = await op();
+    if (value !== undefined) { return value; }
+  }
+  return undefined;
+}
 
 /**
  * Parses json and returns the result, or returns defaultVal if parsing fails.
@@ -362,13 +379,6 @@ export function arraySplice<T>(target: T[], start: number, arrToInsert: ArrayLik
   return target;
 }
 
-
-/**
- * Returns a new array of length count, filled with the given value.
- */
-export function arrayRepeat<T>(count: number, value: T): T[] {
-  return times(count, constant(value));
-}
 
 // Type for a compare func that returns a positive, negative, or zero value, as used for sorting.
 export type CompareFunc<T> = (a: T, b: T) => number;
@@ -900,9 +910,9 @@ export function isAffirmative(parameter: any): boolean {
  * Returns whether a value is neither null nor undefined, with a type guard for the return type.
  *
  * This is particularly useful for filtering, e.g. if `array` includes values of type
- * T|null|undefined, then TypeScript can tell that `array.filter(isObject)` has the type T[].
+ * T|null|undefined, then TypeScript can tell that `array.filter(isNonNullish)` has the type T[].
  */
-export function isObject<T>(value: T | null | undefined): value is T {
+export function isNonNullish<T>(value: T | null | undefined): value is T {
   return value !== null && value !== undefined;
 }
 
@@ -926,4 +936,26 @@ export function getDistinctValues<T>(values: readonly T[], count: number = Infin
     distinct.add(values[i]);
   }
   return distinct;
+}
+
+/**
+ * Asserts that variable `name` has a non-nullish `value`.
+ */
+export function assertIsDefined<T>(name: string, value: T): asserts value is NonNullable<T> {
+  if (value === undefined || value === null) {
+    throw new Error(`Expected '${name}' to be defined, but received ${value}`);
+  }
+}
+
+/**
+ * Calls function `fn`, passes any thrown errors to function `recover`, and finally calls `fn`
+ * once more if `recover` doesn't throw.
+ */
+ export async function retryOnce<T>(fn: () => Promise<T>, recover: (e: unknown) => Promise<void>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    await recover(e);
+    return await fn();
+  }
 }

@@ -1,4 +1,4 @@
-import * as BaseView from 'app/client/components/BaseView';
+import BaseView from 'app/client/components/BaseView';
 import {CursorPos} from 'app/client/components/Cursor';
 import {FilterColValues, LinkingState} from 'app/client/components/LinkingState';
 import {KoArray} from 'app/client/lib/koArray';
@@ -8,6 +8,7 @@ import {
   FilterRec,
   IRowModel,
   recordSet,
+  refListRecords,
   refRecord,
   TableRec,
   ViewFieldRec,
@@ -22,13 +23,14 @@ import {arrayRepeat} from 'app/common/gutil';
 import {Sort} from 'app/common/SortSpec';
 import {ColumnsToMap, WidgetColumnMap} from 'app/plugin/CustomSectionAPI';
 import {ColumnToMapImpl} from 'app/client/models/ColumnToMap';
-import {Computed, Observable} from 'grainjs';
+import {removeRule, RuleOwner} from 'app/client/models/RuleOwner';
+import {Computed, Holder, Observable} from 'grainjs';
 import * as ko from 'knockout';
 import defaults = require('lodash/defaults');
 
 // Represents a section of user views, now also known as a "page widget" (e.g. a view may contain
 // a grid section and a chart section).
-export interface ViewSectionRec extends IRowModel<"_grist_Views_section"> {
+export interface ViewSectionRec extends IRowModel<"_grist_Views_section">, RuleOwner {
   viewFields: ko.Computed<KoArray<ViewFieldRec>>;
 
   // All table columns associated with this view section, excluding hidden helper columns.
@@ -44,8 +46,10 @@ export interface ViewSectionRec extends IRowModel<"_grist_Views_section"> {
 
   table: ko.Computed<TableRec>;
 
-  tableTitle: ko.Computed<string>;
+  // Widget title with a default value
   titleDef: modelUtil.KoSaveableObservable<string>;
+  // Default widget title (the one that is used in titleDef).
+  defaultWidgetTitle: ko.PureComputed<string>;
 
   // true if this record is its table's rawViewSection, i.e. a 'raw data view'
   // in which case the UI prevents various things like hiding columns or changing the widget type.
@@ -118,6 +122,7 @@ export interface ViewSectionRec extends IRowModel<"_grist_Views_section"> {
   // Linking state maintains .filterFunc and .cursorPos observables which we use for
   // auto-scrolling and filtering.
   linkingState: ko.Computed<LinkingState | null>;
+  _linkingState: Holder<LinkingState>; // Holder for the current value of linkingState
 
   linkingFilter: ko.Computed<FilterColValues>;
 
@@ -164,6 +169,8 @@ export interface ViewSectionRec extends IRowModel<"_grist_Views_section"> {
 
   // List of selected rows
   selectedRows: Observable<number[]>;
+
+  editingFormula: ko.Computed<boolean>;
 
   // Save all filters of fields/columns in the section.
   saveFilters(): Promise<void>;
@@ -218,7 +225,7 @@ export interface CustomViewSectionDef {
 
 // Information about filters for a field or hidden column.
 export interface FilterInfo {
-  // The field or column associated with this filter info.
+  // The field or column associated with this filter info (field if column is visible, else column).
   fieldOrColumn: ViewFieldRec|ColumnRec;
   // Filter that applies to this field/column, if any.
   filter: modelUtil.CustomComputed<string>;
@@ -231,7 +238,12 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
 
   // All table columns associated with this view section, excluding any hidden helper columns.
   this.columns = this.autoDispose(ko.pureComputed(() => this.table().columns().all().filter(c => !c.isHiddenCol())));
-
+  this.editingFormula = ko.pureComputed({
+    read: () => docModel.editingFormula(),
+    write: val => {
+      docModel.editingFormula(val);
+    }
+  });
   const defaultOptions = {
     verticalGridlines: true,
     horizontalGridlines: true,
@@ -278,19 +290,31 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
 
   this.table = refRecord(docModel.tables, this.tableRef);
 
-  this.tableTitle = this.autoDispose(ko.pureComputed(() => this.table().tableTitle()));
-  this.titleDef = modelUtil.fieldWithDefault(
-    this.title,
-    () => this.table().tableTitle() + (
-      (this.parentKey() === 'record') ? '' : ` ${getWidgetTypes(this.parentKey.peek() as any).label}`
-    )
-  );
+
+  // The user-friendly name of the table, which is the same as tableId for non-summary tables,
+  // and is 'tableId[groupByCols...]' for summary tables.
+  // Consist of 3 parts
+  // - TableId (or primary table id for summary tables) capitalized
+  // - Grouping description (table record contains this for summary tables)
+  // - Widget type description (if not grid)
+  // All concatenated separated by space.
+  this.defaultWidgetTitle = this.autoDispose(ko.pureComputed(() => {
+    const widgetTypeDesc = this.parentKey() !== 'record' ? `${getWidgetTypes(this.parentKey.peek() as any).label}` : '';
+    const table = this.table();
+    return [
+      table.tableNameDef()?.toUpperCase(), // Due to ACL this can be null.
+      table.groupDesc(),
+      widgetTypeDesc
+    ].filter(part => Boolean(part?.trim())).join(' ');
+  }));
+  // Widget title.
+  this.titleDef = modelUtil.fieldWithDefault(this.title, this.defaultWidgetTitle);
 
   // true if this record is its table's rawViewSection, i.e. a 'raw data view'
   // in which case the UI prevents various things like hiding columns or changing the widget type.
   this.isRaw = this.autoDispose(ko.pureComputed(() => this.table().rawViewSectionRef() === this.getRowId()));
 
-  this.borderWidthPx = ko.pureComputed(function() { return this.borderWidth() + 'px'; }, this);
+  this.borderWidthPx = ko.pureComputed(() => this.borderWidth() + 'px');
 
   this.layoutSpecObj = modelUtil.jsonObservable(this.layoutSpec);
 
@@ -317,7 +341,7 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
    */
   this.filters = this.autoDispose(ko.computed(() => {
     const savedFiltersByColRef = new Map(this._savedFilters().all().map(f => [f.colRef(), f]));
-    const viewFieldsByColRef = new Map(this.viewFields().all().map(f => [f.colRef(), f]));
+    const viewFieldsByColRef = new Map(this.viewFields().all().map(f => [f.origCol().getRowId(), f]));
 
     return this.columns().map(column => {
       const savedFilter = savedFiltersByColRef.get(column.origColRef());
@@ -450,7 +474,7 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
   this.hasFocus = ko.pureComputed({
     // Read may occur for recently disposed sections, must check condition first.
     read: () => !this.isDisposed() && this.view().activeSectionId() === this.id(),
-    write: (val) => { if (val) { this.view().activeSectionId(this.id()); } }
+    write: (val) => { this.view().activeSectionId(val ? this.id() : 0); }
   });
 
   this.activeLinkSrcSectionRef = modelUtil.customValue(this.linkSrcSectionRef);
@@ -471,17 +495,21 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
   this.linkSrcCol = refRecord(docModel.columns, this.activeLinkSrcColRef);
   this.linkTargetCol = refRecord(docModel.columns, this.activeLinkTargetColRef);
 
-  this.activeRowId = ko.observable(null);
+  this.activeRowId = ko.observable<RowId|null>(null);
 
+  this._linkingState = Holder.create(this);
   this.linkingState = this.autoDispose(ko.pureComputed(() => {
-    if (!this.linkSrcSection().getRowId()) {
+    if (!this.activeLinkSrcSectionRef()) {
+      // This view section isn't selecting by anything.
       return null;
     }
     try {
       const config = new LinkConfig(this);
-      return new LinkingState(docModel, config);
+      return LinkingState.create(this._linkingState, docModel, config);
     } catch (err) {
-      console.warn(`Can't create LinkingState: ${err.message}`);
+      console.warn(err);
+      // Dispose old LinkingState in case creating the new one failed.
+      this._linkingState.dispose();
       return null;
     }
   }));
@@ -491,7 +519,7 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
   }));
 
   // If the view instance for this section is instantiated, it will be accessible here.
-  this.viewInstance = ko.observable(null);
+  this.viewInstance = ko.observable<BaseView|null>(null);
 
   // Describes the most recent cursor position in the section.
   this.lastCursorPos = {
@@ -527,8 +555,8 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
   );
 
   this.hasCustomOptions = ko.observable(false);
-  this.desiredAccessLevel = ko.observable(null);
-  this.columnsToMap = ko.observable(null);
+  this.desiredAccessLevel = ko.observable<AccessLevel|null>(null);
+  this.columnsToMap = ko.observable<ColumnsToMap|null>(null);
   // Calculate mapped columns for Custom Widget.
   this.mappedColumns = ko.pureComputed(() => {
     // First check if widget has requested a custom column mapping and
@@ -571,4 +599,25 @@ export function createViewSectionRec(this: ViewSectionRec, docModel: DocModel): 
 
   this.allowSelectBy = Observable.create(this, false);
   this.selectedRows = Observable.create(this, []);
+
+  this.tableId = this.autoDispose(ko.pureComputed(() => this.table().tableId()));
+  const rawSection = this.autoDispose(ko.pureComputed(() => this.table().rawViewSection()));
+  this.rulesCols = refListRecords(docModel.columns, ko.pureComputed(() => rawSection().rules()));
+  this.rulesColsIds = ko.pureComputed(() => this.rulesCols().map(c => c.colId()));
+  this.rulesStyles = modelUtil.savingComputed({
+    read: () => rawSection().optionsObj.prop("rulesOptions")() ?? [],
+    write: (setter, val) => setter(rawSection().optionsObj.prop("rulesOptions"), val)
+  });
+  this.hasRules = ko.pureComputed(() => this.rulesCols().length > 0);
+  this.addEmptyRule = async () => {
+    const action = [
+      'AddEmptyRule',
+      this.tableId.peek(),
+      null,
+      null
+    ];
+    await docModel.docData.sendAction(action, `Update rules for ${this.table.peek().tableId.peek()}`);
+  };
+
+  this.removeRule = (index: number) => removeRule(docModel, this, index);
 }

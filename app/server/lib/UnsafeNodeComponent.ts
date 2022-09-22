@@ -2,7 +2,7 @@ import { ActionRouter } from 'app/common/ActionRouter';
 import { LocalPlugin } from 'app/common/plugin';
 import { BaseComponent, createRpcLogger, warnIfNotReady } from 'app/common/PluginInstance';
 import { GristAPI, RPC_GRISTAPI_INTERFACE } from 'app/plugin/GristAPI';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import { getAppPathTo } from 'app/server/lib/places';
 import { makeLinePrefixer } from 'app/server/lib/sandboxUtil';
 import { exitPromise, timeoutReached } from 'app/server/lib/serverUtils';
@@ -121,8 +121,8 @@ export class UnsafeNodeComponent extends BaseComponent {
     .catch(err => log.warn("unsafeNode[%s] failed with %s", child.pid, err))
     .then(() => { this._child = undefined; });
 
-    child.stdout.on('data', makeLinePrefixer('PLUGIN stdout: '));
-    child.stderr.on('data', makeLinePrefixer('PLUGIN stderr: '));
+    child.stdout!.on('data', makeLinePrefixer('PLUGIN stdout: '));
+    child.stderr!.on('data', makeLinePrefixer('PLUGIN stderr: '));
 
     warnIfNotReady(this._rpc, 3000, "Plugin isn't ready; be sure to call grist.ready() from plugin");
     child.on('message', this._rpc.receiveMessage.bind(this._rpc));

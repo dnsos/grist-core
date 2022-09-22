@@ -6,14 +6,14 @@ import {
   LocalActionBundle,
   UserActionBundle
 } from 'app/common/ActionBundle';
-import {DocAction, getNumRows, UserAction} from 'app/common/DocActions';
+import {CALCULATING_USER_ACTIONS, DocAction, getNumRows, UserAction} from 'app/common/DocActions';
 import {allToken} from 'app/common/sharing';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {LogMethods} from "app/server/lib/LogMethods";
 import {shortDesc} from 'app/server/lib/shortDesc';
-import * as assert from 'assert';
+import assert from 'assert';
 import {Mutex} from 'async-mutex';
-import * as Deque from 'double-ended-queue';
+import Deque from 'double-ended-queue';
 import {ActionHistory, asActionGroup, getActionUndoInfo} from './ActionHistory';
 import {ActiveDoc} from './ActiveDoc';
 import {makeExceptionalDocSession, OptDocSession} from './DocSession';
@@ -215,16 +215,19 @@ export class Sharing {
 
     try {
 
-      // A trivial action does not merit allocating an actionNum,
-      // logging, and sharing.  Since we currently don't store
-      // calculated values in the database, it is best not to log the
-      // action that initializes them when the document is opened cold
-      // (without cached ActiveDoc) - otherwise we'll end up with spam
-      // log entries for each time the document is opened cold.
+      const isCalculate = (userActions.length === 1 && CALCULATING_USER_ACTIONS.has(userActions[0][0] as string));
+      // `internal` is true if users shouldn't be able to undo the actions. Applies to:
+      // - Calculate/UpdateCurrentTime because it's not considered as performed by a particular client.
+      // - Adding attachment metadata when uploading attachments,
+      //   because then the attachment file may get hard-deleted and redo won't work properly.
+      const internal = isCalculate || userActions.every(a => a[0] === "AddRecord" && a[1] === "_grist_Attachments");
 
-      const isCalculate = (userActions.length === 1 &&
-                           userActions[0][0] === 'Calculate');
-      const trivial = isCalculate && sandboxActionBundle.stored.length === 0;
+      // A trivial action does not merit allocating an actionNum,
+      // logging, and sharing. It's best not to log the
+      // action that calculates formula values when the document is opened cold
+      // (without cached ActiveDoc) if it doesn't change anything - otherwise we'll end up with spam
+      // log entries for each time the document is opened cold.
+      const trivial = internal && sandboxActionBundle.stored.length === 0;
 
       const actionNum = trivial ? 0 :
         (branch === Branch.Shared ? this._actionHistory.getNextHubActionNum() :
@@ -243,6 +246,7 @@ export class Sharing {
         parentActionHash: null,  // Gets set below by _actionHistory.recordNext...
       };
 
+      const altSessionId = client?.getAltSessionId();
       const logMeta = {
         actionNum,
         linkId: info.linkId,
@@ -250,6 +254,7 @@ export class Sharing {
         numDocActions: localActionBundle.stored.length,
         numRows: localActionBundle.stored.reduce((n, env) => n + getNumRows(env[1]), 0),
         author: info.user,
+        ...(altSessionId ? {session: altSessionId}: {}),
       };
       this._log.rawLog('debug', docSession, '_doApplyUserActions', logMeta);
       if (LOG_ACTION_BUNDLE) {
@@ -276,7 +281,7 @@ export class Sharing {
       // Apply the action to the database, and record in the action log.
       if (!trivial) {
         await this._activeDoc.docStorage.execTransaction(async () => {
-          await this._activeDoc.docStorage.applyStoredActions(getEnvContent(ownActionBundle.stored));
+          await this._activeDoc.applyStoredActionsToDocStorage(getEnvContent(ownActionBundle.stored));
           if (this.isShared() && branch === Branch.Local) {
             // this call will compute an actionHash for localActionBundle
             await this._actionHistory.recordNextLocalUnsent(localActionBundle);
@@ -287,9 +292,7 @@ export class Sharing {
             // be shared. Once sharing is enabled, we would share a snapshot at that time.
             await this._actionHistory.recordNextShared(localActionBundle);
           }
-          // Check isCalculate because that's not an action we should allow undo/redo for (it's not
-          // considered as performed by a particular client).
-          if (client && client.clientId && !isCalculate) {
+          if (client && client.clientId && !internal) {
             this._actionHistory.setActionUndoInfo(
               localActionBundle.actionHash!,
               getActionUndoInfo(localActionBundle, client.clientId, sandboxActionBundle.retValues));
@@ -300,17 +303,17 @@ export class Sharing {
 
       const actionSummary = await this._activeDoc.handleTriggers(localActionBundle);
 
+      await this._activeDoc.updateRowCount(sandboxActionBundle.rowCount, docSession);
+
       // Broadcast the action to connected browsers.
       const actionGroup = asActionGroup(this._actionHistory, localActionBundle, {
         clientId: client?.clientId,
         retValues: sandboxActionBundle.retValues,
-        // Mark the on-open Calculate action as internal. In future, synchronizing fields to today's
-        // date and other changes from external values may count as internal.
-        internal: isCalculate,
+        internal,
       });
       actionGroup.actionSummary = actionSummary;
       await accessControl.appliedBundle();
-      await accessControl.sendDocUpdateForBundle(actionGroup);
+      await accessControl.sendDocUpdateForBundle(actionGroup, this._activeDoc.getDocUsageSummary());
       if (docSession) {
         docSession.linkId = docSession.shouldBundleActions ? localActionBundle.actionNum : 0;
       }

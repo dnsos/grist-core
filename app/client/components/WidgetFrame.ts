@@ -1,4 +1,4 @@
-import * as BaseView from 'app/client/components/BaseView';
+import BaseView from 'app/client/components/BaseView';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {get as getBrowserGlobals} from 'app/client/lib/browserGlobals';
 import {ColumnRec, ViewSectionRec} from 'app/client/models/DocModel';
@@ -6,7 +6,7 @@ import {AccessLevel, isSatisfied} from 'app/common/CustomWidget';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
 import {BulkColValues, fromTableDataAction, RowRecord} from 'app/common/DocActions';
 import {extractInfoFromColType, reencodeAsAny} from 'app/common/gristTypes';
-import {CustomSectionAPI, GristDocAPI, GristView,
+import {AccessTokenOptions, CustomSectionAPI, GristDocAPI, GristView,
         InteractionOptionsRequest, WidgetAPI, WidgetColumnMap} from 'app/plugin/grist-plugin-api';
 import {MsgType, Rpc} from 'grain-rpc';
 import {Computed, Disposable, dom, Observable} from 'grainjs';
@@ -67,6 +67,9 @@ export class WidgetFrame extends DisposableWithEvents {
     _options.access = _options.access || AccessLevel.none;
     // Build RPC object and connect it to iframe.
     this._rpc = new Rpc({});
+
+    // queue until iframe's content emit ready() message
+    this._rpc.queueOutgoingUntilReadyMessage();
 
     // Register outgoing message handler.
     this._rpc.setSendMessage(msg => this._iframe?.contentWindow!.postMessage(msg, '*'));
@@ -302,7 +305,7 @@ export class GristDocAPIImpl implements GristDocAPI {
   }
 
   public async listTables(): Promise<string[]> {
-    // Could perhaps read tableIds from this.gristDoc.docModel.allTableIds.all()?
+    // Could perhaps read tableIds from this.gristDoc.docModel.visibleTableIds.all()?
     const tables = await this._doc.docComm.fetchTable('_grist_Tables');
     // Tables the user doesn't have access to are just blanked out.
     return tables[3].tableId.filter(tableId => tableId !== '') as string[];
@@ -312,8 +315,23 @@ export class GristDocAPIImpl implements GristDocAPI {
     return fromTableDataAction(await this._doc.docComm.fetchTable(tableId));
   }
 
-  public async applyUserActions(actions: any[][]) {
-    return this._doc.docComm.applyUserActions(actions, {desc: undefined});
+  public async applyUserActions(actions: any[][], options?: any) {
+    return this._doc.docComm.applyUserActions(actions, {desc: undefined, ...options});
+  }
+
+  // Get a token for out-of-band access to the document.
+  // Currently will require the custom widget to have full access to the
+  // document.
+  // It would be great to support this with read_table rights. This could be
+  // possible to do by adding a tableId setting to AccessTokenOptions,
+  // encoding that limitation in the access token, and ensuring the back-end
+  // respects it. But the current motivating use for adding access tokens is
+  // showing attachments, and they aren't currently something that logically
+  // lives within a specific table.
+  public async getAccessToken(options: AccessTokenOptions) {
+    return this._doc.docComm.getAccessToken({
+      readOnly: options.readOnly,
+    });
   }
 }
 
@@ -328,7 +346,7 @@ export class GristViewImpl implements GristView {
     // Hidden/Visible columns will eventually reflect what is available, but this operation
     // is not instant - and widget can receive rows with fields that are not in the mapping.
     const columns: ColumnRec[] = this._visibleColumns();
-    const rowIds: number[] = this._baseView.sortedRows.getKoArray().peek() as number[];
+    const rowIds = this._baseView.sortedRows.getKoArray().peek().filter(id => id != 'new');
     const data: BulkColValues = {};
     for (const column of columns) {
       // Use the colId of the displayCol, which may be different in case of Reference columns.

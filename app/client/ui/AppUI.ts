@@ -1,3 +1,4 @@
+import {buildDocumentBanners, buildHomeBanners} from 'app/client/components/Banners';
 import {domAsync} from 'app/client/lib/domAsync';
 import {loadBillingPage} from 'app/client/lib/imports';
 import {createSessionObs, isBoolean, isNumber} from 'app/client/lib/sessionObs';
@@ -16,6 +17,8 @@ import {RightPanel} from 'app/client/ui/RightPanel';
 import {createTopBarDoc, createTopBarHome} from 'app/client/ui/TopBar';
 import {WelcomePage} from 'app/client/ui/WelcomePage';
 import {testId} from 'app/client/ui2018/cssVars';
+import {getPageTitleSuffix} from 'app/common/gristUrls';
+import {getGristConfig} from 'app/common/urlUtils';
 import {Computed, dom, IDisposable, IDisposableOwner, Observable, replaceContent, subscribe} from 'grainjs';
 
 // When integrating into the old app, we might in theory switch between new-style and old-style
@@ -88,7 +91,7 @@ function pagePanelsHome(owner: IDisposableOwner, appModel: AppModel, app: App) {
       page === 'templates' ? 'Beispiele & Templates' :
       ws ? ws.name : appModel.currentOrgName
     );
-    document.title = `${name} - Grist`;
+    document.title = `${name}${getPageTitleSuffix(getGristConfig())}`;
   }));
 
   return pagePanels({
@@ -101,6 +104,8 @@ function pagePanelsHome(owner: IDisposableOwner, appModel: AppModel, app: App) {
     },
     headerMain: createTopBarHome(appModel),
     contentMain: createDocMenu(pageModel),
+    contentTop: buildHomeBanners(appModel),
+    testId,
   });
 }
 
@@ -109,6 +114,7 @@ function pagePanelsDoc(owner: IDisposableOwner, appModel: AppModel, appObj: App)
   // To simplify manual inspection in the common case, keep the most recently created
   // DocPageModel available as a global variable.
   (window as any).gristDocPageModel = pageModel;
+  appObj.setDocPageModel(pageModel);
   const leftPanelOpen = createSessionObs<boolean>(owner, "leftPanelOpen", true, isBoolean);
   const rightPanelOpen = createSessionObs<boolean>(owner, "rightPanelOpen", false, isBoolean);
   const leftPanelWidth = createSessionObs<number>(owner, "leftPanelWidth", 240, isNumber);
@@ -123,7 +129,11 @@ function pagePanelsDoc(owner: IDisposableOwner, appModel: AppModel, appObj: App)
 
   // Set document title to strings like "DocName - Grist"
   owner.autoDispose(subscribe(pageModel.currentDocTitle, (use, docName) => {
-    document.title = `${docName} - Grist`;
+    // If the document hasn't loaded yet, don't update the title; since the HTML document already has
+    // a title element with the document's name, there's no need for further action.
+    if (!pageModel.currentDoc.get()) { return; }
+
+    document.title = `${docName}${getPageTitleSuffix(getGristConfig())}`;
   }));
 
   // Called after either panel is closed, opened, or resized.
@@ -149,6 +159,7 @@ function pagePanelsDoc(owner: IDisposableOwner, appModel: AppModel, appObj: App)
     contentMain: dom.maybe(pageModel.gristDoc, (gristDoc) => gristDoc.buildDom()),
     onResize,
     testId,
-    contentBottom: dom.create(createBottomBarDoc, pageModel, leftPanelOpen, rightPanelOpen)
+    contentTop: buildDocumentBanners(pageModel),
+    contentBottom: dom.create(createBottomBarDoc, pageModel, leftPanelOpen, rightPanelOpen),
   });
 }

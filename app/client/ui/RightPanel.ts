@@ -16,8 +16,8 @@
 
 import * as commands from 'app/client/components/commands';
 import {GristDoc, IExtraTool, TabContent} from 'app/client/components/GristDoc';
-import * as RefSelect from 'app/client/components/RefSelect';
-import * as ViewConfigTab from 'app/client/components/ViewConfigTab';
+import {RefSelect} from 'app/client/components/RefSelect';
+import ViewConfigTab from 'app/client/components/ViewConfigTab';
 import {domAsync} from 'app/client/lib/domAsync';
 import * as imports from 'app/client/lib/imports';
 import {createSessionObs} from 'app/client/lib/sessionObs';
@@ -25,12 +25,12 @@ import {reportError} from 'app/client/models/AppModel';
 import {ColumnRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {GridOptions} from 'app/client/ui/GridOptions';
 import {attachPageWidgetPicker, IPageWidget, toPageWidget} from 'app/client/ui/PageWidgetPicker';
-import {linkFromId, linkId, selectBy} from 'app/client/ui/selectBy';
+import {linkId, selectBy} from 'app/client/ui/selectBy';
 import {CustomSectionConfig} from 'app/client/ui/CustomSectionConfig';
 import {VisibleFieldsConfig} from 'app/client/ui/VisibleFieldsConfig';
 import {IWidgetType, widgetTypes} from 'app/client/ui/widgetTypes';
 import {basicButton, primaryButton} from 'app/client/ui2018/buttons';
-import {colors, testId, vars} from 'app/client/ui2018/cssVars';
+import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {textInput} from 'app/client/ui2018/editableLabel';
 import {IconName} from 'app/client/ui2018/IconList';
 import {icon} from 'app/client/ui2018/icons';
@@ -194,7 +194,7 @@ export class RightPanel extends Disposable {
     const isColumnValid = owner.autoDispose(ko.computed(() => Boolean(origColRef())));
 
     // Builder for the reference display column multiselect.
-    const refSelect = owner.autoDispose(RefSelect.create({docModel, origColumn, fieldBuilder}));
+    const refSelect = RefSelect.create(owner, {docModel, origColumn, fieldBuilder});
 
     // build cursor position observable
     const cursor = owner.autoDispose(ko.computed(() => {
@@ -299,11 +299,17 @@ export class RightPanel extends Disposable {
     });
     return dom.maybe(viewConfigTab, (vct) => [
       this._disableIfReadonly(),
-      cssLabel('WIDGET TITLE',
-               dom.style('margin-bottom', '14px')),
+      cssLabel(dom.text(use => use(activeSection.isRaw) ? 'DATA TABLE NAME' : 'WIDGET TITLE'),
+        dom.style('margin-bottom', '14px'),
+      ),
       cssRow(cssTextInput(
         Computed.create(owner, (use) => use(activeSection.titleDef)),
         val => activeSection.titleDef.saveOnly(val),
+        dom.boolAttr('disabled', use => {
+          const isRawTable = use(activeSection.isRaw);
+          const isSummaryTable = use(use(activeSection.table).summarySourceTable) !== 0;
+          return isRawTable && isSummaryTable;
+        }),
         testId('right-widget-title')
       )),
 
@@ -327,6 +333,17 @@ export class RightPanel extends Disposable {
       domComputed((use) => {
         if (use(this._pageWidgetType) !== 'record') { return null; }
         return dom.create(GridOptions, activeSection);
+      }),
+
+      domComputed((use) => {
+        if (use(this._pageWidgetType) !== 'record') { return null; }
+        return [
+          cssSeparator(),
+          cssLabel('ROW STYLE'),
+          domAsync(imports.loadViewPane().then(ViewPane =>
+            dom.create(ViewPane.ConditionalStyle, "Row Style", activeSection, this._gristDoc)
+          ))
+        ];
       }),
 
       dom.maybe((use) => use(this._pageWidgetType) === 'chart', () => [
@@ -390,20 +407,23 @@ export class RightPanel extends Disposable {
       });
     });
 
-    // TODO: this computed is not enough to make sure that the linkOptions are up to date. Indeed
+    // This computed is not enough to make sure that the linkOptions are up to date. Indeed
     // the selectBy function depends on a much greater number of observables. Creating that many
-    // dependencies does not seem a better approach. Instead, we could refresh the list of
-    // linkOptions only when the user clicks the dropdown. Such behaviour is not supported by the
-    // weasel select function as of writing and would require a custom implementation.
-    const linkOptions = Computed.create(owner, (use) =>
-      selectBy(
+    // dependencies does not seem a better approach. Instead, we refresh the list of
+    // linkOptions only when the user clicks on the dropdown. Such behavior is not supported by the
+    // weasel select function as of writing and would require a custom implementation, so we will simulate
+    // this behavior by using temporary observable that will be changed when the user clicks on the dropdown.
+    const refreshTrigger = Observable.create(owner, false);
+    const linkOptions = Computed.create(owner, (use) => {
+      void use(refreshTrigger);
+      return selectBy(
         this._gristDoc.docModel,
-        use(viewModel.viewSections).peek(),
+        viewModel.viewSections().all(),
         activeSection,
-      )
-    );
+      );
+    });
 
-    link.onWrite((val) => this._gristDoc.saveLink(linkFromId(val)));
+    link.onWrite((val) => this._gristDoc.saveLink(val));
     return [
       this._disableIfReadonly(),
       cssLabel('DATA TABLE'),
@@ -450,7 +470,12 @@ export class RightPanel extends Disposable {
       dom.maybe((use) => !use(activeSection.isRaw), () => [
         cssLabel('SELECT BY'),
         cssRow(
-          select(link, linkOptions, {defaultLabel: 'Select Widget'}),
+          dom.update(
+            select(link, linkOptions, {defaultLabel: 'Select Widget'}),
+            dom.on('click', () => {
+              refreshTrigger.set(!refreshTrigger.get());
+            })
+          ),
           testId('right-select-by')
         ),
       ]),
@@ -542,7 +567,7 @@ function tabContentToDom(content: Observable<TabContent[]>|TabContent[]|IDomComp
 }
 
 const cssOverlay = styled('div', `
-  background-color: white;
+  background-color: ${theme.rightPanelDisabledOverlay};
   opacity: 0.8;
   position: absolute;
   top: 0;
@@ -553,25 +578,21 @@ const cssOverlay = styled('div', `
 `);
 
 const cssBottomText = styled('span', `
+  color: ${theme.text};
   position: absolute;
   bottom: -40px;
   padding: 4px 16px;
 `);
 
-export const cssLabel = styled('div', `
+const cssLabel = styled('div', `
+  color: ${theme.text};
   text-transform: uppercase;
   margin: 16px 16px 12px 16px;
   font-size: ${vars.xsmallFontSize};
 `);
 
-// Additional text in label (greyed out)
-export const cssSubLabel = styled('span', `
-  text-transform: none;
-  font-size: ${vars.xsmallFontSize};
-  color: ${colors.slate};
-`);
-
-export const cssRow = styled('div', `
+const cssRow = styled('div', `
+  color: ${theme.text};
   display: flex;
   margin: 8px 16px;
   align-items: center;
@@ -579,17 +600,12 @@ export const cssRow = styled('div', `
     margin-top: 24px;
   }
   &-disabled {
-    color: ${colors.slate};
+    color: ${theme.disabledText};
   }
 `);
 
-export const cssBlockedCursor = styled('span', `
-  &, & * {
-    cursor: not-allowed !important;
-  }
-`);
 
-export const cssButtonRow = styled(cssRow, `
+const cssButtonRow = styled(cssRow, `
   margin-left: 0;
   margin-right: 0;
   & > button {
@@ -597,31 +613,31 @@ export const cssButtonRow = styled(cssRow, `
   }
 `);
 
-export const cssIcon = styled(icon, `
+const cssIcon = styled(icon, `
   flex: 0 0 auto;
-  background-color: ${colors.slate};
+  --icon-color: ${theme.lightText};
 `);
 
 const cssTopBarItem = styled('div', `
   flex: 1 1 0px;
   height: 100%;
-  background-color: ${colors.lightGrey};
+  background-color: ${theme.rightPanelTabBg};
   font-weight: ${vars.headerControlTextWeight};
-  color: ${colors.dark};
-  --icon-color: ${colors.slate};
+  color: ${theme.rightPanelTabFg};
+  --icon-color: ${theme.rightPanelTabIcon};
   display: flex;
   align-items: center;
   cursor: default;
 
   &-selected {
-    background-color: ${colors.lightGreen};
+    background-color: ${theme.rightPanelTabSelectedBg};
     font-weight: initial;
-    color: ${colors.light};
-    --icon-color: ${colors.light};
+    color: ${theme.rightPanelTabSelectedFg};
+    --icon-color: ${theme.rightPanelTabSelectedFg};
   }
   &:not(&-selected):hover {
-    background-color: ${colors.mediumGrey};
-    --icon-color: ${colors.lightGreen};
+    background-color: ${theme.rightPanelTabHoverBg};
+    --icon-color: ${theme.rightPanelTabIconHover};
   }
 `);
 
@@ -645,7 +661,7 @@ const cssHoverCircle = styled('div', `
   justify-content: center;
 
   &:hover {
-    background-color: ${colors.darkGreen};
+    background-color: ${theme.rightPanelTabCloseButtonHoverBg};
   }
 `);
 
@@ -655,7 +671,7 @@ const cssHoverIcon = styled(icon, `
   background-color: vars(--icon-color);
 `);
 
-export const cssSubTabContainer = styled('div', `
+const cssSubTabContainer = styled('div', `
   height: 48px;
   flex: none;
   display: flex;
@@ -663,8 +679,8 @@ export const cssSubTabContainer = styled('div', `
   justify-content: space-between;
 `);
 
-export const cssSubTab = styled('div', `
-  color: ${colors.lightGreen};
+const cssSubTab = styled('div', `
+  color: ${theme.rightPanelSubtabFg};
   flex: auto;
   height: 100%;
   display: flex;
@@ -672,21 +688,21 @@ export const cssSubTab = styled('div', `
   justify-content: flex-end;
   text-align: center;
   padding-bottom: 8px;
-  border-bottom: 1px solid ${colors.mediumGrey};
+  border-bottom: 1px solid ${theme.pagePanelsBorder};
   cursor: default;
 
   &-selected {
-    color: ${colors.dark};
-    border-bottom: 1px solid ${colors.lightGreen};
+    color: ${theme.rightPanelSubtabSelectedFg};
+    border-bottom: 1px solid ${theme.rightPanelSubtabSelectedUnderline};
   }
   &:not(&-selected):hover {
-    color: ${colors.darkGreen};
+    color: ${theme.rightPanelSubtabHoverFg};
   }
   &:hover {
-    border-bottom: 1px solid ${colors.lightGreen};
+    border-bottom: 1px solid ${theme.rightPanelSubtabHoverUnderline};
   }
   .${cssSubTabContainer.className}:hover > &-selected:not(:hover) {
-    border-bottom: 1px solid ${colors.mediumGrey};
+    border-bottom: 1px solid ${theme.pagePanelsBorder};
   }
 `);
 
@@ -695,12 +711,8 @@ const cssTabContents = styled('div', `
   overflow: auto;
 `);
 
-export const cssSeparator = styled('div', `
-  border-bottom: 1px solid ${colors.mediumGrey};
-  margin-top: 16px;
-`);
-
-export const cssEmptySeparator = styled('div', `
+const cssSeparator = styled('div', `
+  border-bottom: 1px solid ${theme.pagePanelsBorder};
   margin-top: 16px;
 `);
 
@@ -721,7 +733,7 @@ const cssConfigContainer = styled('div', `
 
 const cssDataLabel = styled('div', `
   flex: 0 0 81px;
-  color: ${colors.slate};
+  color: ${theme.lightText};
   font-size: ${vars.xsmallFontSize};
   margin-left: 4px;
   margin-top: 2px;
@@ -741,7 +753,7 @@ const cssList = styled('div', `
 
 
 const cssListItem = styled('li', `
-  background-color: ${colors.mediumGrey};
+  background-color: ${theme.hover};
   border-radius: 2px;
   margin-bottom: 4px;
   white-space: nowrap;
@@ -751,6 +763,14 @@ const cssListItem = styled('li', `
   padding: 4px 8px;
 `);
 
-export const cssTextInput = styled(textInput, `
+const cssTextInput = styled(textInput, `
   flex: 1 0 auto;
+  color: ${theme.inputFg};
+  background-color: ${theme.inputBg};
+
+  &:disabled {
+    color: ${theme.inputDisabledFg};
+    background-color: ${theme.inputDisabledBg};
+    pointer-events: none;
+  }
 `);

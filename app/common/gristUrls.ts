@@ -2,10 +2,10 @@ import {BillingPage, BillingSubPage, BillingTask} from 'app/common/BillingAPI';
 import {OpenDocMode} from 'app/common/DocListAPI';
 import {EngineCode} from 'app/common/DocumentSettings';
 import {encodeQueryParams, isAffirmative} from 'app/common/gutil';
-import {localhostRegex} from 'app/common/LoginState';
 import {LocalPlugin} from 'app/common/plugin';
 import {StringUnion} from 'app/common/StringUnion';
 import {UIRowId} from 'app/common/UIRowId';
+import {getGristConfig} from 'app/common/urlUtils';
 import {Document} from 'app/common/UserAPI';
 import clone = require('lodash/clone');
 import pickBy = require('lodash/pickBy');
@@ -13,6 +13,14 @@ import pickBy = require('lodash/pickBy');
 export const SpecialDocPage = StringUnion('code', 'acl', 'data', 'GristDocTour');
 type SpecialDocPage = typeof SpecialDocPage.type;
 export type IDocPage = number | SpecialDocPage;
+
+export type ViewDocPage = number | 'data';
+/**
+ * ViewDocPage is a page that shows table data (either normal or raw data view).
+ */
+export function isViewDocPage(docPage: IDocPage): docPage is ViewDocPage {
+  return typeof docPage === 'number' || docPage === 'data';
+}
 
 // What page to show in the user's home area. Defaults to 'workspace' if a workspace is set, and
 // to 'all' otherwise.
@@ -26,7 +34,10 @@ export type WelcomePage = typeof WelcomePage.type;
 export const AccountPage = StringUnion('account');
 export type AccountPage = typeof AccountPage.type;
 
-export const LoginPage = StringUnion('signup', 'verified', 'forgot-password');
+export const ActivationPage = StringUnion('activation');
+export type ActivationPage = typeof ActivationPage.type;
+
+export const LoginPage = StringUnion('signup', 'login', 'verified', 'forgot-password');
 export type LoginPage = typeof LoginPage.type;
 
 // Overall UI style.  "full" is normal, "light" is a single page focused, panels hidden experience.
@@ -52,9 +63,12 @@ export const commonUrls = {
   help: "https://support.getgrist.com",
   plans: "https://www.getgrist.com/pricing",
   createTeamSite: "https://www.getgrist.com/create-team-site",
+  sproutsProgram: "https://www.getgrist.com/sprouts-program",
+  contact: "https://www.getgrist.com/contact",
 
   efcrConnect: 'https://efc-r.com/connect',
   efcrHelp: 'https://www.nioxus.info/eFCR-Help',
+  videoTour: 'https://www.youtube.com/embed/qnr2Pfnxdlc?autoplay=1',
 };
 
 /**
@@ -72,16 +86,19 @@ export interface IGristUrlState {
   docPage?: IDocPage;
   account?: AccountPage;
   billing?: BillingPage;
+  activation?: ActivationPage;
   login?: LoginPage;
   welcome?: WelcomePage;
   welcomeTour?: boolean;
   docTour?: boolean;
   manageUsers?: boolean;
+  createTeam?: boolean;
   params?: {
     billingPlan?: string;
+    planType?: string;
     billingTask?: BillingTask;
     embed?: boolean;
-    next?: string;
+    state?: string;
     style?: InterfaceStyle;
     compare?: string;
     linkParameters?: Record<string, string>;  // Parameters to pass as 'user.Link' in granular ACLs.
@@ -105,6 +122,9 @@ export interface OrgUrlOptions {
 
   // Base URL used for accessing plugin material.
   pluginUrl?: string;
+
+  // If set, org is expected to be encoded in the path, not domain.
+  pathOnly?: boolean;
 }
 
 // Result of getOrgUrlInfo().
@@ -138,6 +158,9 @@ export function getOrgUrlInfo(newOrg: string, currentHost: string, options: OrgU
   if (newOrg === options.singleOrg) {
     return {};
   }
+  if (options.pathOnly) {
+    return {orgInPath: newOrg};
+  }
   const hostType = getHostType(currentHost, options);
   if (hostType !== 'plugin') {
     const hostname = currentHost.split(":")[0];
@@ -162,7 +185,12 @@ export function getOrgUrlInfo(newOrg: string, currentHost: string, options: OrgU
  *    localhost:8080/o/<org>
  */
 export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
-                          state: IGristUrlState, baseLocation: Location | URL): string {
+                          state: IGristUrlState, baseLocation: Location | URL,
+                          options: {
+                            // make an api url - warning: just barely works, and
+                            // only for documents
+                            api?: boolean
+                          } = {}): string {
   const url = new URL(baseLocation.href);
   const parts = ['/'];
 
@@ -177,9 +205,14 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
     }
   }
 
+  if (options.api) {
+    parts.push(`api/`);
+  }
   if (state.ws) { parts.push(`ws/${state.ws}/`); }
   if (state.doc) {
-    if (state.slug) {
+    if (options.api) {
+      parts.push(`docs/${encodeURIComponent(state.doc)}`);
+    } else if (state.slug) {
       parts.push(`${encodeURIComponent(state.doc)}/${encodeURIComponent(state.slug)}`);
     } else {
       parts.push(`doc/${encodeURIComponent(state.doc)}`);
@@ -202,6 +235,8 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
     parts.push(state.billing === 'billing' ? 'billing' : `billing/${state.billing}`);
   }
 
+  if (state.activation) { parts.push(state.activation); }
+
   if (state.login) { parts.push(state.login); }
 
   if (state.welcome) {
@@ -215,7 +250,7 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
   const hashParts: string[] = [];
   if (state.hash && state.hash.rowId) {
     const hash = state.hash;
-    hashParts.push(`a1`);
+    hashParts.push(state.hash?.popup ? 'a2' : `a1`);
     for (const key of ['sectionId', 'rowId', 'colRef'] as Array<keyof HashLink>) {
       if (hash[key]) { hashParts.push(`${key[0]}${hash[key]}`); }
     }
@@ -232,6 +267,8 @@ export function encodeUrl(gristConfig: Partial<GristLoadConfig>,
     url.hash = 'repeat-doc-tour';
   } else if (state.manageUsers) {
     url.hash = 'manage-users';
+  } else if (state.createTeam) {
+    url.hash = 'create-team';
   } else {
     url.hash = '';
   }
@@ -286,7 +323,11 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
   if (map.has('m')) { state.mode = OpenDocMode.parse(map.get('m')); }
   if (map.has('account')) { state.account = AccountPage.parse(map.get('account')) || 'account'; }
   if (map.has('billing')) { state.billing = BillingSubPage.parse(map.get('billing')) || 'billing'; }
+  if (map.has('activation')) {
+    state.activation = ActivationPage.parse(map.get('activation')) || 'activation';
+  }
   if (map.has('welcome')) { state.welcome = WelcomePage.parse(map.get('welcome')); }
+  if (sp.has('planType')) { state.params!.planType = sp.get('planType')!; }
   if (sp.has('billingPlan')) { state.params!.billingPlan = sp.get('billingPlan')!; }
   if (sp.has('billingTask')) {
     state.params!.billingTask = BillingTask.parse(sp.get('billingTask'));
@@ -294,13 +335,16 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
 
   if (map.has('signup')) {
     state.login = 'signup';
+  } else if (map.has('login')) {
+    state.login = 'login';
   } else if (map.has('verified')) {
     state.login = 'verified';
   } else if (map.has('forgot-password')) {
     state.login = 'forgot-password';
   }
-
-  if (sp.has('next')) { state.params!.next = sp.get('next')!; }
+  if (sp.has('state')) {
+    state.params!.state = sp.get('state')!;
+  }
 
   if (sp.has('style')) {
     state.params!.style = InterfaceStyle.parse(sp.get('style'));
@@ -328,9 +372,9 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
     for (const part of hashParts) {
       hashMap.set(part.slice(0, 1), part.slice(1));
     }
-    if (hashMap.has('#') && hashMap.get('#') === 'a1') {
+    if (hashMap.has('#') && ['a1', 'a2'].includes(hashMap.get('#') || '')) {
       const link: HashLink = {};
-      for (const key of ['sectionId', 'rowId', 'colRef'] as Array<keyof HashLink>) {
+      for (const key of ['sectionId', 'rowId', 'colRef'] as Array<Exclude<keyof HashLink, 'popup'>>) {
         const ch = key.substr(0, 1);
         if (!hashMap.has(ch)) { continue; }
         const value = hashMap.get(ch);
@@ -340,11 +384,15 @@ export function decodeUrl(gristConfig: Partial<GristLoadConfig>, location: Locat
           link[key] = parseInt(value!, 10);
         }
       }
+      if (hashMap.get('#') === 'a2') {
+        link.popup =  true;
+      }
       state.hash = link;
     }
     state.welcomeTour = hashMap.get('#') === 'repeat-welcome-tour';
     state.docTour = hashMap.get('#') === 'repeat-doc-tour';
     state.manageUsers = hashMap.get('#') === 'manage-users';
+    state.createTeam = hashMap.get('#') === 'create-team';
   }
   return state;
 }
@@ -398,6 +446,9 @@ export function parseSubdomain(host: string|undefined): {org?: string, base?: st
   // Host has nowhere to put a subdomain.
   return {};
 }
+
+// Allowed localhost addresses.
+const localhostRegex = /^localhost(?::(\d+))?$/i;
 
 /**
  * Like parseSubdomain, but throws an error if neither of these cases apply:
@@ -496,6 +547,52 @@ export interface GristLoadConfig {
 
   // Whether there is somewhere for survey data to go.
   survey?: boolean;
+
+  // Google Tag Manager id. Currently only used to load tag manager for reporting new sign-ups.
+  tagManagerId?: string;
+
+  activation?: Activation;
+
+  // Parts of the UI to hide
+  hideUiElements?: IHideableUiElement[];
+
+  // String to append to the end of the HTML document.title
+  pageTitleSuffix?: string;
+
+  // If custom CSS should be included in the head of each page.
+  enableCustomCss?: boolean;
+}
+
+export const HideableUiElements = StringUnion("helpCenter", "billing", "templates", "multiSite", "multiAccounts");
+export type IHideableUiElement = typeof HideableUiElements.type;
+
+export function shouldHideUiElement(elem: IHideableUiElement): boolean {
+  return (getGristConfig().hideUiElements || []).includes(elem);
+}
+
+export function getPageTitleSuffix(config?: GristLoadConfig) {
+  return config?.pageTitleSuffix ?? " - Grist";
+}
+
+/**
+ * For a packaged version of Grist that requires activation, this
+ * summarizes the current state. Not applicable to grist-core.
+ */
+export interface ActivationState {
+  trial?: {                  // Present when installation has not yet been activated.
+    days: number;            // Max number of days allowed prior to activation.
+    expirationDate: string;  // ISO8601 date that Grist will get cranky.
+    daysLeft: number;        // Number of days left until Grist will get cranky.
+  }
+  needKey?: boolean;         // Set when Grist is cranky and demanding activation.
+  key?: {                    // Set when Grist is activated.
+    expirationDate?: string; // ISO8601 date that Grist will need reactivation.
+    daysLeft?: number;       // Number of days until Grist will need reactivation.
+  }
+}
+
+export interface Activation extends ActivationState {
+  isManager: boolean;
 }
 
 // Acceptable org subdomains are alphanumeric (hyphen also allowed) and of
@@ -555,7 +652,7 @@ export function isOrgInPathOnly(host?: string): boolean {
     const gristConfig: GristLoadConfig = (window as any).gristConfig;
     return (gristConfig && gristConfig.pathOnly) || false;
   } else {
-    if (host && host.match(/^localhost(:[0-9]+)?$/)) { return true; }
+    if (host && host.match(localhostRegex)) { return true; }
     return (process.env.GRIST_ORG_IN_PATH === 'true');
   }
 }
@@ -682,6 +779,7 @@ export interface HashLink {
   sectionId?: number;
   rowId?: UIRowId;
   colRef?: number;
+  popup?: boolean;
 }
 
 // Check whether a urlId is a prefix of the docId, and adequately long to be

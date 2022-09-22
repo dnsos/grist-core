@@ -6,7 +6,7 @@
  */
 
 import {FlexServer, FlexServerOptions} from 'app/server/lib/FlexServer';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 
 // Allowed server types. We'll start one or a combination based on the value of GRIST_SERVERS
 // environment variable.
@@ -34,7 +34,7 @@ interface ServerOptions extends FlexServerOptions {
   logToConsole?: boolean;  // If set, messages logged to console (default: false)
                            //   (but if options are not given at all in call to main,
                            //    logToConsole is set to true)
-  s3?: boolean;            // If set, documents saved to s3 (default is to check environment
+  externalStorage?: boolean; // If set, documents saved to external storage such as s3 (default is to check environment
                            // variables, which get set in various ways in dev/test entry points)
 }
 
@@ -59,7 +59,7 @@ export async function main(port: number, serverTypes: ServerType[],
   }
 
   if (options.logToConsole) { server.addLogging(); }
-  if (options.s3 === false) { server.disableS3(); }
+  if (options.externalStorage === false) { server.disableExternalStorage(); }
   await server.loadConfig();
 
   if (includeDocs) {
@@ -88,7 +88,7 @@ export async function main(port: number, serverTypes: ServerType[],
     await server.addAssetsForPlugins();
   }
 
-  if (includeHome && !includeApp) {
+  if (includeHome) {
     server.addEarlyWebhooks();
   }
 
@@ -98,25 +98,22 @@ export async function main(port: number, serverTypes: ServerType[],
 
   server.addAccessMiddleware();
   server.addApiMiddleware();
+  await server.addBillingMiddleware();
 
   await server.start();
 
   if (includeHome) {
-    if (!includeApp) {
-      server.addUsage();
-    }
+    server.addUsage();
     if (!includeDocs) {
       server.addDocApiForwarder();
     }
     server.addJsonSupport();
     await server.addLandingPages();
     // todo: add support for home api to standalone app
-    if (!includeApp) {
-      server.addHomeApi();
-      server.addBillingApi();
-      server.addNotifier();
-      await server.addHousekeeper();
-    }
+    server.addHomeApi();
+    server.addBillingApi();
+    server.addNotifier();
+    await server.addHousekeeper();
     await server.addLoginRoutes();
     server.addAccountPage();
     server.addBillingPages();

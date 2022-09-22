@@ -1,8 +1,9 @@
-import { ObjSnapshotWithMetadata } from 'app/common/DocSnapshot';
-import { KeyedOps } from 'app/common/KeyedOps';
-import { KeyedMutex } from 'app/common/KeyedMutex';
-import { ExternalStorage } from 'app/server/lib/ExternalStorage';
-import * as log from 'app/server/lib/log';
+import {ObjSnapshotWithMetadata} from 'app/common/DocSnapshot';
+import {SnapshotWindow} from 'app/common/Features';
+import {KeyedMutex} from 'app/common/KeyedMutex';
+import {KeyedOps} from 'app/common/KeyedOps';
+import {ExternalStorage} from 'app/server/lib/ExternalStorage';
+import log from 'app/server/lib/log';
 import * as fse from 'fs-extra';
 import * as moment from 'moment-timezone';
 
@@ -10,6 +11,7 @@ import * as moment from 'moment-timezone';
  * A subset of the ExternalStorage interface, focusing on maintaining a list of versions.
  */
 export interface IInventory {
+  getSnapshotWindow?: (key: string) => Promise<SnapshotWindow|undefined>;
   versions(key: string): Promise<ObjSnapshotWithMetadata[]>;
   remove(key: string, snapshotIds: string[]): Promise<void>;
 }
@@ -59,8 +61,9 @@ export class DocSnapshotPruner {
 
   // Get all snapshots for a document, and whether they should be kept or pruned.
   public async classify(key: string): Promise<Array<{snapshot: ObjSnapshotWithMetadata, keep: boolean}>> {
+    const snapshotWindow = await this._ext.getSnapshotWindow?.(key);
     const versions = await this._ext.versions(key);
-    return shouldKeepSnapshots(versions).map((keep, index) => ({keep, snapshot: versions[index]}));
+    return shouldKeepSnapshots(versions, snapshotWindow).map((keep, index) => ({keep, snapshot: versions[index]}));
   }
 
   // Prune the specified document immediately.  If no snapshotIds are provided, they
@@ -107,8 +110,12 @@ export class DocSnapshotInventory implements IInventory {
    * Expects to be given the store for documents, a store for metadata, and a method
    * for naming cache files on the local filesystem.  The stores should be consistent.
    */
-  constructor(private _doc: ExternalStorage, private _meta: ExternalStorage,
-              private _getFilename: (key: string) => Promise<string>) {}
+  constructor(
+    private _doc: ExternalStorage,
+    private _meta: ExternalStorage,
+    private _getFilename: (key: string) => Promise<string>,
+    public getSnapshotWindow: (key: string) => Promise<SnapshotWindow|undefined>,
+  ) {}
 
   /**
    * Start keeping inventory for a new document.
@@ -141,7 +148,29 @@ export class DocSnapshotInventory implements IInventory {
    * The snapshot supplied will be modified in place to a normalized form.
    */
   public async add(key: string, snapshot: ObjSnapshotWithMetadata, prevSnapshotId: string|null) {
+    await this.uploadAndAdd(key, async () => {
+      return { snapshot, prevSnapshotId };
+    });
+  }
+
+  /**
+   * Like add(), but takes an "upload" callback that allows
+   * preparing snapshot and prevSnapshotId atomically with the
+   * rest of the add operation, and thus serialized with any
+   * other operations such as versions(). This is important since an
+   * upload changes the list of versions as far as the external store
+   * is concerned, which could trigger a "surprise" and a full reload
+   * of the version list.
+   */
+  public async uploadAndAdd(key: string,
+                            upload: () => Promise<{snapshot?: ObjSnapshotWithMetadata,
+                                                   prevSnapshotId: string|null}>) {
     await this._mutex.runExclusive(key, async() => {
+      const {snapshot, prevSnapshotId} = await upload();
+      if (!snapshot) {
+        // the upload generated no snapshot, so there is nothing to do.
+        return;
+      }
       const snapshots = await this._getSnapshots(key, prevSnapshotId);
       // Could be already added if reconstruction happened.
       if (snapshots[0] && snapshots[0].snapshotId === snapshot.snapshotId) { return; }
@@ -307,12 +336,12 @@ export class DocSnapshotInventory implements IInventory {
  *   - The most recent version in every hour, for up to 25 distinct hours
  *   - The most recent version in every day, for up to 32 distinct days
  *   - The most recent version in every week, for up to 12 distinct weeks
- *   - The most recent version in every month, for up to 36 distinct months
+ *   - The most recent version in every month, for up to 96 distinct months
  *   - The most recent version in every year, for up to 1000 distinct years
  *   - Anything with a label, for up to 32 days before the current version.
  * Calculations done in UTC, Gregorian calendar, ISO weeks (week starts with Monday).
  */
-export function shouldKeepSnapshots(snapshots: ObjSnapshotWithMetadata[]): boolean[] {
+export function shouldKeepSnapshots(snapshots: ObjSnapshotWithMetadata[], snapshotWindow?: SnapshotWindow): boolean[] {
   // Get current version
   const current = snapshots[0];
   if (!current) { return []; }
@@ -328,21 +357,32 @@ export function shouldKeepSnapshots(snapshots: ObjSnapshotWithMetadata[]): boole
     {range: 'hour', prev: start, usage: 0, cap: 25},
     {range: 'day', prev: start, usage: 0, cap: 32},
     {range: 'isoWeek', prev: start, usage: 0, cap: 12},
-    {range: 'month', prev: start, usage: 0, cap: 36},
+    {range: 'month', prev: start, usage: 0, cap: 96},
     {range: 'year', prev: start, usage: 0, cap: 1000}
   ];
   // For each snapshot starting with newest, check if it is worth saving by comparing
   // it with the last saved snapshot based on hour, day, week, month, year
   return snapshots.map((snapshot, index) => {
-    let keep = index < 5;   // Keep 5 most recent versions
+    // Just to make extra sure we don't delete everything
+    if (index === 0) {
+      return true;
+    }
+
     const date = moment.tz(snapshot.lastModified, tz);
+
+    // Limit snapshots to the given window corresponding to what the user has paid for
+    if (snapshotWindow && start.diff(date, snapshotWindow.unit, true) > snapshotWindow.count) {
+      return false;
+    }
+
+    let keep = index < 5;   // Keep 5 most recent versions
     for (const bucket of buckets) {
       if (updateAndCheckRange(date, bucket)) { keep = true; }
     }
     // Preserve recent labelled snapshots in a naive and limited way.  No doubt this will
     // be elaborated on if we make this a user-facing feature.
     if (snapshot.metadata?.label &&
-        start.diff(moment.tz(snapshot.lastModified, tz), 'days') < 32) { keep = true; }
+        start.diff(date, 'days') < 32) { keep = true; }
     return keep;
   });
 }

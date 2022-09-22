@@ -1,5 +1,6 @@
 import {MinimalActionGroup} from 'app/common/ActionGroup';
 import {TableDataAction} from 'app/common/DocActions';
+import {FilteredDocUsageSummary} from 'app/common/DocUsage';
 import {Role} from 'app/common/roles';
 import {StringUnion} from 'app/common/StringUnion';
 import {FullUser} from 'app/common/UserAPI';
@@ -44,6 +45,7 @@ export interface OpenLocalDocResult {
   log: MinimalActionGroup[];
   recoveryMode?: boolean;
   userOverride?: UserOverride;
+  docUsage?: FilteredDocUsageSummary;
 }
 
 export interface UserOverride {

@@ -22,9 +22,18 @@ export const GristObjCode = t.enumtype({
 
 export const CellValue = t.union("number", "string", "boolean", "null", t.tuple("GristObjCode", t.rest(t.array("unknown"))));
 
+export const BulkColValues = t.iface([], {
+  [t.indexKey]: t.array("CellValue"),
+});
+
 export const RowRecord = t.iface([], {
   "id": "number",
   [t.indexKey]: "CellValue",
+});
+
+export const RowRecords = t.iface([], {
+  "id": t.array("number"),
+  [t.indexKey]: t.array("CellValue"),
 });
 
 export const GristType = t.union(t.lit('Any'), t.lit('Attachments'), t.lit('Blob'), t.lit('Bool'), t.lit('Choice'), t.lit('ChoiceList'), t.lit('Date'), t.lit('DateTime'), t.lit('Id'), t.lit('Int'), t.lit('ManualSortPos'), t.lit('Numeric'), t.lit('PositionNumber'), t.lit('Ref'), t.lit('RefList'), t.lit('Text'));
@@ -32,7 +41,9 @@ export const GristType = t.union(t.lit('Any'), t.lit('Attachments'), t.lit('Blob
 const exportedTypeSuite: t.ITypeSuite = {
   GristObjCode,
   CellValue,
+  BulkColValues,
   RowRecord,
+  RowRecords,
   GristType,
 };
 export default exportedTypeSuite;

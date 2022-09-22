@@ -99,10 +99,25 @@ exports.groups = [{
       desc: 'Print currently selected page widget',
     },
     {
+      name: 'showRawData',
+      keys: [],
+      desc: 'Show raw data widget for table of currently selected page widget',
+    },
+    {
       name: 'openWidgetConfiguration',
       keys: [],
       desc: 'Open Custom widget configuration screen',
-    }
+    },
+    {
+      name: 'leftPanelOpen',
+      keys: [],
+      desc: 'Shortcut to open the left panel',
+    },
+    {
+      name: 'videoTourToolsOpen',
+      keys: [],
+      desc: 'Shortcut to open video tour from home left panel',
+    },
   ]
 }, {
   group: 'Navigation',
@@ -333,9 +348,9 @@ exports.groups = [{
       keys: ['Ctrl+m'],
       desc: 'Rename the currently selected column'
     }, {
-      name: 'hideField',
+      name: 'hideFields',
       keys: ['Alt+Shift+-'],
-      desc: 'Hide the currently selected column'
+      desc: 'Hide currently selected columns'
     }, {
       name: 'toggleFreeze',
       keys: [],
@@ -360,6 +375,10 @@ exports.groups = [{
       name: 'deleteSection',
       keys: [],
       desc: 'Delete the currently active viewsection'
+    }, {
+      name: 'duplicateRows',
+      keys: ['Mod+Shift+d'],
+      desc: 'Duplicate selected rows'
     }
   ],
 }, {
@@ -384,6 +403,15 @@ exports.groups = [{
     },
 
   ],
+}, {
+  group: 'Filtering',
+  commands: [
+    {
+      name: 'filterByThisCellValue',
+      keys: [],
+      desc: `Filter this column by just this cell's value`,
+    },
+  ]
 }, {
   group: 'Linking',
   commands: [

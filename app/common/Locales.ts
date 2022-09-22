@@ -19,7 +19,7 @@ try {
   const display = (code: string) => {
     try {
       const locale = new Intl.Locale(code);
-      const regionName = regionDisplay.of(locale.region);
+      const regionName = regionDisplay.of(locale.region!);
       const languageName = languageDisplay.of(locale.language);
       return `${regionName} (${languageName})`;
     } catch (ex) {
@@ -49,7 +49,7 @@ LocaleCurrencyMap["SS"] = "SSP";
 LocaleCurrencyMap["XK"] = "EUR";
 const currenciesCodes = Object.values(LocaleCurrencyMap);
 export function getCurrency(code: string) {
-  const currency = LocaleCurrency.getCurrency(code);
+  const currency = LocaleCurrency.getCurrency(code ?? 'en-US');
   // Fallback to USD
   return currency ?? DEFAULT_CURRENCY;
 }
@@ -58,7 +58,7 @@ export function getCurrency(code: string) {
 try {
   const currencyDisplay = new Intl.DisplayNames('en', {type: 'currency'});
   currencies = [...new Set(currenciesCodes)].map(code => {
-    return {name: currencyDisplay.of(code), code};
+    return {name: currencyDisplay.of(code)!, code};
   });
 } catch {
   // Fall back to using the currency code as the display name.

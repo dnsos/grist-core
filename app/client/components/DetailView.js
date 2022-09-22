@@ -14,6 +14,7 @@ var {CopySelection} = require('./CopySelection');
 var RecordLayout  = require('./RecordLayout');
 var commands      = require('./commands');
 const {RowContextMenu} = require('../ui/RowContextMenu');
+const {parsePasteForView} = require("./BaseView2");
 
 /**
  * DetailView component implements a list of record layouts.
@@ -131,7 +132,9 @@ DetailView.generalCommands = {
 
   copy: function() { return this.copy(this.getSelection()); },
   cut: function() { return this.cut(this.getSelection()); },
-  paste: function(pasteObj, cutCallback) { return this.paste(pasteObj, cutCallback); },
+  paste: function(pasteObj, cutCallback) {
+    return this.gristDoc.docData.bundleActions(null, () => this.paste(pasteObj, cutCallback));
+  },
 
   editLayout: function() {
     if (this.scrolly()) {
@@ -166,12 +169,12 @@ DetailView.prototype.deleteRow = function(index) {
  * @param {Function} cutCallback - If provided returns the record removal action needed
  *  for a cut.
  */
-DetailView.prototype.paste = function(data, cutCallback) {
+DetailView.prototype.paste = async function(data, cutCallback) {
   let pasteData = data[0][0];
   let field = this.viewSection.viewFields().at(this.cursor.fieldIndex());
   let isCompletePaste = (data.length === 1 && data[0].length === 1);
 
-  let richData = this._parsePasteForView([[pasteData]], [field]);
+  const richData = await parsePasteForView([[pasteData]], [field], this.gristDoc);
   if (_.isEmpty(richData)) {
     return;
   }
@@ -213,6 +216,7 @@ DetailView.prototype.buildContextMenu = function(row, options) {
     disableInsert: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || this.tableModel.tableMetaRow.onDemand()),
     disableDelete: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || row._isAddRow()),
     isViewSorted: this.viewSection.activeSortSpec.peek().length > 0,
+    numRows: this.getSelection().rowIds.length,
   };
   return RowContextMenu(options ? Object.assign(defaults, options) : defaults);
 }
@@ -417,6 +421,11 @@ DetailView.prototype._isAddRow = function(index = this.cursor.rowIndex()) {
 DetailView.prototype.scrollToCursor = function(sync = true) {
   if (!this.scrollPane) { return Promise.resolve(); }
   return kd.doScrollChildIntoView(this.scrollPane, this.cursor.rowIndex(), sync);
+}
+
+DetailView.prototype._duplicateRows = async function() {
+  const addRowIds = await BaseView.prototype._duplicateRows.call(this);
+  this.setCursorPos({rowId: addRowIds[0]})
 }
 
 module.exports = DetailView;

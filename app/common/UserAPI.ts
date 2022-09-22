@@ -5,16 +5,17 @@ import {BillingAPI, BillingAPIImpl} from 'app/common/BillingAPI';
 import {BrowserSettings} from 'app/common/BrowserSettings';
 import {BulkColValues, TableColValues, TableRecordValue, TableRecordValues, UserAction} from 'app/common/DocActions';
 import {DocCreationInfo, OpenDocMode} from 'app/common/DocListAPI';
-import {Features} from 'app/common/Features';
+import {OrgUsageSummary} from 'app/common/DocUsage';
+import {Product} from 'app/common/Features';
 import {ICustomWidget} from 'app/common/CustomWidget';
 import {isClient} from 'app/common/gristUrls';
-import {FullUser} from 'app/common/LoginSessionAPI';
+import {FullUser, UserProfile} from 'app/common/LoginSessionAPI';
 import {OrgPrefs, UserOrgPrefs, UserPrefs} from 'app/common/Prefs';
 import * as roles from 'app/common/roles';
 import {addCurrentOrgToPath} from 'app/common/urlUtils';
 import {encodeQueryParams} from 'app/common/gutil';
 
-export {FullUser} from 'app/common/LoginSessionAPI';
+export type {FullUser, UserProfile};
 
 // Nominal email address of the anonymous user.
 export const ANONYMOUS_USER_EMAIL = 'anon@getgrist.com';
@@ -67,15 +68,10 @@ export interface BillingAccount {
   individual: boolean;
   product: Product;
   isManager: boolean;
+  inGoodStanding: boolean;
   externalOptions?: {
     invoiceId?: string;
   };
-}
-
-// Information about the product associated with an org or orgs.
-export interface Product {
-  name: string;
-  features: Features;
 }
 
 // The upload types vary based on which fetch implementation is in use.  This is
@@ -87,6 +83,14 @@ export type UploadType = string | Blob | Buffer;
  */
 export function getOrgName(org: Organization): string {
   return org.owner ? `@` + org.owner.name : org.name;
+}
+
+/**
+ * Returns whether the given org is the templates org, which contains the public templates.
+ */
+export function isTemplatesOrg(org: Organization): boolean {
+  // TODO: It would be nice to have a more robust way to detect the templates org.
+  return org.domain === 'templates' || org.domain === 'templates-s';
 }
 
 export type WorkspaceProperties = CommonProperties;
@@ -135,6 +139,11 @@ export interface Document extends DocumentProperties {
 export interface UserOptions {
   // Whether signing in with Google is allowed. Defaults to true if unset.
   allowGoogleLogin?: boolean;
+  // The "sub" (subject) from the JWT issued by the password-based authentication provider.
+  authSubject?: string;
+  // Whether user is a consultant. Consultant users can be added to sites
+  // without being counted for billing. Defaults to false if unset.
+  isConsultant?: boolean;
 }
 
 export interface PermissionDelta {
@@ -146,6 +155,10 @@ export interface PermissionDelta {
 }
 
 export interface PermissionData {
+  // True if permission data is restricted to current user.
+  personal?: true;
+  // True if current user is a public member.
+  public?: boolean;
   maxInheritedRole?: roles.BasicRole|null;
   users: UserAccessData[];
 }
@@ -272,59 +285,6 @@ export interface DocStateComparisonDetails {
   rightChanges: ActionSummary;
 }
 
-/**
- * User multi-factor authentication preferences, as fetched from Cognito.
- */
-export interface UserMFAPreferences {
-  isSmsMfaEnabled: boolean;
-  // If SMS MFA is enabled, the destination number for receiving verification codes.
-  phoneNumber?: string;
-  isSoftwareTokenMfaEnabled: boolean;
-}
-
-/**
- * Cognito response to initiating software token MFA registration.
- */
-export interface SoftwareTokenRegistrationInfo {
-  secretCode: string;
-}
-
-/**
- * Cognito response to initiating SMS MFA registration.
- */
-export interface SMSRegistrationInfo {
-  deliveryDestination: string;
-}
-
-/**
- * Cognito response to verifying a password (e.g. in a security verification form).
- */
-export type PassVerificationResult = ChallengeRequired | ChallengeNotRequired;
-
-/**
- * Information about the follow-up authentication challenge.
- */
-export interface ChallengeRequired {
-  isChallengeRequired: true;
-  isAlternateChallengeAvailable: boolean;
-  // Session identifier that must be re-used in response to auth challenge.
-  session: string;
-  challengeName: 'SMS_MFA' | 'SOFTWARE_TOKEN_MFA';
-  // If SMS MFA is enabled, the destination phone number that codes are sent to.
-  deliveryDestination?: string;
-}
-
-/**
- * Successful authentication, with no additional challenge required.
- */
-interface ChallengeNotRequired {
-  isChallengeRequired: false;
-}
-
-export type AuthMethod = 'TOTP' | 'SMS';
-
-export {UserProfile} from 'app/common/LoginSessionAPI';
-
 export interface UserAPI {
   getSessionActive(): Promise<ActiveSessionInfo>;
   setSessionActive(email: string): Promise<void>;
@@ -333,6 +293,7 @@ export interface UserAPI {
   getWorkspace(workspaceId: number): Promise<Workspace>;
   getOrg(orgId: number|string): Promise<Organization>;
   getOrgWorkspaces(orgId: number|string): Promise<Workspace[]>;
+  getOrgUsageSummary(orgId: number|string): Promise<OrgUsageSummary>;
   getTemplates(onlyFeatured?: boolean): Promise<Workspace[]>;
   getDoc(docId: string): Promise<Document>;
   newOrg(props: Partial<OrganizationProperties>): Promise<number>;
@@ -361,9 +322,9 @@ export interface UserAPI {
   unpinDoc(docId: string): Promise<void>;
   moveDoc(docId: string, workspaceId: number): Promise<void>;
   getUserProfile(): Promise<FullUser>;
-  getUserMfaPreferences(): Promise<UserMFAPreferences>;
   updateUserName(name: string): Promise<void>;
   updateAllowGoogleLogin(allowGoogleLogin: boolean): Promise<void>;
+  updateIsConsultant(userId: number, isConsultant: boolean): Promise<void>;
   getWorker(key: string): Promise<string>;
   getWorkerAPI(key: string): Promise<DocWorkerAPI>;
   getBillingAPI(): BillingAPI;
@@ -379,23 +340,15 @@ export interface UserAPI {
     onUploadProgress?: (ev: ProgressEvent) => void,
   }): Promise<string>;
   deleteUser(userId: number, name: string): Promise<void>;
-  registerSoftwareToken(): Promise<SoftwareTokenRegistrationInfo>;
-  confirmRegisterSoftwareToken(verificationCode: string): Promise<void>;
-  unregisterSoftwareToken(): Promise<void>;
-  registerSMS(phoneNumber: string): Promise<SMSRegistrationInfo>;
-  confirmRegisterSMS(verificationCode: string): Promise<void>;
-  unregisterSMS(): Promise<void>;
-  verifyPassword(password: string, preferredMfaMethod?: AuthMethod): Promise<PassVerificationResult>;
-  verifySecondStep(authMethod: AuthMethod, verificationCode: string, session: string): Promise<void>;
   getBaseUrl(): string;  // Get the prefix for all the endpoints this object wraps.
   forRemoved(): UserAPI; // Get a version of the API that works on removed resources.
   getWidgets(): Promise<ICustomWidget[]>;
 }
 
 /**
- * Parameters for the download CSV endpoint (/download/csv).
+ * Parameters for the download CSV and XLSX endpoint (/download/csv & /download/csv).
  */
- export interface DownloadCsvParams {
+ export interface DownloadDocParams {
   tableId: string;
   viewSection?: number;
   activeSortSpec?: string;
@@ -438,8 +391,8 @@ export interface DocAPI {
   // is HEAD, the result will contain a copy of any rows added or updated.
   compareVersion(leftHash: string, rightHash: string): Promise<DocStateComparison>;
   getDownloadUrl(template?: boolean): string;
-  getDownloadXlsxUrl(): string;
-  getDownloadCsvUrl(params: DownloadCsvParams): string;
+  getDownloadXlsxUrl(params?: DownloadDocParams): string;
+  getDownloadCsvUrl(params: DownloadDocParams): string;
   /**
    * Exports current document to the Google Drive as a spreadsheet file. To invoke this method, first
    * acquire "code" via Google Auth Endpoint (see ShareMenu.ts for an example).
@@ -447,6 +400,9 @@ export interface DocAPI {
    * @param title Name of the spreadsheet that will be created (should use a Grist document's title)
    */
   sendToDrive(code: string, title: string): Promise<{url: string}>;
+  // Upload a single attachment and return the resulting metadata row ID.
+  // The arguments are passed to FormData.append.
+  uploadAttachment(value: string | Blob, filename?: string): Promise<number>;
 }
 
 // Operations that are supported by a doc worker.
@@ -496,6 +452,10 @@ export class UserAPIImpl extends BaseAPI implements UserAPI {
   public async getOrgWorkspaces(orgId: number|string): Promise<Workspace[]> {
     return this.requestJson(`${this._url}/api/orgs/${orgId}/workspaces?includeSupport=1`,
       { method: 'GET' });
+  }
+
+  public async getOrgUsageSummary(orgId: number|string): Promise<OrgUsageSummary> {
+    return this.requestJson(`${this._url}/api/orgs/${orgId}/usage`, { method: 'GET' });
   }
 
   public async getTemplates(onlyFeatured: boolean = false): Promise<Workspace[]> {
@@ -654,10 +614,6 @@ export class UserAPIImpl extends BaseAPI implements UserAPI {
     return this.requestJson(`${this._url}/api/profile/user`);
   }
 
-  public async getUserMfaPreferences(): Promise<UserMFAPreferences> {
-    return this.requestJson(`${this._url}/api/profile/mfa_preferences`);
-  }
-
   public async updateUserName(name: string): Promise<void> {
     await this.request(`${this._url}/api/profile/user/name`, {
       method: 'POST',
@@ -669,6 +625,13 @@ export class UserAPIImpl extends BaseAPI implements UserAPI {
     await this.request(`${this._url}/api/profile/allowGoogleLogin`, {
       method: 'POST',
       body: JSON.stringify({allowGoogleLogin})
+    });
+  }
+
+  public async updateIsConsultant(userId: number, isConsultant: boolean): Promise<void> {
+    await this.request(`${this._url}/api/profile/isConsultant`, {
+      method: 'POST',
+      body: JSON.stringify({userId, isConsultant})
     });
   }
 
@@ -751,57 +714,6 @@ export class UserAPIImpl extends BaseAPI implements UserAPI {
                         body: JSON.stringify({name})});
   }
 
-  public async registerSoftwareToken(): Promise<SoftwareTokenRegistrationInfo> {
-    return this.requestJson(`${this._url}/api/auth/register_totp`, {method: 'POST'});
-  }
-
-  public async confirmRegisterSoftwareToken(verificationCode: string): Promise<void> {
-    await this.request(`${this._url}/api/auth/confirm_register_totp`, {
-      method: 'POST',
-      body: JSON.stringify({verificationCode}),
-    });
-  }
-
-  public async unregisterSoftwareToken(): Promise<void> {
-    await this.request(`${this._url}/api/auth/unregister_totp`, {method: 'POST'});
-  }
-
-  public async registerSMS(phoneNumber: string): Promise<SMSRegistrationInfo> {
-    return this.requestJson(`${this._url}/api/auth/register_sms`, {
-      method: 'POST',
-      body: JSON.stringify({phoneNumber}),
-    });
-  }
-
-  public async confirmRegisterSMS(verificationCode: string): Promise<void> {
-    await this.request(`${this._url}/api/auth/confirm_register_sms`, {
-      method: 'POST',
-      body: JSON.stringify({verificationCode}),
-    });
-  }
-
-  public async unregisterSMS(): Promise<void> {
-    await this.request(`${this._url}/api/auth/unregister_sms`, {method: 'POST'});
-  }
-
-  public async verifyPassword(password: string, preferredMfaMethod?: AuthMethod): Promise<any> {
-    return this.requestJson(`${this._url}/api/auth/verify_pass`, {
-      method: 'POST',
-      body: JSON.stringify({password, preferredMfaMethod}),
-    });
-  }
-
-  public async verifySecondStep(
-    authMethod: AuthMethod,
-    verificationCode: string,
-    session: string
-  ): Promise<void> {
-    await this.request(`${this._url}/api/auth/verify_second_step`, {
-      method: 'POST',
-      body: JSON.stringify({authMethod, verificationCode, session}),
-    });
-  }
-
   public getBaseUrl(): string { return this._url; }
 
   // Recomputes the URL on every call to pick up changes in the URL when switching orgs.
@@ -843,8 +755,8 @@ export class DocWorkerAPIImpl extends BaseAPI implements DocWorkerAPI {
   }
 
   public async downloadDoc(docId: string, template: boolean = false): Promise<Response> {
-    const extra = template ? '&template=1' : '';
-    const result = await this.request(`${this.url}/download?doc=${docId}${extra}`, {
+    const extra = template ? '?template=1' : '';
+    const result = await this.request(`${this.url}/api/docs/${docId}/download${extra}`, {
       method: 'GET',
     });
     if (!result.ok) { throw new Error(await result.text()); }
@@ -954,11 +866,11 @@ export class DocAPIImpl extends BaseAPI implements DocAPI {
     return this._url + `/download?template=${Number(template)}`;
   }
 
-  public getDownloadXlsxUrl() {
-    return this._url + '/download/xlsx';
+  public getDownloadXlsxUrl(params: DownloadDocParams) {
+    return this._url + '/download/xlsx?' + encodeQueryParams({...params});
   }
 
-  public getDownloadCsvUrl(params: DownloadCsvParams) {
+  public getDownloadCsvUrl(params: DownloadDocParams) {
     // We spread `params` to work around TypeScript being overly cautious.
     return this._url + '/download/csv?' + encodeQueryParams({...params});
   }
@@ -968,6 +880,20 @@ export class DocAPIImpl extends BaseAPI implements DocAPI {
     url.searchParams.append('title', title);
     url.searchParams.append('code', code);
     return this.requestJson(url.href);
+  }
+
+  public async uploadAttachment(value: string | Blob, filename?: string): Promise<number> {
+    const formData = this.newFormData();
+    formData.append('upload', value, filename);
+    const response = await this.requestAxios(`${this._url}/attachments`, {
+      method: 'POST',
+      data: formData,
+      // On browser, it is important not to set Content-Type so that the browser takes care
+      // of setting HTTP headers appropriately.  Outside browser, requestAxios has logic
+      // for setting the HTTP headers.
+      headers: {...this.defaultHeadersWithoutContentType()},
+    });
+    return response.data[0];
   }
 
   private _getRecords(tableId: string, endpoint: 'data' | 'records', options?: GetRowsParams): Promise<any> {

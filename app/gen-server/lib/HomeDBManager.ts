@@ -1,5 +1,7 @@
 import {ApiError} from 'app/common/ApiError';
 import {mapGetOrSet, mapSetOrClear, MapWithTTL} from 'app/common/AsyncCreate';
+import {getDataLimitStatus} from 'app/common/DocLimits';
+import {createEmptyOrgUsageSummary, DocumentUsage, OrgUsageSummary} from 'app/common/DocUsage';
 import {normalizeEmail} from 'app/common/emails';
 import {canAddOrgMembers, Features} from 'app/common/Features';
 import {buildUrlId, MIN_URLID_PREFIX_LENGTH, parseUrlId} from 'app/common/gristUrls';
@@ -7,12 +9,23 @@ import {FullUser, UserProfile} from 'app/common/LoginSessionAPI';
 import {checkSubdomainValidity} from 'app/common/orgNameUtils';
 import {UserOrgPrefs} from 'app/common/Prefs';
 import * as roles from 'app/common/roles';
-// TODO: API should implement UserAPI
-import {ANONYMOUS_USER_EMAIL, DocumentProperties, EVERYONE_EMAIL, getRealAccess,
-        ManagerDelta, NEW_DOCUMENT_CODE, OrganizationProperties,
-        Organization as OrgInfo, PermissionData, PermissionDelta, SUPPORT_EMAIL, UserAccessData,
-        UserOptions,
-        WorkspaceProperties} from "app/common/UserAPI";
+import {StringUnion} from 'app/common/StringUnion';
+import {
+  ANONYMOUS_USER_EMAIL,
+  DocumentProperties,
+  EVERYONE_EMAIL,
+  getRealAccess,
+  ManagerDelta,
+  NEW_DOCUMENT_CODE,
+  OrganizationProperties,
+  Organization as OrgInfo,
+  PermissionData,
+  PermissionDelta,
+  SUPPORT_EMAIL,
+  UserAccessData,
+  UserOptions,
+  WorkspaceProperties
+} from "app/common/UserAPI";
 import {AclRule, AclRuleDoc, AclRuleOrg, AclRuleWs} from "app/gen-server/entity/AclRule";
 import {Alias} from "app/gen-server/entity/Alias";
 import {BillingAccount, ExternalBillingOptions} from "app/gen-server/entity/BillingAccount";
@@ -22,26 +35,40 @@ import {Group} from "app/gen-server/entity/Group";
 import {Login} from "app/gen-server/entity/Login";
 import {AccessOption, AccessOptionWithRole, Organization} from "app/gen-server/entity/Organization";
 import {Pref} from "app/gen-server/entity/Pref";
-import {getDefaultProductNames, Product, starterFeatures} from "app/gen-server/entity/Product";
+import {getDefaultProductNames, personalFreeFeatures, Product} from "app/gen-server/entity/Product";
 import {Secret} from "app/gen-server/entity/Secret";
 import {User} from "app/gen-server/entity/User";
 import {Workspace} from "app/gen-server/entity/Workspace";
 import {Permissions} from 'app/gen-server/lib/Permissions';
 import {scrubUserFromOrg} from "app/gen-server/lib/scrubUserFromOrg";
 import {applyPatch} from 'app/gen-server/lib/TypeORMPatches';
-import {bitOr, getRawAndEntities, hasAtLeastOneOfTheseIds, hasOnlyTheseIdsOrNull,
-        now, readJson} from 'app/gen-server/sqlUtils';
+import {
+  bitOr,
+  getRawAndEntities,
+  hasAtLeastOneOfTheseIds,
+  hasOnlyTheseIdsOrNull,
+  now,
+  readJson
+} from 'app/gen-server/sqlUtils';
+import {getOrCreateConnection} from 'app/server/lib/dbUtils';
 import {makeId} from 'app/server/lib/idUtils';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {Permit} from 'app/server/lib/Permit';
+import {getScope} from 'app/server/lib/requestUtils';
 import {WebHookSecret} from "app/server/lib/Triggers";
-import {StringUnion} from 'app/common/StringUnion';
 import {EventEmitter} from 'events';
+import {Request} from "express";
+import {
+  Brackets,
+  Connection,
+  DatabaseType,
+  EntityManager,
+  SelectQueryBuilder,
+  WhereExpression
+} from "typeorm";
+import uuidv4 from "uuid/v4";
 import flatten = require('lodash/flatten');
 import pick = require('lodash/pick');
-import {Brackets, Connection, createConnection, DatabaseType, EntityManager,
-        getConnection, SelectQueryBuilder, WhereExpression} from "typeorm";
-import * as uuidv4 from "uuid/v4";
 
 // Support transactions in Sqlite in async code.  This is a monkey patch, affecting
 // the prototypes of various TypeORM classes.
@@ -84,6 +111,18 @@ export interface QueryResult<T> {
 // Maps from userId to group name, or null to inherit.
 export interface UserIdDelta {
   [userId: string]: roles.NonGuestRole|null;
+}
+
+// A collection of fun facts derived from a PermissionDelta (used to describe
+// a change of users) and a user.
+export interface PermissionDeltaAnalysis {
+  userIdDelta: UserIdDelta | null;   // New roles for users, indexed by user id.
+  permissionThreshold: Permissions;  // The permissions needed to make the change.
+                                     // Usually Permissions.ACL_EDIT, but
+                                     // Permissions.ACL_VIEW is enough for a user
+                                     // to removed themselves.
+  affectsSelf: boolean;              // Flags if the user making the change would
+                                     // be affected by the change.
 }
 
 // Options for certain create query helpers private to this file.
@@ -177,6 +216,12 @@ export interface DocAuthResult {
   cachedDoc?: Document;       // For cases where stale info is ok.
 }
 
+interface GetUserOptions {
+  manager?: EntityManager;
+  profile?: UserProfile;
+  userOptions?: UserOptions;
+}
+
 // Represent a DocAuthKey as a string.  The format is "<urlId>:<org> <userId>".
 // flushSingleDocAuthCache() depends on this format.
 function stringifyDocAuthKey(key: DocAuthKey): string {
@@ -185,6 +230,12 @@ function stringifyDocAuthKey(key: DocAuthKey): string {
 
 function stringifyUrlIdOrg(urlId: string, org?: string): string {
   return `${urlId}:${org}`;
+}
+
+export interface DocumentMetadata {
+  // ISO 8601 UTC date (e.g. the output of new Date().toISOString()).
+  updatedAt?: string;
+  usage?: DocumentUsage|null;
 }
 
 /**
@@ -201,10 +252,8 @@ export class HomeDBManager extends EventEmitter {
                                    // deployments on same subdomain.
 
   private _docAuthCache = new MapWithTTL<string, Promise<DocAuthResult>>(DOC_AUTH_CACHE_TTL);
-
-  public emit(event: NotifierEvent, ...args: any[]): boolean {
-    return super.emit(event, ...args);
-  }
+  // In restricted mode, documents should be read-only.
+  private _restrictedMode: boolean = false;
 
   /**
    * Five aclRules, each with one group (with the names 'owners', 'editors', 'viewers',
@@ -244,6 +293,10 @@ export class HomeDBManager extends EventEmitter {
     nestParent: false,
     orgOnly: true
   }];
+
+  public emit(event: NotifierEvent, ...args: any[]): boolean {
+    return super.emit(event, ...args);
+  }
 
   // All groups.
   public get defaultGroups(): GroupDescriptor[] {
@@ -286,15 +339,12 @@ export class HomeDBManager extends EventEmitter {
     this._idPrefix = prefix;
   }
 
+  public setRestrictedMode(restricted: boolean) {
+    this._restrictedMode = restricted;
+  }
+
   public async connect(): Promise<void> {
-    try {
-      // If multiple servers are started within the same process, we
-      // share the database connection.  This saves locking trouble
-      // with Sqlite.
-      this._connection = getConnection();
-    } catch (e) {
-      this._connection = await createConnection();
-    }
+    this._connection = await getOrCreateConnection();
     this._dbType = this._connection.driver.options.type;
   }
 
@@ -356,15 +406,15 @@ export class HomeDBManager extends EventEmitter {
    * force, and returns the id of this first match it finds.
    */
   public async testGetId(name: string): Promise<number|string> {
-    const org = await Organization.findOne({name});
+    const org = await Organization.findOne({where: {name}});
     if (org) { return org.id; }
-    const ws = await Workspace.findOne({name});
+    const ws = await Workspace.findOne({where: {name}});
     if (ws) { return ws.id; }
-    const doc = await Document.findOne({name});
+    const doc = await Document.findOne({where: {name}});
     if (doc) { return doc.id; }
-    const user = await User.findOne({name});
+    const user = await User.findOne({where: {name}});
     if (user) { return user.id; }
-    const product = await Product.findOne({name});
+    const product = await Product.findOne({where: {name}});
     if (product) { return product.id; }
     throw new Error(`Cannot testGetId(${name})`);
   }
@@ -376,7 +426,7 @@ export class HomeDBManager extends EventEmitter {
   public async testClearUserPrefs(emails: string[]) {
     return await this._connection.transaction(async manager => {
       for (const email of emails) {
-        const user = await this.getUserByLogin(email, undefined, manager);
+        const user = await this.getUserByLogin(email, {manager});
         if (user) {
           await manager.delete(Pref, {userId: user.id});
         }
@@ -384,17 +434,17 @@ export class HomeDBManager extends EventEmitter {
     });
   }
 
-  public getUserByKey(apiKey: string): Promise<User|undefined> {
+  public async getUserByKey(apiKey: string): Promise<User|undefined> {
     // Include logins relation for Authorization convenience.
-    return User.findOne({apiKey}, {relations: ["logins"]});
+    return await User.findOne({where: {apiKey}, relations: ["logins"]}) || undefined;
   }
 
-  public getUser(userId: number): Promise<User|undefined> {
-    return User.findOne(userId, {relations: ["logins"]});
+  public async getUser(userId: number): Promise<User|undefined> {
+    return await User.findOne({where: {id: userId}, relations: ["logins"]}) || undefined;
   }
 
   public async getFullUser(userId: number): Promise<FullUser> {
-    const user = await User.findOne(userId, {relations: ["logins"]});
+    const user = await User.findOne({where: {id: userId}, relations: ["logins"]});
     if (!user) { throw new ApiError("unable to find user", 400); }
     return this.makeFullUser(user);
   }
@@ -418,9 +468,66 @@ export class HomeDBManager extends EventEmitter {
     return result;
   }
 
+  /**
+   * Ensures that user with external id exists and updates its profile and email if necessary.
+   *
+   * @param profile External profile
+   */
+  public async ensureExternalUser(profile: UserProfile) {
+    await this._connection.transaction(async manager => {
+      // First find user by the connectId from the profile
+      const existing = await manager.findOne(User, {
+        where: {connectId: profile.connectId || undefined},
+        relations: ["logins"],
+      });
+
+      // If a user does not exist, create it with data from the external profile.
+      if (!existing) {
+        const newUser = await this.getUserByLoginWithRetry(profile.email, {
+          profile,
+          manager
+        });
+        if (!newUser) {
+          throw new ApiError("Unable to create user", 500);
+        }
+        // No need to survey this user.
+        newUser.isFirstTimeUser = false;
+        await newUser.save();
+      } else {
+        // Else update profile and login information from external profile.
+        let updated = false;
+        let login: Login = existing.logins[0]!;
+        const properEmail = normalizeEmail(profile.email);
+
+        if (properEmail !== existing.loginEmail) {
+          login = login ?? new Login();
+          login.email = properEmail;
+          login.displayEmail = profile.email;
+          existing.logins.splice(0, 1, login);
+          login.user = existing;
+          updated = true;
+        }
+
+        if (profile?.name && profile?.name !== existing.name) {
+          existing.name = profile.name;
+          updated = true;
+        }
+
+        if (profile?.picture && profile?.picture !== existing.picture) {
+          existing.picture = profile.picture;
+          updated = true;
+        }
+
+        if (updated) {
+          await manager.save([existing, login]);
+        }
+      }
+    });
+  }
+
   public async updateUser(userId: number, props: UserProfileChange): Promise<void> {
     let isWelcomed: boolean = false;
-    let user: User|undefined;
+    let user: User|null = null;
     await this._connection.transaction(async manager => {
       user = await manager.findOne(User, {relations: ['logins'],
                                           where: {id: userId}});
@@ -448,14 +555,14 @@ export class HomeDBManager extends EventEmitter {
   }
 
   public async updateUserName(userId: number, name: string) {
-    const user = await User.findOne(userId);
+    const user = await User.findOne({where: {id: userId}});
     if (!user) { throw new ApiError("unable to find user", 400); }
     user.name = name;
     await user.save();
   }
 
   public async updateUserOptions(userId: number, props: Partial<UserOptions>) {
-    const user = await User.findOne(userId);
+    const user = await User.findOne({where: {id: userId}});
     if (!user) { throw new ApiError("unable to find user", 400); }
 
     const newOptions = {...(user.options ?? {}), ...props};
@@ -467,16 +574,16 @@ export class HomeDBManager extends EventEmitter {
   // for an email key conflict failure.  This is in case our transaction conflicts with a peer
   // doing the same thing.  This is quite likely if the first page visited by a previously
   // unseen user fires off multiple api calls.
-  public async getUserByLoginWithRetry(email: string, profile: UserProfile): Promise<User|undefined> {
+  public async getUserByLoginWithRetry(email: string, options: GetUserOptions = {}): Promise<User|undefined> {
     try {
-      return await this.getUserByLogin(email, profile);
+      return await this.getUserByLogin(email, options);
     } catch (e) {
       if (e.name === 'QueryFailedError' && e.detail &&
           e.detail.match(/Key \(email\)=[^ ]+ already exists/)) {
         // This is a postgres-specific error message. This problem cannot arise in sqlite,
         // because we have to serialize sqlite transactions in any case to get around a typeorm
         // limitation.
-        return await this.getUserByLogin(email, profile);
+        return await this.getUserByLogin(email, options);
       }
       throw e;
     }
@@ -487,15 +594,12 @@ export class HomeDBManager extends EventEmitter {
    * Fetches a user record based on an email address.  If a user record already
    * exists linked to the email address supplied, that is the record returned.
    * Otherwise a fresh record is created, linked to the supplied email address.
-   * The name supplied is used to create this fresh record - otherwise it is
-   * ignored.
+   * The supplied `options` are used when creating a fresh record, or updating
+   * unset/outdated fields of an existing record.
    *
    */
-  public async getUserByLogin(
-    email: string,
-    profile?: UserProfile,
-    transaction?: EntityManager
-  ): Promise<User|undefined> {
+  public async getUserByLogin(email: string, options: GetUserOptions = {}): Promise<User|undefined> {
+    const {manager: transaction, profile, userOptions} = options;
     const normalizedEmail = normalizeEmail(email);
     const userByLogin = await this._runInTransaction(transaction, async manager => {
       let needUpdate = false;
@@ -546,12 +650,23 @@ export class HomeDBManager extends EventEmitter {
         login.displayEmail = profile.email;
         needUpdate = true;
       }
+
+      if (profile?.connectId && profile?.connectId !== user.connectId) {
+        user.connectId = profile.connectId;
+        needUpdate = true;
+      }
+
       if (!login.displayEmail) {
         // Save some kind of display email if we don't have anything at all for it yet.
         // This could be coming from how someone wrote it in a UserManager dialog, for
         // instance.  It will get overwritten when the user logs in if the provider's
         // version is different.
         login.displayEmail = email;
+        needUpdate = true;
+      }
+      if (!user.options?.authSubject && userOptions?.authSubject) {
+        // Link subject from password-based authentication provider if not previously linked.
+        user.options = {...(user.options ?? {}), authSubject: userOptions.authSubject};
         needUpdate = true;
       }
       if (needUpdate) {
@@ -596,12 +711,12 @@ export class HomeDBManager extends EventEmitter {
     manager?: EntityManager
   ): Promise<User|undefined> {
     const normalizedEmail = normalizeEmail(email);
-    return (manager || this._connection).createQueryBuilder()
+    return await (manager || this._connection).createQueryBuilder()
       .select('user')
       .from(User, 'user')
       .leftJoinAndSelect('user.logins', 'logins')
       .where('email = :email', {email: normalizedEmail})
-      .getOne();
+      .getOne() || undefined;
   }
 
   /**
@@ -699,7 +814,7 @@ export class HomeDBManager extends EventEmitter {
         id: 0,
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-         domain: this.mergedOrgDomain(),
+        domain: this.mergedOrgDomain(),
         name: 'Anonymous',
         owner: this.makeFullUser(this.getAnonymousUser()),
         access: 'viewers',
@@ -708,9 +823,10 @@ export class HomeDBManager extends EventEmitter {
           individual: true,
           product: {
             name: 'anonymous',
-            features: starterFeatures,
+            features: personalFreeFeatures,
           },
           isManager: false,
+          inGoodStanding: true,
         },
         host: null
       };
@@ -819,7 +935,7 @@ export class HomeDBManager extends EventEmitter {
       .leftJoinAndSelect('orgs.billingAccount', 'billing_accounts')
       .leftJoinAndSelect('billing_accounts.product', 'products')
       .where('external_id = :externalId', {externalId});
-    return query.getOne();
+    return await query.getOne() || undefined;
   }
 
   /**
@@ -874,6 +990,44 @@ export class HomeDBManager extends EventEmitter {
       result.data = result.data[0];
     }
     return result;
+  }
+
+  /**
+   * Returns an organization's usage summary (e.g. count of documents that are approaching or exceeding
+   * limits).
+   */
+  public async getOrgUsageSummary(scope: Scope, orgKey: string|number): Promise<OrgUsageSummary> {
+    // Check that an owner of the org is making the request.
+    const markPermissions = Permissions.OWNER;
+    let orgQuery = this.org(scope, orgKey, {
+      markPermissions,
+      needRealOrg: true
+    });
+    orgQuery = this._addFeatures(orgQuery);
+    const orgQueryResult = await verifyIsPermitted(orgQuery);
+    const org: Organization = this.unwrapQueryResult(orgQueryResult);
+    const productFeatures = org.billingAccount.product.features;
+
+    // Grab all the non-removed documents in the org.
+    let docsQuery = this._docs()
+      .innerJoin('docs.workspace', 'workspaces')
+      .innerJoin('workspaces.org', 'orgs')
+      .where('docs.workspace_id = workspaces.id')
+      .andWhere('workspaces.removed_at IS NULL AND docs.removed_at IS NULL');
+    docsQuery = this._whereOrg(docsQuery, orgKey);
+    if (this.isMergedOrg(orgKey)) {
+      docsQuery = docsQuery.andWhere('orgs.owner_id = :userId', {userId: scope.userId});
+    }
+    const docsQueryResult = await this._verifyAclPermissions(docsQuery, { scope, emptyAllowed: true });
+    const docs: Document[] = this.unwrapQueryResult(docsQueryResult);
+
+    // Return an aggregate count of documents, grouped by data limit status.
+    const summary = createEmptyOrgUsageSummary();
+    for (const {usage: docUsage, gracePeriodStart} of docs) {
+      const dataLimitStatus = getDataLimitStatus({docUsage, gracePeriodStart, productFeatures});
+      if (dataLimitStatus) { summary[dataLimitStatus] += 1; }
+    }
+    return summary;
   }
 
   /**
@@ -1012,7 +1166,7 @@ export class HomeDBManager extends EventEmitter {
       if (docs.length > 1) { throw new ApiError('ambiguous document request', 400); }
       doc = docs[0];
       const features = doc.workspace.org.billingAccount.product.features;
-      if (features.readOnlyDocs) {
+      if (features.readOnlyDocs || this._restrictedMode) {
         // Don't allow any access to docs that is stronger than "viewers".
         doc.access = roles.getWeakestRole('viewers', doc.access);
       }
@@ -1038,7 +1192,8 @@ export class HomeDBManager extends EventEmitter {
 
   // Calls getDocImpl() and returns the Document from that, caching a fresh DocAuthResult along
   // the way. Note that we only cache the access level, not Document itself.
-  public async getDoc(scope: Scope): Promise<Document> {
+  public async getDoc(reqOrScope: Request | Scope): Promise<Document> {
+    const scope = "params" in reqOrScope ? getScope(reqOrScope) : reqOrScope;
     const key = getDocAuthKeyFromScope(scope);
     const promise = this.getDocImpl(key);
     await mapSetOrClear(this._docAuthCache, stringifyDocAuthKey(key), makeDocAuthResult(promise));
@@ -1050,6 +1205,10 @@ export class HomeDBManager extends EventEmitter {
       throw new ApiError('document not found', 404);
     }
     return doc;
+  }
+
+  public async getRawDocById(docId: string) {
+    return await this.getDoc({urlId: docId, userId: this.getPreviewerUserId(), showAll: true});
   }
 
   // Returns access info for the given doc and user, caching the results for DOC_AUTH_CACHE_TTL
@@ -1070,7 +1229,7 @@ export class HomeDBManager extends EventEmitter {
   // TODO: make a more efficient implementation if needed.
   public async flushSingleDocAuthCache(scope: DocScope, docId: string) {
     // Get all aliases of this document.
-    const aliases = await this._connection.manager.find(Alias, { docId });
+    const aliases = await this._connection.manager.find(Alias, {where: {docId}});
     // Construct a set of possible prefixes for cache keys.
     const names = new Set(aliases.map(a => stringifyUrlIdOrg(a.urlId, scope.org)));
     names.add(stringifyUrlIdOrg(docId, scope.org));
@@ -1108,6 +1267,7 @@ export class HomeDBManager extends EventEmitter {
    * @param useNewPlan: by default, the individual billing account associated with the
    *   user's personal org will be used for all other orgs they create.  Set useNewPlan
    *   to force a distinct non-individual billing account to be used for this org.
+   *   NOTE: Currently it is always a true - billing account is one to one with org.
    * @param planType: if set, controls the type of plan used for the org. Only
    *   meaningful for team sites currently.
    *
@@ -1115,7 +1275,7 @@ export class HomeDBManager extends EventEmitter {
   public async addOrg(user: User, props: Partial<OrganizationProperties>,
                       options: { setUserAsOwner: boolean,
                                  useNewPlan: boolean,
-                                 planType?: 'free',
+                                 planType?: string,
                                  externalId?: string,
                                  externalOptions?: ExternalBillingOptions },
                       transaction?: EntityManager): Promise<QueryResult<number>> {
@@ -1142,20 +1302,22 @@ export class HomeDBManager extends EventEmitter {
       // Create or find a billing account to associate with this org.
       const billingAccountEntities = [];
       let billingAccount;
-      if (options.useNewPlan) {
+      if (options.useNewPlan) { // use separate billing account (currently yes)
         const productNames = getDefaultProductNames();
         let productName = options.setUserAsOwner ? productNames.personal :
-          options.planType === 'free' ? productNames.teamFree : productNames.teamInitial;
+          options.planType === productNames.teamFree ? productNames.teamFree : productNames.teamInitial;
         // A bit fragile: this is called during creation of support@ user, before
         // getSupportUserId() is available, but with setUserAsOwner of true.
-        if (!options.setUserAsOwner && user.id === this.getSupportUserId() && options.planType !== 'free') {
+        if (!options.setUserAsOwner
+            && user.id === this.getSupportUserId()
+            && options.planType !== productNames.teamFree) {
           // For teams created by support@getgrist.com, set the product to something
           // good so payment not needed.  This is useful for testing.
           productName = productNames.team;
         }
         billingAccount = new BillingAccount();
         billingAccount.individual = options.setUserAsOwner;
-        const dbProduct = await manager.findOne(Product, {name: productName});
+        const dbProduct = await manager.findOne(Product, {where: {name: productName}});
         if (!dbProduct) {
           throw new Error('Cannot find product for new organization');
         }
@@ -1173,6 +1335,7 @@ export class HomeDBManager extends EventEmitter {
           billingAccount.externalOptions = options.externalOptions;
         }
       } else {
+        log.warn("Creating org with shared billing account");
         // Use the billing account from the user's personal org to start with.
         billingAccount = await manager.createQueryBuilder()
           .select('billing_accounts')
@@ -1373,8 +1536,10 @@ export class HomeDBManager extends EventEmitter {
         ...wsAcls, ...wsGroups, ...docs, ...docAcls, ...docGroups]);
 
       // Delete billing account if this was the last org using it.
-      const billingAccount = await manager.findOne(BillingAccount, org.billingAccountId,
-                                                   {relations: ['orgs']});
+      const billingAccount = await manager.findOne(BillingAccount, {
+        where: {id: org.billingAccountId},
+        relations: ['orgs'],
+      });
       if (billingAccount && billingAccount.orgs.length === 0) {
         await manager.remove([billingAccount]);
       }
@@ -1543,12 +1708,18 @@ export class HomeDBManager extends EventEmitter {
       doc.id = docId || makeId();
       doc.checkProperties(props);
       doc.updateFromProperties(props);
+      // For some reason, isPinned defaulting to null, not false,
+      // for some typeorm/postgres combination? That causes a
+      // constraint violation.
+      if (!doc.isPinned) {
+        doc.isPinned = false;
+      }
       // By default, assign a urlId that is a prefix of the docId.
       // The urlId should be unique across all existing documents.
       if (!doc.urlId) {
         for (let i = MIN_URLID_PREFIX_LENGTH; i <= doc.id.length; i++) {
           const candidate = doc.id.substr(0, i);
-          if (!await manager.findOne(Alias, { urlId: candidate })) {
+          if (!await manager.findOne(Alias, {where: {urlId: candidate}})) {
             doc.urlId = candidate;
             break;
           }
@@ -1773,7 +1944,9 @@ export class HomeDBManager extends EventEmitter {
       }
       // Get the ids of users to update.
       const billingAccountId = billingAccount.id;
-      const userIdDelta = await this._verifyAndLookupDeltaEmails(userId, permissionDelta, true, transaction);
+      const analysis = await this._verifyAndLookupDeltaEmails(userId, permissionDelta, true, transaction);
+      this._failIfPowerfulAndChangingSelf(analysis);
+      const {userIdDelta} = analysis;
       if (!userIdDelta) { throw new ApiError('No userIdDelta', 500); }
       // Any duplicated emails have been merged, and userIdDelta is now keyed by user ids.
       // Now we iterate over users and add/remove them as managers.
@@ -1817,10 +1990,11 @@ export class HomeDBManager extends EventEmitter {
     const {userId} = scope;
     const notifications: Array<() => void> = [];
     const result = await this._connection.transaction(async manager => {
-      const userIdDelta = await this._verifyAndLookupDeltaEmails(userId, delta, true, manager);
+      const analysis = await this._verifyAndLookupDeltaEmails(userId, delta, true, manager);
+      const {userIdDelta} = analysis;
       let orgQuery = this.org(scope, orgKey, {
         manager,
-        markPermissions: Permissions.ACL_EDIT,
+        markPermissions: analysis.permissionThreshold,
         needRealOrg: true
       })
       // Join the org's ACL rules (with 1st level groups/users listed) so we can edit them.
@@ -1828,11 +2002,13 @@ export class HomeDBManager extends EventEmitter {
       .leftJoinAndSelect('acl_rules.group', 'org_groups')
       .leftJoinAndSelect('org_groups.memberUsers', 'org_member_users');
       orgQuery = this._addFeatures(orgQuery);
+      orgQuery = this._withAccess(orgQuery, userId, 'orgs');
       const queryResult = await verifyIsPermitted(orgQuery);
       if (queryResult.status !== 200) {
         // If the query for the organization failed, return the failure result.
         return queryResult;
       }
+      this._failIfPowerfulAndChangingSelf(analysis, queryResult);
       const org: Organization = queryResult.data;
       const groups = getNonGuestGroups(org);
       if (userIdDelta) {
@@ -1871,10 +2047,11 @@ export class HomeDBManager extends EventEmitter {
     const {userId} = scope;
     const notifications: Array<() => void> = [];
     const result = await this._connection.transaction(async manager => {
-      let userIdDelta = await this._verifyAndLookupDeltaEmails(userId, delta, false, manager);
+      const analysis = await this._verifyAndLookupDeltaEmails(userId, delta, false, manager);
+      let {userIdDelta} = analysis;
       let wsQuery = this._workspace(scope, wsId, {
         manager,
-        markPermissions: Permissions.ACL_EDIT
+        markPermissions: analysis.permissionThreshold,
       })
       // Join the workspace's ACL rules and groups/users so we can edit them.
       .leftJoinAndSelect('workspaces.aclRules', 'acl_rules')
@@ -1886,11 +2063,13 @@ export class HomeDBManager extends EventEmitter {
       .leftJoinAndSelect('org_acl_rules.group', 'org_groups')
       .leftJoinAndSelect('org_groups.memberUsers', 'org_users');
       wsQuery = this._addFeatures(wsQuery, 'org');
+      wsQuery = this._withAccess(wsQuery, userId, 'workspaces');
       const queryResult = await verifyIsPermitted(wsQuery);
       if (queryResult.status !== 200) {
         // If the query for the workspace failed, return the failure result.
         return queryResult;
       }
+      this._failIfPowerfulAndChangingSelf(analysis, queryResult);
       const ws: Workspace = queryResult.data;
       // Get all the non-guest groups on the org.
       const orgGroups = getNonGuestGroups(ws.org);
@@ -1941,8 +2120,10 @@ export class HomeDBManager extends EventEmitter {
     const notifications: Array<() => void> = [];
     const result = await this._connection.transaction(async manager => {
       const {userId} = scope;
-      let userIdDelta = await this._verifyAndLookupDeltaEmails(userId, delta, false, manager);
-      const doc = await this._loadDocAccess(scope, Permissions.ACL_EDIT, manager);
+      const analysis = await this._verifyAndLookupDeltaEmails(userId, delta, false, manager);
+      let {userIdDelta} = analysis;
+      const doc = await this._loadDocAccess(scope, analysis.permissionThreshold, manager);
+      this._failIfPowerfulAndChangingSelf(analysis, {data: doc, status: 200});
       // Get all the non-guest doc groups to be updated by the delta.
       const groups = getNonGuestGroups(doc);
       if ('maxInheritedRole' in delta) {
@@ -2005,9 +2186,11 @@ export class HomeDBManager extends EventEmitter {
       ...this.makeFullUser(u),
       access: userRoleMap[u.id]
     }));
+    const personal = this._filterAccessData(scope, users, null);
     return {
       status: 200,
       data: {
+        ...personal,
         users
       }
     };
@@ -2049,10 +2232,13 @@ export class HomeDBManager extends EventEmitter {
         parentAccess: roles.getEffectiveRole(orgMap[u.id] || null)
       };
     });
+    const maxInheritedRole = this._getMaxInheritedRole(workspace);
+    const personal = this._filterAccessData(scope, users, maxInheritedRole);
     return {
       status: 200,
       data: {
-        maxInheritedRole: this._getMaxInheritedRole(workspace),
+        ...personal,
+        maxInheritedRole,
         users
       }
     };
@@ -2128,14 +2314,7 @@ export class HomeDBManager extends EventEmitter {
       maxInheritedRole = null;
     }
 
-    // Unless we have special access to the document, or are an owner, limit user information
-    // returned to being about the current user.
-    const thisUser = users.find(user => user.id === scope.userId);
-    if (scope.specialPermit?.docId !== doc.id &&
-        (!thisUser || getRealAccess(thisUser, { maxInheritedRole, users }) !== 'owners')) {
-      // If not an owner, don't return information about other users.
-      users = thisUser ? [thisUser] : [];
-    }
+    const personal = this._filterAccessData(scope, users, maxInheritedRole, doc.id);
 
     // If we are on a fork, make any access changes needed. Assumes results
     // have been flattened.
@@ -2148,6 +2327,7 @@ export class HomeDBManager extends EventEmitter {
     return {
       status: 200,
       data: {
+        ...personal,
         maxInheritedRole,
         users
       }
@@ -2298,12 +2478,13 @@ export class HomeDBManager extends EventEmitter {
   }
 
   /**
-   * Updates the updatedAt values for several docs. Takes a map where each entry maps a docId to
-   * an ISO date string representing the new updatedAt time. This is not a part of the API, it
-   * should be called only by the HostedMetadataManager when a change is made to a doc.
+   * Updates the updatedAt and usage values for several docs. Takes a map where each entry maps
+   * a docId to a metadata object containing the updatedAt and/or usage values. This is not a part
+   * of the API, it should be called only by the HostedMetadataManager when a change is made to a
+   * doc.
    */
-  public async setDocsUpdatedAt(
-    docUpdateMap: {[docId: string]: string}
+  public async setDocsMetadata(
+    docUpdateMap: {[docId: string]: DocumentMetadata}
   ): Promise<QueryResult<void>> {
     if (!docUpdateMap || Object.keys(docUpdateMap).length === 0) {
       return {
@@ -2316,13 +2497,33 @@ export class HomeDBManager extends EventEmitter {
       const updateTasks = docIds.map(docId => {
         return manager.createQueryBuilder()
           .update(Document)
-          .set({updatedAt: docUpdateMap[docId]})
+          .set(docUpdateMap[docId])
           .where("id = :docId", {docId})
           .execute();
       });
       await Promise.all(updateTasks);
       return { status: 200 };
     });
+  }
+
+  public async setDocGracePeriodStart(docId: string, gracePeriodStart: Date | null) {
+    return await this._connection.createQueryBuilder()
+      .update(Document)
+      .set({gracePeriodStart})
+      .where({id: docId})
+      .execute();
+  }
+
+  public async getDocProduct(docId: string): Promise<Product | undefined> {
+    return await this._connection.createQueryBuilder()
+      .select('product')
+      .from(Product, 'product')
+      .leftJoinAndSelect('product.accounts', 'account')
+      .leftJoinAndSelect('account.orgs', 'org')
+      .leftJoinAndSelect('org.workspaces', 'workspace')
+      .leftJoinAndSelect('workspace.docs', 'doc')
+      .where('doc.id = :docId', {docId})
+      .getOne() || undefined;
   }
 
   /**
@@ -2822,7 +3023,7 @@ export class HomeDBManager extends EventEmitter {
       // get or create user - with retry, since there'll be a race to create the
       // user if a bunch of servers start simultaneously and the user doesn't exist
       // yet.
-      const user = await this.getUserByLoginWithRetry(profile.email, profile);
+      const user = await this.getUserByLoginWithRetry(profile.email, {profile});
       if (user) { id = this._specialUserIds[profile.email] = user.id; }
     }
     if (!id) { throw new Error(`Could not find or create user ${profile.email}`); }
@@ -2887,7 +3088,7 @@ export class HomeDBManager extends EventEmitter {
     delta: PermissionDelta,
     isOrg: boolean = false,
     transaction?: EntityManager
-  ): Promise<UserIdDelta|null> {
+  ): Promise<PermissionDeltaAnalysis> {
     if (!delta) {
       throw new ApiError('Bad request: missing permission delta', 400);
     }
@@ -2922,7 +3123,7 @@ export class HomeDBManager extends EventEmitter {
       const emailMap = delta.users;
       const emails = Object.keys(emailMap);
       const emailUsers = await Promise.all(
-        emails.map(async email => await this.getUserByLogin(email, undefined, transaction))
+        emails.map(async email => await this.getUserByLogin(email, {manager: transaction}))
       );
       emails.forEach((email, i) => {
         const userIdAffected = emailUsers[i]!.id;
@@ -2936,12 +3137,35 @@ export class HomeDBManager extends EventEmitter {
         userIdMap[userIdAffected] = emailMap[email];
       });
     }
-    if (userId in userIdMap) {
+    const userIdDelta = delta.users ? userIdMap : null;
+    const userIds = Object.keys(userIdDelta || {});
+    const removingSelf = userIds.length === 1 && userIds[0] === String(userId) &&
+      delta.maxInheritedRole === undefined && userIdDelta?.[userId] === null;
+    const permissionThreshold = removingSelf ? Permissions.VIEW : Permissions.ACL_EDIT;
+    return {
+      userIdDelta,
+      permissionThreshold,
+      affectsSelf: userId in userIdMap,
+    };
+  }
+
+  /**
+   * A helper to throw an error if a user with ACL_EDIT permission attempts
+   * to change their own access rights. The user permissions are expected to
+   * be in the supplied QueryResult, or if none is supplied are assumed to be
+   * ACL_EDIT.
+   */
+  private _failIfPowerfulAndChangingSelf(analysis: PermissionDeltaAnalysis, result?: QueryResult<any>) {
+    const permissions: Permissions = result ? result.data.permissions : Permissions.ACL_EDIT;
+    if (permissions === undefined) {
+      throw new Error('Query malformed');
+    }
+    if ((permissions & Permissions.ACL_EDIT) && analysis.affectsSelf) {
+      // editors don't get to remove themselves.
       // TODO: Consider when to allow updating own permissions - allowing updating own
       // permissions indiscriminately could lead to orphaned resources.
       throw new ApiError('Bad request: cannot update own permissions', 400);
     }
-    return delta.users ? userIdMap : null;
   }
 
   /**
@@ -3365,8 +3589,8 @@ export class HomeDBManager extends EventEmitter {
   // Access fields are added to all entities giving the group name corresponding
   // with the access level of the user.
   // Returns the resource fetched by the queryBuilder.
-  private async _verifyAclPermissions(
-    queryBuilder: SelectQueryBuilder<Resource>,
+  private async _verifyAclPermissions<T extends Resource>(
+    queryBuilder: SelectQueryBuilder<T>,
     options: {
       rawQueryBuilder?: SelectQueryBuilder<any>,
       emptyAllowed?: boolean,
@@ -4048,6 +4272,31 @@ export class HomeDBManager extends EventEmitter {
         .execute();
     });
   }
+
+  private _filterAccessData(
+    scope: Scope,
+    users: UserAccessData[],
+    maxInheritedRole: roles.BasicRole|null,
+    docId?: string
+  ): {personal: true, public: boolean}|undefined {
+    if (scope.userId === this.getPreviewerUserId()) { return; }
+
+    // If we have special access to the resource, don't filter user information.
+    if (scope.specialPermit?.docId === docId && docId) { return; }
+
+    const thisUser = this.getAnonymousUserId() === scope.userId
+      ? null
+      : users.find(user => user.id === scope.userId);
+    const realAccess = thisUser ? getRealAccess(thisUser, { maxInheritedRole, users }) : null;
+
+    // If we are an owner, don't filter user information.
+    if (thisUser && realAccess === 'owners') { return; }
+
+    // Limit user information returned to being about the current user.
+    users.length = 0;
+    if (thisUser) { users.push(thisUser); }
+    return { personal: true, public: !realAccess };
+  }
 }
 
 // Return a QueryResult reflecting the output of a query builder.
@@ -4128,7 +4377,7 @@ function getFrom(queryBuilder: SelectQueryBuilder<any>): string {
 }
 
 // Flatten a map of users per role into a simple list of users.
-function removeRole(usersWithRoles: Map<roles.NonGuestRole, User[]>) {
+export function removeRole(usersWithRoles: Map<roles.NonGuestRole, User[]>) {
   return flatten([...usersWithRoles.values()]);
 }
 

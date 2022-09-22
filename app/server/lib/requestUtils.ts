@@ -5,7 +5,7 @@ import {DocScope, QueryResult, Scope} from 'app/gen-server/lib/HomeDBManager';
 import {getUserId, RequestWithLogin} from 'app/server/lib/Authorizer';
 import {RequestWithOrg} from 'app/server/lib/extractOrg';
 import {RequestWithGrist} from 'app/server/lib/GristServer';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {Permit} from 'app/server/lib/Permit';
 import {Request, Response} from 'express';
 import {URL} from 'url';
@@ -18,9 +18,11 @@ export const TEST_HTTPS_OFFSET = process.env.GRIST_TEST_HTTPS_OFFSET ?
   parseInt(process.env.GRIST_TEST_HTTPS_OFFSET, 10) : undefined;
 
 // Database fields that we permit in entities but don't want to cross the api.
-const INTERNAL_FIELDS = new Set(['apiKey', 'billingAccountId', 'firstLoginAt', 'filteredOut', 'ownerId',
-                                 'stripeCustomerId', 'stripeSubscriptionId', 'stripePlanId',
-                                 'stripeProductId', 'userId', 'isFirstTimeUser', 'allowGoogleLogin']);
+const INTERNAL_FIELDS = new Set([
+  'apiKey', 'billingAccountId', 'firstLoginAt', 'filteredOut', 'ownerId', 'gracePeriodStart', 'stripeCustomerId',
+  'stripeSubscriptionId', 'stripePlanId', 'stripeProductId', 'userId', 'isFirstTimeUser', 'allowGoogleLogin',
+  'authSubject', 'usage'
+]);
 
 /**
  * Adapt a home-server or doc-worker URL to match the hostname in the request URL. For custom
@@ -67,8 +69,8 @@ export function addOrgToPath(req: RequestWithOrg, path: string): string {
 /**
  * Get url to the org associated with the request.
  */
-export function getOrgUrl(req: Request) {
-  return req.protocol + '://' + req.get('host') + addOrgToPathIfNeeded(req, '/');
+export function getOrgUrl(req: Request, path: string = '/') {
+  return getOriginUrl(req) + addOrgToPathIfNeeded(req, path);
 }
 
 /**
@@ -95,8 +97,8 @@ export function trustOrigin(req: Request, resp: Response): boolean {
 // enough if only the base domains match. Differing ports are allowed, which helps in dev/testing.
 export function allowHost(req: Request, allowedHost: string|URL) {
   const mreq = req as RequestWithOrg;
-  const proto = req.protocol;
-  const actualUrl = new URL(`${proto}://${req.get('host')}`);
+  const proto = getEndUserProtocol(req);
+  const actualUrl = new URL(getOriginUrl(req));
   const allowedUrl = (typeof allowedHost === 'string') ? new URL(`${proto}://${allowedHost}`) : allowedHost;
   if (mreq.isCustomHost) {
     // For a request to a custom domain, the full hostname must match.
@@ -150,10 +152,10 @@ export function getDocScope(req: Request): DocScope {
  *     is limited to docs/workspaces that have been removed.
  */
 export function getScope(req: Request): Scope {
-  const urlId = req.params.did || req.params.docId;
+  const {specialPermit, docAuth} = (req as RequestWithLogin);
+  const urlId = req.params.did || req.params.docId || docAuth?.docId || undefined;
   const userId = getUserId(req);
   const org = (req as RequestWithOrg).org;
-  const {specialPermit} = (req as RequestWithLogin);
   const includeSupport = isParameterOn(req.query.includeSupport);
   const showRemoved = isParameterOn(req.query.showRemoved);
   return {urlId, userId, org, includeSupport, showRemoved, specialPermit};
@@ -179,12 +181,13 @@ export async function sendReply<T>(
   result: QueryResult<T>,
   options: SendReplyOptions = {},
 ) {
-  const data = pruneAPIResult(result.data || null, options.allowedFields);
+  const data = pruneAPIResult(result.data, options.allowedFields);
   if (shouldLogApiDetails && req) {
     const mreq = req as RequestWithLogin;
     log.rawDebug('api call', {
       url: req.url,
       userId: mreq.userId,
+      altSessionId: mreq.altSessionId,
       email: mreq.user && mreq.user.loginEmail,
       org: mreq.org,
       params: req.params,
@@ -193,7 +196,7 @@ export async function sendReply<T>(
     });
   }
   if (result.status === 200) {
-    return res.json(data);
+    return res.json(data ?? null); // can't handle undefined
   } else {
     return res.status(result.status).json({error: result.errMessage});
   }
@@ -220,9 +223,12 @@ export function pruneAPIResult<T>(data: T, allowedFields?: Set<string>): T {
       if (key === 'options' && value === null) { return undefined; }
       // Don't prune anything that is explicitly allowed.
       if (allowedFields?.has(key)) { return value; }
+      // User connect id is not used in regular configuration, so we remove it from the response, when
+      // it's not filled.
+      if (key === 'connectId' && value === null) { return undefined; }
       return INTERNAL_FIELDS.has(key) ? undefined : value;
     });
-  return JSON.parse(output);
+  return output !== undefined ? JSON.parse(output) : undefined;
 }
 
 /**
@@ -252,8 +258,14 @@ export function stringParam(p: any, name: string, allowed?: string[]): string {
 
 export function integerParam(p: any, name: string): number {
   if (typeof p === 'number') { return Math.floor(p); }
-  if (typeof p === 'string') { return parseInt(p, 10); }
-  throw new Error(`${name} parameter should be an integer: ${p}`);
+  if (typeof p === 'string') {
+    const result = parseInt(p, 10);
+    if (isNaN(result)) {
+      throw new ApiError(`${name} parameter cannot be understood as an integer: ${p}`, 400);
+    }
+    return result;
+  }
+  throw new ApiError(`${name} parameter should be an integer: ${p}`, 400);
 }
 
 export function optIntegerParam(p: any): number|undefined {
@@ -279,9 +291,22 @@ export interface RequestWithGristInfo extends Request {
  * https://docs.aws.amazon.com/elasticloadbalancing/latest/classic/x-forwarded-headers.html
  */
 export function getOriginUrl(req: Request) {
-  const host = req.headers.host!;
-  const protocol = req.get("X-Forwarded-Proto") || req.protocol;
+  const host = req.get('host')!;
+  const protocol = getEndUserProtocol(req);
   return `${protocol}://${host}`;
+}
+
+/**
+ * Get the protocol to use in Grist URLs that are intended to be reachable
+ * from a user's browser. Use the protocol in APP_HOME_URL if available,
+ * otherwise X-Forwarded-Proto is set on the provided request, otherwise
+ * the protocol of the request itself.
+ */
+export function getEndUserProtocol(req: Request) {
+  if (process.env.APP_HOME_URL) {
+    return new URL(process.env.APP_HOME_URL).protocol.replace(':', '');
+  }
+  return req.get("X-Forwarded-Proto") || req.protocol;
 }
 
 /**

@@ -2,19 +2,19 @@ import {CursorPos} from 'app/client/components/Cursor';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {ColumnRec} from 'app/client/models/entities/ColumnRec';
 import {buildHighlightedCode, cssCodeBlock} from 'app/client/ui/CodeHighlight';
-import {cssBlockedCursor, cssEmptySeparator, cssLabel, cssRow} from 'app/client/ui/RightPanel';
+import {cssBlockedCursor, cssLabel, cssRow} from 'app/client/ui/RightPanelStyles';
 import {buildFormulaTriggers} from 'app/client/ui/TriggerFormulas';
 import {textButton} from 'app/client/ui2018/buttons';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {textInput} from 'app/client/ui2018/editableLabel';
 import {cssIconButton, icon} from 'app/client/ui2018/icons';
+import {IconName} from 'app/client/ui2018/IconList';
 import {selectMenu, selectOption, selectTitle} from 'app/client/ui2018/menus';
+import {createFormulaErrorObs, cssError} from 'app/client/widgets/FormulaEditor';
 import {sanitizeIdent} from 'app/common/gutil';
 import {bundleChanges, Computed, dom, DomContents, DomElementArg, fromKo, MultiHolder,
-        Observable, styled, subscribe} from 'grainjs';
+        Observable, styled} from 'grainjs';
 import * as ko from 'knockout';
-import debounce = require('lodash/debounce');
-import {IconName} from 'app/client/ui2018/IconList';
 
 export function buildNameConfig(owner: MultiHolder, origColumn: ColumnRec, cursor: ko.Computed<CursorPos>) {
   const untieColId = origColumn.untieColIdFromLabel;
@@ -42,15 +42,15 @@ export function buildNameConfig(owner: MultiHolder, origColumn: ColumnRec, curso
     cssRow(
       dom.cls(cssBlockedCursor.className, origColumn.disableModify),
       cssColLabelBlock(
-        editor = textInput(fromKo(origColumn.label),
+        editor = cssInput(fromKo(origColumn.label),
           async val => { await origColumn.label.saveOnly(val); editedLabel.set(''); },
           dom.on('input', (ev, elem) => { if (!untieColId.peek()) { editedLabel.set(elem.value); } }),
           dom.boolAttr('disabled', origColumn.disableModify),
           testId('field-label'),
         ),
-        textInput(editableColId,
+        cssInput(editableColId,
           saveColId,
-          dom.boolAttr('disabled', use => use(origColumn.disableModify) || !use(origColumn.untieColIdFromLabel)),
+          dom.boolAttr(`readonly`, use => use(origColumn.disableModify) || !use(origColumn.untieColIdFromLabel)),
           cssCodeBlock.cls(''),
           {style: 'margin-top: 8px'},
           testId('field-col-id'),
@@ -327,62 +327,15 @@ function buildFormula(
   );
 }
 
-/**
- * Create and return an observable for the count of errors in a column, which gets updated in
- * response to changes in origColumn and in user data.
- */
-function createFormulaErrorObs(owner: MultiHolder, gristDoc: GristDoc, origColumn: ColumnRec) {
-  const errorMessage = Observable.create(owner, '');
-
-  // Count errors in origColumn when it's a formula column. Counts get cached by the
-  // tableData.countErrors() method, and invalidated on relevant data changes.
-  function countErrors() {
-    if (owner.isDisposed()) { return; }
-    const tableData = gristDoc.docData.getTable(origColumn.table.peek().tableId.peek());
-    const isFormula = origColumn.isRealFormula.peek() || origColumn.hasTriggerFormula.peek();
-    if (tableData && isFormula) {
-      const colId = origColumn.colId.peek();
-      const numCells = tableData.getColValues(colId)?.length || 0;
-      const numErrors = tableData.countErrors(colId) || 0;
-      errorMessage.set(
-        (numErrors === 0) ? '' :
-        (numCells === 1) ? `Error in the cell` :
-        (numErrors === numCells) ? `Errors in all ${numErrors} cells` :
-        `Errors in ${numErrors} of ${numCells} cells`
-      );
-    } else {
-      errorMessage.set('');
-    }
-  }
-
-  // Debounce the count calculation to defer it to the end of a bundle of actions.
-  const debouncedCountErrors = debounce(countErrors, 0);
-
-  // If there is an update to the data in the table, count errors again. Since the same UI is
-  // reused when different page widgets are selected, we need to re-create this subscription
-  // whenever the selected table changes. We use a Computed to both react to changes and dispose
-  // the previous subscription when it changes.
-  Computed.create(owner, (use) => {
-    const tableData = gristDoc.docData.getTable(use(use(origColumn.table).tableId));
-    return tableData ? use.owner.autoDispose(tableData.tableActionEmitter.addListener(debouncedCountErrors)) : null;
-  });
-
-  // The counts depend on the origColumn and its isRealFormula status, but with the debounced
-  // callback and subscription to data, subscribe to relevant changes manually (rather than using
-  // a Computed).
-  owner.autoDispose(subscribe(use => { use(origColumn.id); use(origColumn.isRealFormula); debouncedCountErrors(); }));
-  return errorMessage;
-}
-
-const cssFieldFormula = styled(buildHighlightedCode, `
+export const cssFieldFormula = styled(buildHighlightedCode, `
   flex: auto;
   cursor: pointer;
   margin-top: 4px;
   padding-left: 24px;
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.accentIcon};
 
   &-disabled-icon.formula_field_sidepane::before {
-    --icon-color: ${colors.slate};
+    --icon-color: ${theme.lightText};
   }
   &-disabled {
     pointer-events: none;
@@ -391,20 +344,20 @@ const cssFieldFormula = styled(buildHighlightedCode, `
 
 const cssToggleButton = styled(cssIconButton, `
   margin-left: 8px;
-  background-color: var(--grist-color-medium-grey-opaque);
-  box-shadow: inset 0 0 0 1px ${colors.darkGrey};
+  background-color: ${theme.rightPanelToggleButtonDisabledBg};
+  box-shadow: inset 0 0 0 1px ${theme.inputBorder};
 
   &-selected, &-selected:hover {
     box-shadow: none;
-    background-color: ${colors.dark};
-    --icon-color: ${colors.light};
+    background-color: ${theme.rightPanelToggleButtonEnabledBg};
+    --icon-color: ${theme.rightPanelToggleButtonEnabledFg};
   }
   &-selected:hover {
-    --icon-color: ${colors.darkGrey};
+    --icon-color: ${theme.rightPanelToggleButtonEnabledHoverFg};
   }
   &-disabled, &-disabled:hover {
-    --icon-color: ${colors.light};
-    background-color: var(--grist-color-medium-grey-opaque);
+    --icon-color: ${theme.rightPanelToggleButtonDisabledFg};
+    background-color: ${theme.rightPanelToggleButtonDisabledBg};
   }
 `);
 
@@ -421,7 +374,7 @@ const cssColTieBlock = styled('div', `
 
 const cssColTieConnectors = styled('div', `
   position: absolute;
-  border: 2px solid var(--grist-color-dark-grey);
+  border: 2px solid ${theme.inputBorder};
   top: -9px;
   bottom: -9px;
   right: 11px;
@@ -430,6 +383,21 @@ const cssColTieConnectors = styled('div', `
   z-index: -1;
 `);
 
-const cssError = styled('div', `
-  color: ${colors.error};
+const cssEmptySeparator = styled('div', `
+  margin-top: 16px;
+`);
+
+const cssInput = styled(textInput, `
+  color: ${theme.inputFg};
+  background-color: ${theme.mainPanelBg};
+  border: 1px solid ${theme.inputBorder};
+
+  &::placeholder {
+    color: ${theme.inputPlaceholderFg};
+  }
+
+  &[readonly] {
+    background-color: ${theme.inputDisabledBg};
+    color: ${theme.inputDisabledFg};
+  }
 `);

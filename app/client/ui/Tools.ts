@@ -1,31 +1,30 @@
 import {GristDoc} from 'app/client/components/GristDoc';
-import {loadGristDoc} from 'app/client/lib/imports';
 import {urlState} from 'app/client/models/gristUrlState';
-import {getUserOrgPrefObs} from 'app/client/models/UserPrefs';
+import {getUserOrgPrefObs, markAsSeen} from 'app/client/models/UserPrefs';
 import {showExampleCard} from 'app/client/ui/ExampleCard';
 import {examples} from 'app/client/ui/ExampleInfo';
 import {createHelpTools, cssLinkText, cssPageEntry, cssPageEntryMain, cssPageEntrySmall,
         cssPageIcon, cssPageLink, cssSectionHeader, cssSpacer, cssSplitPageEntry,
         cssTools} from 'app/client/ui/LeftPanelCommon';
 import {hoverTooltip, tooltipCloseButton} from 'app/client/ui/tooltips';
-import {colors} from 'app/client/ui2018/cssVars';
+import {theme} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {cssLink} from 'app/client/ui2018/links';
 import {menuAnnotate} from 'app/client/ui2018/menus';
 import {confirmModal} from 'app/client/ui2018/modals';
 import {userOverrideParams} from 'app/common/gristUrls';
-import {Computed, Disposable, dom, makeTestId, Observable, observable, styled} from 'grainjs';
+import {isOwner} from 'app/common/roles';
+import {Disposable, dom, makeTestId, Observable, observable, styled} from 'grainjs';
 
 const testId = makeTestId('test-tools-');
 
 export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Observable<boolean>): Element {
-  const isOwner = gristDoc.docPageModel.currentDoc.get()?.access === 'owners';
-  const isOverridden = Boolean(gristDoc.docPageModel.userOverride.get());
-  const hasDocTour = Computed.create(owner, use =>
-    use(gristDoc.docModel.allTableIds.getObservable()).includes('GristDocTour'));
+  const docPageModel = gristDoc.docPageModel;
+  const isDocOwner = isOwner(docPageModel.currentDoc.get());
+  const isOverridden = Boolean(docPageModel.userOverride.get());
   const canViewAccessRules = observable(false);
   function updateCanViewAccessRules() {
-    canViewAccessRules.set((isOwner && !isOverridden) ||
+    canViewAccessRules.set((isDocOwner && !isOverridden) ||
                            gristDoc.docModel.rules.getNumRows() > 0);
   }
   owner.autoDispose(gristDoc.docModel.rules.tableData.tableActionEmitter.addListener(updateCanViewAccessRules));
@@ -49,7 +48,15 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       }),
       testId('access-rules'),
     ),
-
+    cssPageEntry(
+      cssPageEntry.cls('-selected', (use) => use(gristDoc.activeViewId) === 'data'),
+      cssPageLink(
+        cssPageIcon('Database'),
+        cssLinkText('Raw Data'),
+        testId('raw'),
+        urlState().setLinkUrl({docPage: 'data'})
+      )
+    ),
     cssPageEntry(
       cssPageLink(cssPageIcon('Log'), cssLinkText('Dokument-Historie'), testId('log'),
         dom.on('click', () => gristDoc.showTool('docHistory')))
@@ -69,7 +76,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       testId('code'),
     ),
     cssSpacer(),
-    dom.maybe(gristDoc.docPageModel.currentDoc, (doc) => {
+    dom.maybe(docPageModel.currentDoc, (doc) => {
       const ex = examples.find(e => e.urlId === doc.urlId);
       if (!ex || !ex.tutorialUrl) { return null; }
       return cssPageEntry(
@@ -89,24 +96,16 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
       );
     }),
     // Show the 'Tour of this Document' button if a GristDocTour table exists.
-    dom.maybe(hasDocTour, () =>
+    dom.maybe(gristDoc.hasDocTour, () =>
       cssSplitPageEntry(
         cssPageEntryMain(
           cssPageLink(cssPageIcon('Page'),
             cssLinkText('Tour of this Document'),
-            automaticHelpTool(
-              async ({markAsSeen}) => {
-                const gristDocModule = await loadGristDoc();
-                await gristDocModule.startDocTour(gristDoc.docData, gristDoc.docComm, markAsSeen);
-              },
-              gristDoc,
-              "seenDocTours",
-              gristDoc.docId()
-            ),
+            urlState().setLinkUrl({docTour: true}),
             testId('doctour'),
           ),
         ),
-        !isOwner ? null : cssPageEntrySmall(
+        !isDocOwner ? null : cssPageEntrySmall(
           cssPageLink(cssPageIcon('Remove'),
             dom.on('click', () => confirmModal('Delete document tour?', 'Delete', () =>
               gristDoc.docData.sendAction(['RemoveTable', 'GristDocTour']))
@@ -116,7 +115,7 @@ export function tools(owner: Disposable, gristDoc: GristDoc, leftPanelOpen: Obse
         )
       ),
     ),
-    createHelpTools(gristDoc.docPageModel.appModel, false)
+    createHelpTools(docPageModel.appModel),
   );
 }
 
@@ -148,24 +147,7 @@ function automaticHelpTool(
       return;
     }
 
-    // When the help is closed, if it's the first time it's dismissed, save this fact, to avoid
-    // showing it automatically again in the future.
-    function markAsSeen() {
-      try {
-        if (!seenIds.includes(itemId)) {
-          const seen = new Set(seenIds);
-          seen.add(itemId);
-          prefObs.set([...seen].sort());
-        }
-      } catch (e) {
-        // If we fail to save this preference, it's probably not worth alerting the user about,
-        // so just log to console.
-        // tslint:disable-next-line:no-console
-        console.warn("Failed to save userPref " + prefKey, e);
-      }
-    }
-
-    showFunc({elem, reopen, markAsSeen});
+    showFunc({elem, reopen, markAsSeen: () => markAsSeen(prefObs, itemId)});
   }
 
   return [
@@ -225,7 +207,7 @@ function addRevertViewAsUI() {
 const cssConvertTooltip = styled('div', `
   display: flex;
   align-items: center;
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.controlFg};
 
   & > .${cssLink.className} {
     margin-left: 8px;
@@ -242,10 +224,10 @@ const cssExampleCardOpener = styled('div', `
   width: 24px;
   padding: 4px;
   line-height: 0px;
-  --icon-color: ${colors.light};
-  background-color: ${colors.lightGreen};
+  --icon-color: ${theme.iconButtonFg};
+  background-color: ${theme.iconButtonPrimaryBg};
   &:hover {
-    background-color: ${colors.darkGreen};
+    background-color: ${theme.iconButtonPrimaryHoverBg};
   }
   .${cssTools.className}-collapsed & {
     display: none;
@@ -253,9 +235,9 @@ const cssExampleCardOpener = styled('div', `
 `);
 
 const cssRevertViewAsButton = styled(cssExampleCardOpener, `
-  background-color: ${colors.darkGrey};
+  background-color: ${theme.iconButtonSecondaryBg};
   &:hover {
-    background-color: ${colors.slate};
+    background-color: ${theme.iconButtonSecondaryHoverBg};
   }
 `);
 

@@ -1,6 +1,8 @@
-import {ColumnRec, DocModel, IRowModel, refRecord, ViewSectionRec} from 'app/client/models/DocModel';
+import {ColumnRec, DocModel, IRowModel, refListRecords, refRecord, ViewSectionRec} from 'app/client/models/DocModel';
 import {formatterForRec} from 'app/client/models/entities/ColumnRec';
 import * as modelUtil from 'app/client/models/modelUtil';
+import {removeRule, RuleOwner} from 'app/client/models/RuleOwner';
+import {Style} from 'app/client/models/Styles';
 import * as UserType from 'app/client/widgets/UserType';
 import {DocumentSettings} from 'app/common/DocumentSettings';
 import {BaseFormatter} from 'app/common/ValueFormatter';
@@ -8,7 +10,7 @@ import {createParser} from 'app/common/ValueParser';
 import * as ko from 'knockout';
 
 // Represents a page entry in the tree of pages.
-export interface ViewFieldRec extends IRowModel<"_grist_Views_section_field"> {
+export interface ViewFieldRec extends IRowModel<"_grist_Views_section_field">, RuleOwner {
   viewSection: ko.Computed<ViewSectionRec>;
   widthDef: modelUtil.KoSaveableObservable<number>;
 
@@ -66,7 +68,11 @@ export interface ViewFieldRec extends IRowModel<"_grist_Views_section_field"> {
   disableEditData: ko.Computed<boolean>;
 
   textColor: modelUtil.KoSaveableObservable<string|undefined>;
-  fillColor: modelUtil.KoSaveableObservable<string>;
+  fillColor: modelUtil.KoSaveableObservable<string|undefined>;
+  fontBold: modelUtil.KoSaveableObservable<boolean|undefined>;
+  fontUnderline: modelUtil.KoSaveableObservable<boolean|undefined>;
+  fontItalic: modelUtil.KoSaveableObservable<boolean|undefined>;
+  fontStrikethrough: modelUtil.KoSaveableObservable<boolean|undefined>;
 
   documentSettings: ko.PureComputed<DocumentSettings>;
 
@@ -203,16 +209,12 @@ export function createViewFieldRec(this: ViewFieldRec, docModel: DocModel): void
   this.disableModify = ko.pureComputed(() => this.column().disableModify());
   this.disableEditData = ko.pureComputed(() => this.column().disableEditData());
 
-  this.textColor = this.widgetOptionsJson.prop('textColor') as modelUtil.KoSaveableObservable<string>;
-
-  const fillColorProp = modelUtil.fieldWithDefault(
-    this.widgetOptionsJson.prop('fillColor') as modelUtil.KoSaveableObservable<string>, "#FFFFFF00");
-  // Store empty string in place of the default white color, so that we can keep it transparent in
-  // GridView, to avoid interfering with zebra stripes.
-  this.fillColor = modelUtil.savingComputed({
-    read: () => fillColorProp(),
-    write: (setter, val) => setter(fillColorProp, val.toUpperCase() === '#FFFFFF' ? '' : val),
-  });
+  this.textColor = this.widgetOptionsJson.prop('textColor');
+  this.fillColor = this.widgetOptionsJson.prop('fillColor');
+  this.fontBold = this.widgetOptionsJson.prop('fontBold');
+  this.fontUnderline = this.widgetOptionsJson.prop('fontUnderline');
+  this.fontItalic = this.widgetOptionsJson.prop('fontItalic');
+  this.fontStrikethrough = this.widgetOptionsJson.prop('fontStrikethrough');
 
   this.documentSettings = ko.pureComputed(() => docModel.docInfoRow.documentSettingsJson());
 
@@ -231,4 +233,28 @@ export function createViewFieldRec(this: ViewFieldRec, docModel: DocModel): void
     };
     return docModel.docData.bundleActions("Update choices configuration", callback, actionOptions);
   };
+
+  this.tableId = ko.pureComputed(() => this.column().table().tableId());
+  this.rulesCols = refListRecords(docModel.columns, ko.pureComputed(() => this._fieldOrColumn().rules()));
+  this.rulesColsIds = ko.pureComputed(() => this.rulesCols().map(c => c.colId()));
+  this.rulesStyles = modelUtil.fieldWithDefault(
+    this.widgetOptionsJson.prop("rulesOptions") as modelUtil.KoSaveableObservable<Style[]>,
+    []);
+  this.hasRules = ko.pureComputed(() => this.rulesCols().length > 0);
+
+  // Helper method to add an empty rule (either initial or additional one).
+  // Style options are added to widget options directly and can be briefly out of sync,
+  // which is taken into account during rendering.
+  this.addEmptyRule = async () => {
+    const useCol = this.useColOptions.peek();
+    const action = [
+      'AddEmptyRule',
+      this.column.peek().table.peek().tableId.peek(),
+      useCol ? 0 : this.id.peek(), // field_ref
+      useCol ? this.column.peek().id.peek() : 0, // col_ref
+    ];
+    await docModel.docData.sendAction(action, `Update rules for ${this.colId.peek()}`);
+  };
+
+  this.removeRule = (index: number) => removeRule(docModel, this, index);
 }

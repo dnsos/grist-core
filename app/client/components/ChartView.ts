@@ -1,4 +1,4 @@
-import * as BaseView from 'app/client/components/BaseView';
+import BaseView from 'app/client/components/BaseView';
 import {GristDoc} from 'app/client/components/GristDoc';
 import {consolidateValues, formatPercent, sortByXValues, splitValuesByIndex,
         uniqXValues} from 'app/client/lib/chartUtil';
@@ -6,19 +6,22 @@ import {Delay} from 'app/client/lib/Delay';
 import {Disposable} from 'app/client/lib/dispose';
 import {fromKoSave} from 'app/client/lib/fromKoSave';
 import {loadPlotly, PlotlyType} from 'app/client/lib/imports';
-import * as DataTableModel from 'app/client/models/DataTableModel';
+import DataTableModel from 'app/client/models/DataTableModel';
 import {ColumnRec, ViewFieldRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {reportError} from 'app/client/models/errors';
 import {KoSaveableObservable, ObjObservable, setSaveValue} from 'app/client/models/modelUtil';
 import {SortedRowSet} from 'app/client/models/rowset';
-import {cssLabel, cssRow, cssSeparator} from 'app/client/ui/RightPanel';
+import {IPageWidget, toPageWidget} from 'app/client/ui/PageWidgetPicker';
+import {cssLabel, cssRow, cssSeparator} from 'app/client/ui/RightPanelStyles';
 import {cssFieldEntry, cssFieldLabel, IField, VisibleFieldsConfig } from 'app/client/ui/VisibleFieldsConfig';
+import {IconName} from 'app/client/ui2018/IconList';
 import {squareCheckbox} from 'app/client/ui2018/checkbox';
-import {colors, vars} from 'app/client/ui2018/cssVars';
+import {theme, vars} from 'app/client/ui2018/cssVars';
 import {cssDragger} from 'app/client/ui2018/draggableList';
 import {icon} from 'app/client/ui2018/icons';
-import {linkSelect, menu, menuItem, menuText, select} from 'app/client/ui2018/menus';
+import {IOptionFull, linkSelect, menu, menuItem, menuText, select} from 'app/client/ui2018/menus';
 import {nativeCompare, unwrap} from 'app/common/gutil';
+import {Sort} from 'app/common/SortSpec';
 import {BaseFormatter} from 'app/common/ValueFormatter';
 import {decodeObject} from 'app/plugin/objtypes';
 import {Events as BackboneEvents} from 'backbone';
@@ -30,8 +33,11 @@ import debounce = require('lodash/debounce');
 import defaults = require('lodash/defaults');
 import defaultsDeep = require('lodash/defaultsDeep');
 import isNumber = require('lodash/isNumber');
+import merge = require('lodash/merge');
 import sum = require('lodash/sum');
-import {Annotations, Config, Data, Datum, ErrorBar, Layout, LayoutAxis, Margin} from 'plotly.js';
+import union = require('lodash/union');
+import type {Annotations, Config, Datum, ErrorBar, Layout, LayoutAxis, Margin,
+    PlotData as PlotlyPlotData} from 'plotly.js';
 
 
 let Plotly: PlotlyType;
@@ -69,6 +75,7 @@ interface ChartOptions {
   multiseries?: boolean;
   lineConnectGaps?: boolean;
   lineMarkers?: boolean;
+  stacked?: boolean;
   invertYAxis?: boolean;
   logYAxis?: boolean;
   // If "symmetric", one series after each Y series gives the length of the error bars around it. If
@@ -78,6 +85,8 @@ interface ChartOptions {
   showTotal?: boolean;
   textSize?: number;
   isXAxisUndefined?: boolean;
+  orientation?: 'v'|'h';
+  aggregate?: boolean;
 }
 
 // tslint:disable:no-console
@@ -91,6 +100,7 @@ interface Series {
   label: string;          // Corresponds to the column name.
   group?: Datum;          // The group value, when grouped.
   values: Datum[];
+  isInSortSpec?: boolean; // Whether this series is present in sort spec for this chart.
 }
 
 function getSeriesName(series: Series, haveMultiple: boolean) {
@@ -110,6 +120,7 @@ function getSeriesName(series: Series, haveMultiple: boolean) {
   }
 }
 
+type Data = Partial<PlotlyPlotData>;
 
 // The output of a ChartFunc. Normally it just returns one or more Data[] series, but sometimes it
 // includes layout information: e.g. a "Scatter Plot" returns a Layout with axis labels.
@@ -211,6 +222,8 @@ export class ChartView extends Disposable {
     this.listenTo(this.sortedRows, 'rowNotify', this._update);
     this.autoDispose(this.sortedRows.getKoArray().subscribe(this._update));
     this.autoDispose(this._formatterComp.subscribe(this._update));
+    this.autoDispose(this.gristDoc.docPageModel.appModel.currentTheme.addListener(() =>
+      this._update()));
   }
 
   public prepareToPrint(onOff: boolean) {
@@ -255,6 +268,7 @@ export class ChartView extends Disposable {
         return {
           label: field.label(),
           values: rowIds.map(fullGetter),
+          isInSortSpec: Boolean(Sort.findCol(this._sortSpec, field.colRef.peek())),
         };
       });
 
@@ -293,7 +307,9 @@ export class ChartView extends Disposable {
       plotData = chartFunc(series, options, dataOptions);
     } else if (series.length > 1) {
       // We need to group all series by the first column.
-      const nseries = groupSeries(series[0].values, series.slice(1));
+      // Sort series alphabetically only if user has not defined a sort on this chart.
+      const shouldSort = !series[0].isInSortSpec;
+      const nseries = groupSeries(series[0].values, series.slice(1), shouldSort);
 
       // This will be in the order in which nseries Map was created; concat() flattens the arrays.
       const xvalues = Array.from(new Set(series[1].values));
@@ -320,7 +336,7 @@ export class ChartView extends Disposable {
     // meantime and cause error later. So let's check again.
     if (this.isDisposed()) { return; }
 
-    const layout: Partial<Layout> = defaultsDeep(plotData.layout, getPlotlyLayout(options));
+    const layout: Partial<Layout> = defaultsDeep(plotData.layout, this._getPlotlyLayout(options));
     const config: Partial<Config> = {...plotData.config, displayModeBar: false};
     // react() can be used in place of newPlot(), and is faster when updating an existing plot.
     await Plotly.react(this._chartDom, plotData.data, layout, config);
@@ -335,6 +351,50 @@ export class ChartView extends Disposable {
   private _isCompatibleSeries(col: ColumnRec) {
     return isNumericOnly(this._chartType.peek()) ? isNumericLike(col) : true;
   }
+
+  private _getPlotlyLayout(options: ChartOptions): Partial<Layout> {
+    // Note that each call to getPlotlyLayout() creates a new layout object. We are intentionally
+    // avoiding reuse because Plotly caches too many layout calculations when the object is reused.
+    const yaxis: Partial<LayoutAxis> = {automargin: true, title: {standoff: 0}};
+    const xaxis: Partial<LayoutAxis> = {automargin: true, title: {standoff: 0}};
+    if (options.logYAxis) { yaxis.type = 'log'; }
+    if (options.invertYAxis) { yaxis.autorange = 'reversed'; }
+    const layout = {
+      // Margins include labels, titles, legend, and may get auto-expanded beyond this.
+      margin: {
+        l: 50,
+        r: 50,
+        b: 40,  // Space below chart which includes x-axis labels
+        t: 30,  // Space above the chart (doesn't include any text)
+        pad: 4
+      } as Margin,
+      yaxis,
+      xaxis,
+      ...(options.stacked ? {barmode: 'relative'} : {}),
+    };
+    return merge(layout, this._getPlotlyTheme());
+  }
+
+  private _getPlotlyTheme(): Partial<Layout> {
+    const appModel = this.gristDoc.docPageModel.appModel;
+    const {colors} = appModel.currentTheme.get();
+    return {
+      paper_bgcolor: colors['chart-bg'],
+      plot_bgcolor: colors['chart-bg'],
+      xaxis: {
+        color: colors['chart-x-axis'],
+      },
+      yaxis: {
+        color: colors['chart-y-axis'],
+      },
+      font: {
+        color: colors['chart-fg'],
+      },
+      legend: {
+        bgcolor: colors['chart-legend-bg'],
+      },
+    };
+  }
 }
 
 /**
@@ -345,7 +405,7 @@ export class ChartView extends Disposable {
  * (each an array of values), then returns a map mapping each CompanyID to the array [Date,
  * Employees, Revenue], each value of which is itself an array of values for that CompanyID.
  */
-function groupSeries<T extends Datum>(groupColumn: T[], valueSeries: Series[]): Map<T, Series[]> {
+function groupSeries<T extends Datum>(groupColumn: T[], valueSeries: Series[], sort: boolean): Map<T, Series[]> {
   const nseries = new Map<T, Series[]>();
 
   // Limit the number if group values so as to limit the total number of series we pass into
@@ -353,7 +413,11 @@ function groupSeries<T extends Datum>(groupColumn: T[], valueSeries: Series[]): 
   // TODO: When not all data is shown, we should probably show some indicator, similar to when
   // OnDemand data is truncated.
   const maxGroups = Math.floor(MAX_SERIES_IN_CHART / valueSeries.length);
-  const groupValues: T[] = [...new Set(groupColumn)].sort().slice(0, maxGroups);
+  let groupValues: T[] = [...new Set(groupColumn)];
+  if (sort) {
+    groupValues.sort();
+  }
+  groupValues = groupValues.slice(0, maxGroups);
 
   // Set up empty lists for each group.
   for (const group of groupValues) {
@@ -403,33 +467,12 @@ function extractErrorBars(series: Series[], options: ChartOptions): Map<Series, 
 defaults(ChartView.prototype, BaseView.prototype);
 Object.assign(ChartView.prototype, BackboneEvents);
 
-function getPlotlyLayout(options: ChartOptions): Partial<Layout> {
-  // Note that each call to getPlotlyLayout() creates a new layout object. We are intentionally
-  // avoiding reuse because Plotly caches too many layout calculations when the object is reused.
-  const yaxis: Partial<LayoutAxis> = {};
-  if (options.logYAxis) { yaxis.type = 'log'; }
-  if (options.invertYAxis) { yaxis.autorange = 'reversed'; }
-  return {
-    // Margins include labels, titles, legend, and may get auto-expanded beyond this.
-    margin: {
-      l: 50,
-      r: 50,
-      b: 40,  // Space below chart which includes x-axis labels
-      t: 30,  // Space above the chart (doesn't include any text)
-      pad: 4
-    } as Margin,
-    legend: {
-      // Translucent background, so chart data is still visible if legend overlaps it.
-      bgcolor: "#FFFFFF80",
-    },
-    yaxis,
-  };
-}
-
 /**
  * The grainjs component for side-pane configuration options for a Chart section.
  */
 export class ChartConfig extends GrainJSDisposable {
+
+  private static _instanceMap = new WeakMap<ViewSectionRec, ChartConfig>();
 
   // helper to build the draggable field list
   private _configFieldsHelper = VisibleFieldsConfig.create(this, this._gristDoc, this._section);
@@ -444,13 +487,13 @@ export class ChartConfig extends GrainJSDisposable {
     )
   );
 
-  // The column id of the grouping column, or -1 if multiseries is disabled or there are no viewFields,
+  // The colId of the grouping column, or "" if multiseries is disabled or there are no viewFields,
   // for example during section removal.
-  private _groupDataColId: Computed<number> = Computed.create(this, (use) => {
+  private _groupDataColId: Computed<string> = Computed.create(this, (use) => {
     const multiseries = use(this._optionsObj.prop('multiseries'));
     const viewFields = use(use(this._section.viewFields).getObservable());
-    if (!multiseries || viewFields.length === 0) { return -1; }
-    return use(viewFields[0].column).getRowId();
+    if (!multiseries || viewFields.length === 0) { return ""; }
+    return use(use(viewFields[0].column).colId);
   })
     .onWrite((colId) => this._setGroupDataColumn(colId));
 
@@ -461,30 +504,42 @@ export class ChartConfig extends GrainJSDisposable {
 
   private _freezeYAxis = Observable.create(this, false);
 
-  // The column id of the x-axis.
-  private _xAxis: Computed<number> = Computed.create(
+  // The colId of the x-axis, or "" is x axis is undefined.
+  private _xAxis: Computed<string> = Computed.create(
     this, this._xAxisFieldIndex, this._freezeXAxis, (use, i, freeze) => {
       if (freeze) { return this._xAxis.get(); }
       const viewFields = use(use(this._section.viewFields).getObservable());
       if (-1 < i && i < viewFields.length) {
-        return use(viewFields[i].column).getRowId();
+        return use(use(viewFields[i].column).colId);
       }
-      return -1;
+      return "";
     })
     .onWrite((colId) => this._setXAxis(colId));
 
-  private _columns = Computed.create(this, (use) => use(use(use(this._section.table).columns).getObservable()));
+  // Whether value is aggregated or not
+  private _isValueAggregated = Computed.create(this, (use) => this._isSummaryTable(use))
+    .onWrite((val) => this._setAggregation(val));
 
-  // The list of available columns for the group data picker. Picking the actual x-axis is not
-  // permitted.
-  private _groupDataOptions = Computed.create<Array<IOption<number>>>(this, (use) => [
-    {value: -1, label: 'Pick a column'},
-    ...use(this._columns)
+  // Columns options
+  private _columnsOptions: Computed<Array<IOptionFull<string>>> = Computed.create(
+    this, this._freezeXAxis, (use, freeze) => {
+      if (freeze) { return this._columnsOptions.get(); }
+      const columns = use(this._isValueAggregated) ?
+        this._getSummarySourceColumns(use) :
+        this._getColumns(use);
+      return columns
       // filter out hidden column (ie: manualsort ...)
-      .filter((col) => !col.isHiddenCol.peek())
-      .map((col) => ({
-        value: col.getRowId(), label: col.label.peek(), icon: 'FieldColumn',
-      }))
+        .filter((col) => !col.isHiddenCol.peek())
+        .map((col) => ({
+          value: col.colId(), label: col.label.peek(), icon: 'FieldColumn' as IconName,
+        }));
+    }
+  );
+
+  // The list of available columns for the group data picker.
+  private _groupDataOptions = Computed.create<Array<IOption<string>>>(this, (use) => [
+    {value: "", label: 'Pick a column'},
+    ...use(this._columnsOptions)
   ]);
 
   // Force checking/unchecking of the group data checkbox option.
@@ -493,12 +548,12 @@ export class ChartConfig extends GrainJSDisposable {
   // State for the group data option checkbox. True, if a group data column is set or if the user
   // forced it. False otherwise.
   private _groupData = Computed.create(
-    this, this._groupDataColId, this._groupDataForce, (_use, col, force) => {
-      if (col > -1) { return true; }
+    this, this._groupDataColId, this._groupDataForce, (_use, colId, force) => {
+      if (colId) { return true; }
       return force;
     }).onWrite((val) => {
       if (val === false) {
-        this._groupDataColId.set(-1);
+        this._groupDataColId.set("");
       }
       this._groupDataForce.set(val);
     });
@@ -516,15 +571,15 @@ export class ChartConfig extends GrainJSDisposable {
         await this._section.chartTypeDef.saveOnly(val);
         // When switching chart type to 'pie' makes sure to remove the group data option.
         if (isPieLike(val)) {
-          await this._setGroupDataColumn(-1);
+          await this._setGroupDataColumn("");
           this._groupDataForce.set(false);
         }
       });
     });
 
-
   constructor(private _gristDoc: GristDoc, private _section: ViewSectionRec) {
     super();
+    ChartConfig._instanceMap.set(_section, this);
   }
 
   private get _optionsObj() { return this._section.optionsObj; }
@@ -548,8 +603,16 @@ export class ChartConfig extends GrainJSDisposable {
       ),
       dom.maybe((use) => !isPieLike(use(this._section.chartTypeDef)), () => [
         // These options don't make much sense for a pie chart.
-        cssCheckboxRowObs('Group data', this._groupData),
+        cssCheckboxRowObs('Split series', this._groupData),
         cssCheckboxRow('Invert Y-axis', this._optionsObj.prop('invertYAxis')),
+        cssRow(
+          cssRowLabel('Orientation'),
+          dom('div', linkSelect(fromKoSave(this._optionsObj.prop('orientation')), [
+            {value: 'v', label: 'Vertical'},
+            {value: 'h', label: 'Horizontal'}
+          ], {defaultLabel: 'Vertical'})),
+          testId('orientation'),
+        ),
         cssCheckboxRow('Log scale Y-axis', this._optionsObj.prop('logYAxis')),
       ]),
       dom.maybeOwned((use) => use(this._section.chartTypeDef) === 'donut', (owner) => [
@@ -574,6 +637,7 @@ export class ChartConfig extends GrainJSDisposable {
         cssCheckboxRow('Show markers', this._optionsObj.prop('lineMarkers')),
       ]),
       dom.maybe((use) => ['line', 'bar'].includes(use(this._section.chartTypeDef)), () => [
+        cssCheckboxRow('Stack series', this._optionsObj.prop('stacked')),
         cssRow(
           cssRowLabel('Error bars'),
           dom('div', linkSelect(fromKoSave(this._optionsObj.prop('errorBars')), [
@@ -593,7 +657,7 @@ export class ChartConfig extends GrainJSDisposable {
       cssSeparator(),
 
       dom.maybe(this._groupData, () => [
-        cssLabel('Group data'),
+        cssLabel('Split Series'),
         cssRow(
           select(this._groupDataColId, this._groupDataOptions),
           testId('group-by-column'),
@@ -605,15 +669,12 @@ export class ChartConfig extends GrainJSDisposable {
       cssLabel(dom.text(this._firstFieldLabel), testId('first-field-label')),
       cssRow(
         select(
-          this._xAxis, Computed.create(this, (use) => use(this._columns)
-            .filter((col) => !col.isHiddenCol.peek())
-            .map((col) => ({
-              value: col.getRowId(), label: col.label.peek(), icon: 'FieldColumn',
-            }))),
+          this._xAxis, this._columnsOptions,
           { defaultLabel: 'Pick a column' }
         ),
         testId('x-axis'),
       ),
+      cssCheckboxRowObs('Aggregate values', this._isValueAggregated),
 
       cssLabel('SERIES'),
       this._buildYAxis(),
@@ -648,13 +709,14 @@ export class ChartConfig extends GrainJSDisposable {
     ];
   }
 
-  private async _setXAxis(colId: number) {
+  private async _setXAxis(colId: string) {
     const optionsObj = this._section.optionsObj;
-    const col = this._gristDoc.docModel.columns.getRowModel(colId);
+    const findColumn = () => this._getColumns().find((c) => c.colId() === colId);
     const viewFields = this._section.viewFields.peek();
 
     await this._gristDoc.docData.bundleActions('selected new x-axis', async () => {
       this._freezeYAxis.set(true);
+      this._freezeXAxis.set(true);
       try {
 
         // first remove the current field
@@ -665,11 +727,20 @@ export class ChartConfig extends GrainJSDisposable {
         // if x axis was undefined, set option to false
         await setSaveValue(this._optionsObj.prop('isXAxisUndefined'), false);
 
-        // if  new field was used to group by column series, disable multiseries
-        const fieldIndex = viewFields.peek().findIndex((f) => f.column.peek().getRowId() === colId);
+        // if new field was used to split series, disable multiseries
+        const fieldIndex = viewFields.peek().findIndex((f) => f.column.peek().colId() === colId);
         if (fieldIndex === 0 && optionsObj.prop('multiseries').peek()) {
           await optionsObj.prop('multiseries').setAndSave(false);
           return;
+        }
+
+        // if values aggregation is 'on' update the grouped by columns before findColumn()
+        // call. This will make sure that colId is not missing from the summary table's columns (as
+        // could happen if it were a non-numeric for instance).
+        if (this._isValueAggregated.get()) {
+          const splitColId = this._groupDataColId.get();
+          const cols = splitColId === colId ? [colId] : [splitColId, colId];
+          await this._setGroupByColumns(cols);
         }
 
         // if the new column for the x axis is already visible, make it the first visible column,
@@ -680,29 +751,43 @@ export class ChartConfig extends GrainJSDisposable {
         if (fieldIndex > -1) {
           await this._configFieldsHelper.changeFieldPosition(viewFields.peek()[fieldIndex], xAxisField);
         } else {
-          await this._configFieldsHelper.addField(col, xAxisField);
+          const col = findColumn();
+          if (col) {
+            await this._configFieldsHelper.addField(col, xAxisField);
+          }
         }
       } finally {
         this._freezeYAxis.set(false);
+        this._freezeXAxis.set(false);
       }
     });
   }
 
-  private async _setGroupDataColumn(colId: number) {
+  private async _setGroupDataColumn(colId: string) {
     const viewFields = this._section.viewFields.peek().peek();
 
     await this._gristDoc.docData.bundleActions('selected new group data columnd', async () => {
       this._freezeXAxis.set(true);
       this._freezeYAxis.set(true);
       try {
+
         // if grouping was already set, first remove the current field
-        if (this._groupDataColId.get() > -1) {
+        if (this._groupDataColId.get()) {
           await this._configFieldsHelper.removeField(viewFields[0]);
         }
 
-        if (colId > -1) {
-          const col = this._gristDoc.docModel.columns.getRowModel(colId);
-          const field = viewFields.find((f) => f.column.peek().getRowId() === colId);
+        // if values aggregation is 'on' update the grouped by columns first. This will make sure
+        // that colId is not missing from the summary table's columns (as could happen if it were a
+        // non-numeric for instance).
+        if (this._isValueAggregated.get()) {
+          const xAxisColId = this._xAxis.get();
+          const cols = xAxisColId === colId ? [colId] : [colId, xAxisColId];
+          await this._setGroupByColumns(cols);
+        }
+
+        if (colId) {
+          const col = this._getColumns().find((c) => c.colId() === colId)!;
+          const field = viewFields.find((f) => f.column.peek().colId() === colId);
 
           // if new field is already visible, moves the fields to the first place else add the field to the first
           // place
@@ -718,12 +803,24 @@ export class ChartConfig extends GrainJSDisposable {
           }
         }
 
-        await this._optionsObj.prop('multiseries').setAndSave(colId > -1);
+        await this._optionsObj.prop('multiseries').setAndSave(Boolean(colId));
+
       } finally {
         this._freezeXAxis.set(false);
         this._freezeYAxis.set(false);
       }
     }, {nestInActiveBundle: true});
+  }
+
+  private _getColumns(use: UseCB = unwrap) {
+    const table = use(this._section.table);
+    return use(use(table.columns).getObservable());
+  }
+
+  private _getSummarySourceColumns(use: UseCB = unwrap) {
+    let table = use(this._section.table);
+    table = use(table.summarySource);
+    return use(use(table.columns).getObservable());
   }
 
   private _buildField(col: IField) {
@@ -764,6 +861,87 @@ export class ChartConfig extends GrainJSDisposable {
   private _isCompatibleSeries(col: ColumnRec, use: UseCB = unwrap) {
     return isNumericOnly(use(this._chartType)) ? isNumericLike(col, use) : true;
   }
+
+  private async _setAggregation(val: boolean) {
+    try {
+      this._freezeXAxis.set(true);
+      await this._gristDoc.docData.bundleActions(`Toggle chart aggregation`, async () => {
+        if (val) {
+          await this._doAggregation();
+        } else {
+          await this._undoAggregation();
+        }
+      });
+    } finally {
+      if (!this.isDisposed()) {
+        this._freezeXAxis.set(false);
+      }
+    }
+  }
+
+  // Do the aggregation: if not a summary table, turns into one; else update groupby columns to
+  // match the X-Axis and Split-series columns.
+  private async _doAggregation(): Promise<void> {
+    if (!this._isSummaryTable()) {
+      await this._toggleSummaryTable();
+    } else {
+      await this._setGroupByColumns([this._xAxis.get(), this._groupDataColId.get()]);
+    }
+  }
+
+  // Undo the aggregation.
+  private async _undoAggregation() {
+    if (this._isSummaryTable()) {
+      await this._toggleSummaryTable();
+    }
+  }
+
+  private _isSummaryTable(use: UseCB = unwrap) {
+    return Boolean(use(use(this._section.table).summarySourceTable));
+  }
+
+  // Toggle whether section table is a summary table. Must use with care: this function calls
+  // `this.dispose()` as a side effect. Conveniently returns the ChartConfig instance of the new
+  // view section that replaces the old one.
+  private async _toggleSummaryTable(): Promise<ChartConfig> {
+    const colIds = [this._xAxis.get(), this._groupDataColId.get()];
+    const pageWidget = toPageWidget(this._section);
+    pageWidget.summarize = !this._isSummaryTable();
+    pageWidget.columns = this._getColumnIds(colIds);
+    this._ensureValidLinkingIfAny(pageWidget);
+    const newSection = await this._gristDoc.saveViewSection(this._section, pageWidget);
+    return ChartConfig._instanceMap.get(newSection)!;
+  }
+
+  private async _setGroupByColumns(groupByCols: string[]) {
+    const pageWidget = toPageWidget(this._section);
+    pageWidget.columns = this._getColumnIds(groupByCols);
+    this._ensureValidLinkingIfAny(pageWidget);
+    return this._gristDoc.saveViewSection(this._section, pageWidget);
+  }
+
+  // If section is linked to a summary table, makes sure that pageWidget describes a summary table
+  // that is more detailed than the source summary table. Function mutates `pageWidget`.
+  private _ensureValidLinkingIfAny(pageWidget: IPageWidget) {
+    if (!pageWidget.summarize) { return; }
+    if (!this._section.linkSrcSection().getRowId()) { return; }
+    const srcPageWidget = toPageWidget(this._section.linkSrcSection());
+    pageWidget.columns = union(pageWidget.columns, srcPageWidget.columns);
+  }
+
+  // Returns column ids corresponding to each colIds in the selected table (or corresponding summary
+  // source table, if select table is a summary table).
+  private _getColumnIds(colIds: string[]) {
+    const cols = this._isSummaryTable() ?
+      this._section.table().summarySource().columns().all() :
+      this._section.table().columns().all();
+    const columns = colIds
+      .map((colId) => colId && cols.find(c => c.colId() === colId))
+      .filter((col): col is ColumnRec => Boolean(col))
+      .map(col => col.id());
+    return columns;
+  }
+
 
 }
 
@@ -888,22 +1066,38 @@ function basicPlot(series: Series[], options: ChartOptions, dataOptions: Data): 
     // unique values for the x-axis.
     uniqXValues(series);
   }
+  const [axis1, axis2] = options.orientation === 'h' ? ['y', 'x'] : ['x', 'y'];
+
+  const dataSeries = series.slice(1).map((line: Series): Data => ({
+    name: getSeriesName(line, series.length > 2),
+    [axis1]: replaceEmptyLabels(series[0].values),
+    [axis2]: line.values,
+    [`error_${axis2}`]: errorBars.get(line),
+    orientation: options.orientation,
+    ...dataOptions,
+    stackgroup: makeRelativeStackGroup(dataOptions.stackgroup, line.values),
+  }));
+
+  // When stacking, stackgroup will be non-empty (an arbitrary value, set to "A" for line-charts).
+  // We further separate positive series from negative ones, by changing stackgroup to a different
+  // value ("-A") for series which look probably negative. This keeps positive ones above the
+  // x-axis, and negative ones below, as for barmode=relative (which only applies to bar charts).
+  function makeRelativeStackGroup(stackgroup: string|undefined, values: Datum[]) {
+    if (!stackgroup) { return stackgroup; }
+    const firstNonZero = values.find(v => v && (v > 0 || v < 0));
+    const isNegative = firstNonZero && firstNonZero < 0;
+    return isNegative ? "-" + stackgroup : stackgroup;
+  }
 
   return {
-    data: series.slice(1).map((line: Series): Data => ({
-      name: getSeriesName(line, series.length > 2),
-      x: series[0].values,
-      y: line.values,
-      error_y: errorBars.get(line),
-      ...dataOptions,
-    })),
+    data: dataSeries,
     layout: {
-      xaxis: series.length > 0 ? {title: series[0].label} : {},
+      [`${axis1}axis`]: {title: series.length > 0 ? {text: series[0].label}: {}},
       // Include yaxis title for a single y-value series only (2 series total);
       // If there are fewer than 2 total series, there is no y-series to display.
       // If there are multiple y-series, a legend will be included instead, and the yaxis title
       // is less meaningful, so omit it.
-      yaxis: series.length === 2 ? {title: series[1].label} : {},
+      [`${axis2}axis`]: {title: series.length === 2 ? {text: series[1].label} : {}},
     },
   };
 }
@@ -922,6 +1116,7 @@ export const chartTypes: {[name: string]: ChartFunc} = {
       type: 'scatter',
       connectgaps: options.lineConnectGaps,
       mode: options.lineMarkers ? 'lines+markers' : 'lines',
+      stackgroup: (options.stacked ? "A" : ""),
     });
   },
   area(series: Series[], options: ChartOptions): PlotData {
@@ -959,7 +1154,7 @@ export const chartTypes: {[name: string]: ChartFunc} = {
         name: getSeriesName(line, false),
         // nulls cause JS errors when pie charts resize, so replace with blanks.
         // (a falsy value would cause plotly to show its index, like "2" which is more confusing).
-        labels: series[0].values.map(v => (v == null || v === "") ? "-" : v),
+        labels: replaceEmptyLabels(series[0].values),
         values: line.values,
         ...dataOptions,
       }]
@@ -1032,6 +1227,18 @@ function trimNonNumericData(series: Series[]): void {
   }
 }
 
+/**
+ * Replace empty values with "-", which is relevant for labels in Pie Charts and for X-axis in
+ * other chart types.
+ *
+ * In pie charts, nulls cause JS errors. In other types, nulls in X-axis cause that point to be
+ * omitted (but still affect the Y scale, causing confusion). Replace with "-" rather than blank
+ * because plotly replaces falsy values by their index (eg "2") in Pie charts, which is confusing.
+ */
+function replaceEmptyLabels(values: Datum[]): Datum[] {
+  return values.map(v => (v == null || v === "") ? "-" : v);
+}
+
 // Given two parallel arrays, returns an array of series of the form
 // {label: category, values: array-of-values}
 function groupIntoSeries(categoryList: Datum[], valueList: Datum[]): Series[] {
@@ -1071,7 +1278,7 @@ const cssRowLabel = styled('div', `
   margin-right: 8px;
 
   font-weight: initial;   /* negate bootstrap */
-  color: ${colors.dark};
+  color: ${theme.text};
   overflow: hidden;
   text-overflow: ellipsis;
   user-select: none;
@@ -1079,7 +1286,7 @@ const cssRowLabel = styled('div', `
 
 const cssRowHelp = styled(cssRow, `
   font-size: ${vars.smallFontSize};
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
 const cssAddIcon = styled(icon, `
@@ -1089,15 +1296,15 @@ const cssAddIcon = styled(icon, `
 const cssAddYAxis = styled('div', `
   display: flex;
   cursor: pointer;
-  color: ${colors.lightGreen};
-  --icon-color: ${colors.lightGreen};
+  color: ${theme.controlFg};
+  --icon-color: ${theme.controlFg};
 
   &:not(:first-child) {
     margin-top: 8px;
   }
   &:hover, &:focus, &:active {
-    color: ${colors.darkGreen};
-    --icon-color: ${colors.darkGreen};
+    color: ${theme.controlHoverFg};
+    --icon-color: ${theme.controlHoverFg};
   }
 `);
 
@@ -1113,7 +1320,7 @@ const cssRemoveIcon = styled(icon, `
 
 const cssHintRow = styled('div', `
   margin: -4px 16px 8px 16px;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
 const cssRangeInput = styled('input', `

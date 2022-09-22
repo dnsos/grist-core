@@ -1,9 +1,14 @@
 {
   "compilerOptions": {
-    "target": "es2016",
+    "target": "es2017",
     "module": "commonjs",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
     "strict": true,
     "strictPropertyInitialization": false,
+    "useUnknownInCatchVariables": false,
+    "skipLibCheck": true,
     "sourceMap": true,
     "noImplicitAny": true,
     "noUnusedLocals": true,
@@ -16,10 +21,12 @@
       "*": [
         "*",
         "grist-core/*",
-        "stubs/*"
+        "stubs/*",
+        "ext/*"
       ],
     },
     "composite": true,
+    "types" : [],
     "plugins": [{
       "name": "typescript-eslint-language-service"
     }],

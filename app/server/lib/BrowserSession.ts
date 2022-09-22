@@ -1,7 +1,7 @@
 import {normalizeEmail} from 'app/common/emails';
 import {UserProfile} from 'app/common/LoginSessionAPI';
 import {SessionStore} from 'app/server/lib/gristSessions';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {fromCallback} from 'app/server/lib/serverUtils';
 import {Request} from 'express';
 
@@ -19,8 +19,16 @@ export interface SessionUserObj {
    */
   lastLoginTimestamp?: number;
 
-  // [UNUSED] Authentication provider string indicating the login method used.
+  /**
+   * The authentication provider. (Typically the JWT "iss".)
+   */
   authProvider?: string;
+
+  /**
+   * Identifier for the user from the authentication provider. (Typically
+   * the JWT "sub".)
+   */
+  authSubject?: string;
 
   // [UNUSED] Login ID token used to access AWS services.
   idToken?: string;
@@ -282,7 +290,9 @@ export class ScopedSession {
     const session = prev || await this._getSession();
     if (!session.users) { session.users = []; }
     if (!session.orgToUser) { session.orgToUser = {}; }
-    let index = session.users.findIndex(u => Boolean(u.profile && u.profile.email === profile.email));
+    let index = session.users.findIndex(u => {
+      return Boolean(u.profile && normalizeEmail(u.profile.email) === normalizeEmail(profile.email));
+    });
     if (index < 0) { index = session.users.length; }
     session.orgToUser[this._org] = index;
     session.users[index] = user;

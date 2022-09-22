@@ -3,6 +3,7 @@ import { mapGetOrSet, MapWithTTL } from 'app/common/AsyncCreate';
 import { extractOrgParts, getHostType, getKnownOrg } from 'app/common/gristUrls';
 import { Organization } from 'app/gen-server/entity/Organization';
 import { HomeDBManager } from 'app/gen-server/lib/HomeDBManager';
+import { getOriginUrl } from 'app/server/lib/requestUtils';
 import { NextFunction, Request, RequestHandler, Response } from 'express';
 import { IncomingMessage } from 'http';
 
@@ -100,7 +101,7 @@ export class Hosts {
     } else {
       // Otherwise check for a custom host.
       const org = await mapGetOrSet(this._host2org, hostname, async () => {
-        const o = await this._dbManager.connection.manager.findOne(Organization, {host: hostname});
+        const o = await this._dbManager.connection.manager.findOne(Organization, {where: {host: hostname}});
         return o && o.domain || undefined;
       });
       if (!org) { throw new ApiError(`Domain not recognized: ${hostname}`, 404); }
@@ -118,7 +119,7 @@ export class Hosts {
     }
   }
 
-  public async addOrgInfo(req: Request): Promise<RequestWithOrg> {
+  public async addOrgInfo<T extends IncomingMessage>(req: T): Promise<T & RequestOrgInfo> {
     return Object.assign(req, await this.getOrgInfo(req));
   }
 
@@ -129,27 +130,6 @@ export class Hosts {
    */
   public get redirectHost(): RequestHandler {
     return this._redirectHost.bind(this);
-  }
-
-  /**
-   * Returns true if `url` either points to a native Grist host (e.g. foo.getgrist.com),
-   * or a custom host for an existing Grist org.
-   */
-  public async isSafeRedirectUrl(url: string): Promise<boolean> {
-    const {host, protocol} = new URL(url);
-    if (!['http:', 'https:'].includes(protocol)) { return false; }
-
-    switch (this._getHostType(host)) {
-      case 'native': { return true; }
-      case 'custom': {
-        const org = await mapGetOrSet(this._host2org, host, async () => {
-          const o = await this._dbManager.connection.manager.findOne(Organization, {host});
-          return o?.domain ?? undefined;
-        });
-        return org !== undefined;
-      }
-      default: { return false; }
-    }
   }
 
   public close() {
@@ -172,11 +152,11 @@ export class Hosts {
     if (org && this._getHostType(req.headers.host!) === 'native' && !this._dbManager.isMergedOrg(org)) {
       // Check if the org has a preferred host.
       const orgHost = await mapGetOrSet(this._org2host, org, async () => {
-        const o = await this._dbManager.connection.manager.findOne(Organization, {domain: org});
+        const o = await this._dbManager.connection.manager.findOne(Organization, {where: {domain: org}});
         return o && o.host || undefined;
       });
       if (orgHost && orgHost !== req.hostname) {
-        const url = new URL(`${req.protocol}://${req.headers.host}${req.path}`);
+        const url = new URL(getOriginUrl(req) + req.path);
         url.hostname = orgHost;  // assigning hostname rather than host preserves port.
         return resp.redirect(url.href);
       }

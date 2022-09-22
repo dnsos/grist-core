@@ -3,7 +3,7 @@ import { ColumnRec, DocModel, TableRec, ViewSectionRec } from 'app/client/models
 import { linkId, NoLink } from 'app/client/ui/selectBy';
 import { getWidgetTypes, IWidgetType } from 'app/client/ui/widgetTypes';
 import { bigPrimaryButton } from "app/client/ui2018/buttons";
-import { colors, vars } from "app/client/ui2018/cssVars";
+import { theme, vars } from "app/client/ui2018/cssVars";
 import { icon } from "app/client/ui2018/icons";
 import { spinnerModal } from 'app/client/ui2018/modals';
 import { isLongerThan, nativeCompare } from "app/common/gutil";
@@ -86,7 +86,7 @@ function isValidSelection(table: TableId, type: IWidgetType, isNewPage: boolean|
   return table !== null && getCompatibleTypes(table, isNewPage).includes(type);
 }
 
-export type ISaveFunc = (val: IPageWidget) => Promise<void>;
+export type ISaveFunc = (val: IPageWidget) => Promise<any>;
 
 // Delay in milliseconds, after a user click on the save btn, before we start showing a modal
 // spinner. If saving completes before this time elapses (which is likely to happen for regular
@@ -131,7 +131,7 @@ export function buildPageWidgetPicker(
     onSave: ISaveFunc,
     options: IOptions = {}) {
 
-  const tables = fromKo(docModel.allTables.getObservable());
+  const tables = fromKo(docModel.visibleTables.getObservable());
   const columns = fromKo(docModel.columns.createAllRowsModel('parentPos').getObservable());
 
   // default value for when it is omitted
@@ -167,11 +167,16 @@ export function buildPageWidgetPicker(
       link: value.link.get(),
       section: value.section.get(),
     });
-    // If savePromise throws an error, before or after timeout, we let the error propagate as it
-    // should be handle by the caller.
-    if (await isLongerThan(savePromise, DELAY_BEFORE_SPINNER_MS)) {
-      const label = getWidgetTypes(type).label;
-      await spinnerModal(`Building ${label} widget`, savePromise);
+    if (value.table.get() === 'New Table') {
+      // Adding empty table will show a prompt, so we don't want to wait for it.
+      await savePromise;
+    } else {
+      // If savePromise throws an error, before or after timeout, we let the error propagate as it
+      // should be handle by the caller.
+      if (await isLongerThan(savePromise, DELAY_BEFORE_SPINNER_MS)) {
+        const label = getWidgetTypes(type).label;
+        await spinnerModal(`Building ${label} widget`, savePromise);
+      }
     }
   }
 
@@ -300,7 +305,8 @@ export class PageWidgetSelect extends Disposable {
           ),
           dom.forEach(this._tables, (table) => dom('div',
             cssEntryWrapper(
-              cssEntry(cssIcon('TypeTable'), cssLabel(dom.text(table.tableId)),
+              cssEntry(cssIcon('TypeTable'),
+                       cssLabel(dom.text(use => use(table.tableNameDef) || use(table.tableId))),
                        dom.on('click', () => this._selectTable(table.id())),
                        cssEntry.cls('-selected', (use) => use(this._value.table) === table.id()),
                        testId('table-label')
@@ -336,11 +342,11 @@ export class PageWidgetSelect extends Disposable {
       cssFooter(
         cssFooterContent(
           // If _selectByOptions exists and has more than then "NoLinkOption", show the selector.
-          dom.maybe((use) => this._selectByOptions && use(this._selectByOptions).length > 1, () => [
+          dom.maybe((use) => this._selectByOptions && use(this._selectByOptions).length > 1, () => cssSelectBy(
             cssSmallLabel('SELECT BY'),
             dom.update(cssSelect(this._value.link, this._selectByOptions!),
                        testId('selectby'))
-          ]),
+          )),
           dom('div', {style: 'flex-grow: 1'}),
           bigPrimaryButton(
             // TODO: The button's label of the page widget picker should read 'Close' instead when
@@ -415,15 +421,15 @@ function header(label: string) {
 }
 
 const cssContainer = styled('div', `
-  --outline: 1px solid rgba(217,217,217,0.60);
+  --outline: 1px solid ${theme.widgetPickerBorder};
 
   max-height: 386px;
-  box-shadow: 0 2px 20px 0 rgba(38,38,51,0.20);
+  box-shadow: 0 2px 20px 0 ${theme.widgetPickerShadow};
   border-radius: 2px;
   display: flex;
   flex-direction: column;
   user-select: none;
-  background-color: white;
+  background-color: ${theme.widgetPickerPrimaryBg};
 `);
 
 const cssPopupWrapper = styled('div', `
@@ -444,17 +450,19 @@ const cssPanel = styled('div', `
   overflow: auto;
   padding-bottom: 18px;
   &:nth-of-type(2n) {
-    background-color: ${colors.lightGrey};
+    background-color: ${theme.widgetPickerSecondaryBg};
     outline: var(--outline);
   }
 `);
 
 const cssHeader = styled('div', `
+  color: ${theme.text};
   margin: 24px 0 24px 24px;
   font-size: ${vars.mediumFontSize};
 `);
 
 const cssEntry = styled('div', `
+  color: ${theme.widgetPickerItemFg};
   padding: 0 0 0 24px;
   height: 32px;
   display: flex;
@@ -463,11 +471,13 @@ const cssEntry = styled('div', `
   align-items: center;
   white-space: nowrap;
   overflow: hidden;
+  cursor: pointer;
   &-selected {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.widgetPickerItemSelectedBg};
   }
   &-disabled {
-    color: ${colors.mediumGrey};
+    color: ${theme.widgetPickerItemDisabledBg};
+    cursor: default;
   }
   &-disabled&-selected {
     background-color: inherit;
@@ -477,14 +487,14 @@ const cssEntry = styled('div', `
 const cssIcon = styled(icon, `
   margin-right: 8px;
   flex-shrink: 0;
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.widgetPickerIcon};
   .${cssEntry.className}-disabled > & {
-    opacity: 0.2;
+    opacity: 0.25;
   }
 `);
 
 const cssTypeIcon = styled(cssIcon, `
-  --icon-color: ${colors.lightGreen};
+  --icon-color: ${theme.widgetPickerPrimaryIcon};
 `);
 
 const cssLabel = styled('span', `
@@ -510,7 +520,7 @@ const cssPivot = styled(cssEntry, `
 const cssBigIcon = styled(icon, `
   width: 24px;
   height: 24px;
-  background-color: ${colors.darkGreen};
+  background-color: ${theme.widgetPickerSummaryIcon};
 `);
 
 const cssFooter = styled('div', `
@@ -528,12 +538,21 @@ const cssFooterContent = styled('div', `
 `);
 
 const cssSmallLabel = styled('span', `
+  color: ${theme.text};
   font-size: ${vars.xsmallFontSize};
   margin-right: 8px;
 `);
 
 const cssSelect = styled(select, `
+  color: ${theme.selectButtonFg};
+  background-color: ${theme.selectButtonBg};
   flex: 1 0 160px;
+  width: 160px;
+`);
+
+const cssSelectBy = styled('div', `
+  display: flex;
+  align-items: center;
 `);
 
 // Returns a copy of array with its items sorted in the same order as they appear in other.

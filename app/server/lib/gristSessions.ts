@@ -1,5 +1,6 @@
-import * as session from '@gristlabs/express-session';
+import session from '@gristlabs/express-session';
 import {parseSubdomain} from 'app/common/gristUrls';
+import {isNumber} from 'app/common/gutil';
 import {RequestWithOrg} from 'app/server/lib/extractOrg';
 import {GristServer} from 'app/server/lib/GristServer';
 import {Sessions} from 'app/server/lib/Sessions';
@@ -12,7 +13,10 @@ import * as shortUUID from "short-uuid";
 
 export const cookieName = process.env.GRIST_SESSION_COOKIE || 'grist_sid';
 
-export const COOKIE_MAX_AGE = 90 * 24 * 60 * 60 * 1000;  // 90 days in milliseconds
+export const COOKIE_MAX_AGE =
+      process.env.COOKIE_MAX_AGE === 'none' ? null :
+      isNumber(process.env.COOKIE_MAX_AGE || '') ? Number(process.env.COOKIE_MAX_AGE) :
+      90 * 24 * 60 * 60 * 1000;  // 90 days in milliseconds
 
 // RedisStore and SqliteStore are expected to provide a set/get interface for sessions.
 export interface SessionStore {
@@ -69,8 +73,16 @@ function createSessionStoreFactory(sessionsDB: string): () => SessionStore {
       const store = new SQLiteStore({
         dir: path.dirname(sessionsDB),
         db: path.basename(sessionsDB),    // SQLiteStore no longer appends a .db suffix.
-        table: 'sessions'
+        table: 'sessions',
       });
+      // In testing, and monorepo's "yarn start", session is accessed from multiple
+      // processes, so could hit lock failures.
+      // connect-sqlite3 has a concurrentDb: true flag that can be set, but
+      // it puts the database in WAL mode, which would have implications
+      // for self-hosters (a second file to think about). Instead we just
+      // set a busy timeout.
+      store.db.run('PRAGMA busy_timeout = 1000');
+
       return assignIn(store, { async close() {}});
     };
   }

@@ -125,20 +125,18 @@ class BaseLookupMapColumn(column.BaseColumn):
     the current frame to the returned records. Returns an empty set if no records match.
     """
     key = tuple(_extract(val) for val in key)
-    current_frame = self._engine.get_current_frame()
-    if current_frame:
-      rel = self._get_relation(current_frame.node)
-      rel._add_lookup(current_frame.current_row_id, key)
+    engine = self._engine
+    if engine._is_current_node_formula:
+      rel = self._get_relation(engine._current_node)
+      rel._add_lookup(engine._current_row_id, key)
     else:
       rel = None
 
     # The _use_node call both brings LookupMapColumn up-to-date, and creates a dependency on it.
     # Relation of None isn't valid, but it happens to be unused when there is no current_frame.
-    row_ids = self._row_key_map.lookup_right(key, set())
-    self._engine._use_node(self.node, rel, row_ids)
-    if not row_ids:
-      row_ids = self._row_key_map.lookup_right(key, set())
+    engine._use_node(self.node, rel)
 
+    row_ids = self._row_key_map.lookup_right(key, set())
     return row_ids, rel
 
   # Override various column methods, since LookupMapColumn doesn't care to store any values. To
@@ -200,6 +198,8 @@ class ContainsLookupMapColumn(BaseLookupMapColumn):
         # group = [] essentially means there are no new keys in this call
         if isinstance(group, (six.binary_type, six.text_type)):
           group = []
+        elif not group and col_id.match_empty != _Contains.no_match_empty:
+          group = [col_id.match_empty]
       else:
         group = [group]
 

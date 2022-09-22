@@ -11,23 +11,26 @@ import * as sqlite3 from '@gristlabs/sqlite3';
 import {LocalActionBundle} from 'app/common/ActionBundle';
 import {BulkColValues, DocAction, TableColValues, TableDataAction, toTableDataAction} from 'app/common/DocActions';
 import * as gristTypes from 'app/common/gristTypes';
-import {isList} from 'app/common/gristTypes';
+import {isList, isListType, isRefListType} from 'app/common/gristTypes';
 import * as marshal from 'app/common/marshal';
 import * as schema from 'app/common/schema';
+import {SingleCell} from 'app/common/TableData';
 import {GristObjCode} from "app/plugin/GristData";
 import {ActionHistoryImpl} from 'app/server/lib/ActionHistoryImpl';
 import {ExpandedQuery} from 'app/server/lib/ExpandedQuery';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
-import * as log from 'app/server/lib/log';
-import * as assert from 'assert';
+import log from 'app/server/lib/log';
+import assert from 'assert';
 import * as bluebird from 'bluebird';
 import * as fse from 'fs-extra';
+import {RunResult} from 'sqlite3';
 import * as _ from 'underscore';
 import * as util from 'util';
-import * as uuidv4 from "uuid/v4";
+import uuidv4 from "uuid/v4";
 import {OnDemandStorage} from './OnDemandActions';
 import {ISQLiteDB, MigrationHooks, OpenMode, quoteIdent, ResultRow, SchemaInfo, SQLiteDB} from './SQLiteDB';
 import chunk = require('lodash/chunk');
+import cloneDeep = require('lodash/cloneDeep');
 import groupBy = require('lodash/groupBy');
 
 
@@ -38,6 +41,11 @@ const debuglog = util.debuglog('db');
 const maxSQLiteVariables = 500;     // Actually could be 999, so this is playing it safe.
 
 const PENDING_VALUE = [GristObjCode.Pending];
+
+// Number of days that soft-deleted attachments are kept in file storage before being completely deleted.
+// Once a file is deleted it can't be restored by undo, so we want it to be impossible or at least extremely unlikely
+// that someone would delete a reference to an attachment and then undo that action this many days later.
+export const ATTACHMENTS_EXPIRY_DAYS = 7;
 
 export class DocStorage implements ISQLiteDB, OnDemandStorage {
 
@@ -371,6 +379,18 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         }
       },
 
+      async function(db: SQLiteDB): Promise<void> {
+        // Storage version 8.
+        // Migration to add an index to _grist_Attachments.fileIdent for fast joining against _gristsys_Files.ident.
+        const tables = await db.all(`SELECT * FROM sqlite_master WHERE type='table' AND name='_grist_Attachments'`);
+        if (!tables.length) {
+          // _grist_Attachments is created in the first Python migration so doesn't exist here for new documents.
+          // createAttachmentsIndex is called separately by ActiveDoc for that.
+          return;
+        }
+        await createAttachmentsIndex(db);
+      },
+
     ]
   };
 
@@ -455,7 +475,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
       if (isList(val) && val.every(tok => (typeof(tok) === 'string'))) {
         return JSON.stringify(val.slice(1));
       }
-    } else if (gristType?.startsWith('RefList:')) {
+    } else if (isRefListType(gristType)) {
       if (isList(val) && val.slice(1).every((tok: any) => (typeof(tok) === 'number'))) {
         return JSON.stringify(val.slice(1));
       }
@@ -522,7 +542,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         return Boolean(val);
       }
     }
-    if (gristType === 'ChoiceList' || gristType?.startsWith('RefList:')) {
+    if (isListType(gristType)) {
       if (typeof val === 'string' && val.startsWith('[')) {
         try {
           return ['L', ...JSON.parse(val)];
@@ -566,6 +586,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
       case 'ChoiceList':
       case 'RefList':
       case 'ReferenceList':
+      case 'Attachments':
         return 'TEXT';      // To be encoded as a JSON array of strings.
       case 'Date':
         return 'DATE';
@@ -624,8 +645,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   // tables (obtained from auto-generated schema.js).
   private _docSchema: {[tableId: string]: {[colId: string]: string}};
 
-  // The last time _logDataSize ran fully
-  private _lastLoggedDataSize: number = Date.now();
+  private _cachedDataSize: number|null = null;
 
   public constructor(public storageManager: IDocStorageManager, public docName: string) {
     this.docPath = this.storageManager.getPath(docName);
@@ -646,14 +666,26 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
 
   /**
    * Creates a new SQLite database. Will throw an error if the database already exists.
-   * After a database is created it should be initialized by applying the InitNewDoc action.
+   * After a database is created it should be initialized by applying the InitNewDoc action
+   * or by executing the initialDocSql.
    */
-  public createFile(): Promise<void> {
+  public createFile(options?: {
+    useExisting?: boolean,  // If set, it is ok if an sqlite file already exists
+                            // where we would store the Grist document. Its content
+                            // will not be touched. Useful when "gristifying" an
+                            // existing SQLite DB.
+  }): Promise<void> {
     // It turns out to be important to return a bluebird promise, a lot of code outside
     // of DocStorage ultimately depends on this.
-    return bluebird.Promise.resolve(this._openFile(OpenMode.CREATE_EXCL, {}))
+    return bluebird.Promise.resolve(this._openFile(
+      options?.useExisting ? OpenMode.OPEN_EXISTING : OpenMode.CREATE_EXCL,
+      {}))
       .then(() => this._initDB());
     // Note that we don't call _updateMetadata() as there are no metadata tables yet anyway.
+  }
+
+  public isInitialized(): boolean {
+    return Boolean(this._db);
   }
 
   /**
@@ -783,6 +815,13 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   }
 
   /**
+   * Look up Grist type of column.
+   */
+  public getColumnType(tableId: string, colId: string): string|undefined {
+    return this._docSchema[tableId]?.[colId];
+  }
+
+  /**
    * Fetches all rows of the table with the given rowIds.
    */
   public async fetchActionData(tableId: string, rowIds: number[], colIds?: string[]): Promise<TableDataAction> {
@@ -898,27 +937,50 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   public async applyStoredActions(docActions: DocAction[]): Promise<void> {
     debuglog('DocStorage.applyStoredActions');
 
-    await bluebird.Promise.each(docActions, (action: DocAction) => {
-      const actionType = action[0];
-      const f = (this as any)["_process_" + actionType];
-      if (!_.isFunction(f)) {
-        log.error("Unknown action: " + actionType);
-      } else {
-        return f.apply(this, action.slice(1))
-          .then(() => {
-            const tableId = action[1]; // The first argument is always tableId;
-            if (DocStorage._isMetadataTable(tableId) && actionType !== 'AddTable') {
-              // We only need to update the metadata for actions that change
-              // the metadata. We don't update on AddTable actions
-              // because the additional of a table gives no additional data
-              // and if we tried to update when only _grist_Tables was added
-              // without _grist_Tables_column, we would get an error
-              return this._updateMetadata();
-            }
-          });
+    docActions = this._compressStoredActions(docActions);
+    for (const action of docActions) {
+      try {
+        await this.applyStoredAction(action);
+      } catch (e) {
+        // If the table doesn't have a manualSort column, we'll try
+        // again without setting manualSort. This should never happen
+        // for regular Grist documents, but could happen for a
+        // "gristified" Sqlite database where we are choosing to
+        // leave the user tables untouched. The manualSort column doesn't
+        // make much sense outside the context of spreadsheets.
+        // TODO: it could be useful to make Grist more inherently aware of
+        // and tolerant of tables without manual sorting.
+        if (String(e).match(/no column named manualSort/)) {
+          const modifiedAction = this._considerWithoutManualSort(action);
+          if (modifiedAction) {
+            await this.applyStoredAction(modifiedAction);
+            return;
+          }
+        }
+        throw e;
       }
-    });
-    this._logDataSize().catch(e => log.error(`Error in _logDataSize: ${e}`));
+    }
+  }
+
+  // Apply a single stored action, dispatching to an appropriate
+  // _process_<ActionType> handler.
+  public async applyStoredAction(action: DocAction): Promise<void> {
+    const actionType = action[0];
+    const f = (this as any)["_process_" + actionType];
+    if (!_.isFunction(f)) {
+      log.error("Unknown action: " + actionType);
+    } else {
+      await f.apply(this, action.slice(1));
+      const tableId = action[1]; // The first argument is always tableId;
+      if (DocStorage._isMetadataTable(tableId) && actionType !== 'AddTable') {
+        // We only need to update the metadata for actions that change
+        // the metadata. We don't update on AddTable actions
+        // because the additional of a table gives no additional data
+        // and if we tried to update when only _grist_Tables was added
+        // without _grist_Tables_column, we would get an error
+        await this._updateMetadata();
+      }
+    }
   }
 
   /**
@@ -1022,7 +1084,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    * @param {String} rowId   - Row ID.
    * @returns {Promise} - A promise for the SQL execution.
    */
-  public _process_RemoveRecord(tableId: string, rowId: string): Promise<void> {
+  public _process_RemoveRecord(tableId: string, rowId: string): Promise<RunResult> {
     const sql = "DELETE FROM " + quoteIdent(tableId) + " WHERE id=?";
     debuglog("RemoveRecord SQL: " + sql, [rowId]);
     return this.run(sql, [rowId]);
@@ -1045,8 +1107,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
    * @param {Array[Integer]} rowIds - Array of row IDs to be deleted.
    * @returns {Promise} - Promise for SQL execution.
    */
-  public _process_BulkRemoveRecord(tableId: string, rowIds: number[]): Promise<void> {
-    if (rowIds.length === 0) { return Promise.resolve(); }// If we have nothing to remove, done.
+  public async _process_BulkRemoveRecord(tableId: string, rowIds: number[]): Promise<void> {
+    if (rowIds.length === 0) { return; }// If we have nothing to remove, done.
 
     const chunkSize = 10;
     const preSql = "DELETE FROM " + quoteIdent(tableId) + " WHERE id IN (";
@@ -1056,12 +1118,10 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     const numChunks = Math.floor(rowIds.length / chunkSize);
     const numLeftovers = rowIds.length % chunkSize;
 
-    let chunkPromise;
-
     if (numChunks > 0) {
       debuglog("DocStorage.BulkRemoveRecord: splitting " + rowIds.length +
                " deletes into chunks of size " + chunkSize);
-      chunkPromise = this.prepare(preSql + chunkParams + postSql)
+      await this.prepare(preSql + chunkParams + postSql)
         .then(function(stmt) {
           return bluebird.Promise.each(_.range(0, numChunks * chunkSize, chunkSize), function(index: number) {
             debuglog("DocStorage.BulkRemoveRecord: chunk delete " + index + "-" + (index + chunkSize - 1));
@@ -1071,18 +1131,14 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
               return bluebird.Promise.fromCallback((cb: any) => stmt.finalize(cb));
             });
         });
-    } else {
-      chunkPromise = Promise.resolve();
     }
 
-    return chunkPromise.then(() => {
-      if (numLeftovers > 0) {
-        debuglog("DocStorage.BulkRemoveRecord: leftover delete " + (numChunks * chunkSize) + "-" + (rowIds.length - 1));
-        const leftoverParams = _.range(numLeftovers).map(q).join(',');
-        return this.run(preSql + leftoverParams + postSql,
-                        rowIds.slice(numChunks * chunkSize, rowIds.length));
-      }
-    });
+    if (numLeftovers > 0) {
+      debuglog("DocStorage.BulkRemoveRecord: leftover delete " + (numChunks * chunkSize) + "-" + (rowIds.length - 1));
+      const leftoverParams = _.range(numLeftovers).map(q).join(',');
+      await this.run(preSql + leftoverParams + postSql,
+                     rowIds.slice(numChunks * chunkSize, rowIds.length));
+    }
   }
 
   /**
@@ -1147,6 +1203,8 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     // Note that SQLite does not support easily dropping columns. To drop a column from a table, we
     // need to follow the instructions at https://sqlite.org/lang_altertable.html Since we don't use
     // indexes or triggers, we skip a few steps.
+    // TODO: SQLite has since added support for ALTER TABLE DROP COLUMN, should
+    // use that to be more efficient and less disruptive.
 
     // This returns rows with (at least) {name, type, dflt_value}.
     return this.all(`PRAGMA table_info(${quote(tableId)})`)
@@ -1226,11 +1284,144 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
         });
   }
 
+  /**
+   * Returns the total number of bytes used for storing attachments that haven't been soft-deleted.
+   * May be stale if ActiveDoc.updateUsedAttachmentsIfNeeded isn't called first.
+   */
+  public async getTotalAttachmentFileSizes(): Promise<number> {
+    const result = await this.get(`
+      SELECT SUM(len) AS total
+      FROM (
+        -- Using MAX(LENGTH()) instead of just LENGTH() is needed in the presence of GROUP BY
+        -- to make LENGTH() quickly read the stored length instead of actually reading the blob data.
+        -- We use LENGTH() in the first place instead of _grist_Attachments.fileSize because the latter can
+        -- be changed by users.
+        SELECT MAX(LENGTH(files.data)) AS len
+        FROM _gristsys_Files AS files
+          JOIN _grist_Attachments AS meta
+            ON meta.fileIdent = files.ident
+        WHERE meta.timeDeleted IS NULL  -- Don't count soft-deleted attachments
+        -- Duplicate attachments (i.e. identical file contents) are only stored once in _gristsys_Files
+        -- but can be duplicated in _grist_Attachments, so the GROUP BY prevents adding up duplicated sizes.
+        GROUP BY meta.fileIdent
+      )
+    `);
+    return result!.total ?? 0;
+  }
+
+  /**
+   * Returns an array of objects where:
+   *   - `id` is a row ID of _grist_Attachments
+   *   - `used` is true if and only if `id` is in a list in a cell of type Attachments
+   *   - The value of `timeDeleted` in this row of _grist_Attachments needs to be updated
+   *     because its truthiness doesn't match `used`, i.e. either:
+   *       - a used attachment is marked as deleted, OR
+   *       - an unused attachment is not marked as deleted
+   */
+  public async scanAttachmentsForUsageChanges(): Promise<{ used: boolean, id: number }[]> {
+    // Array of SQL queries where attachment_ids contains JSON arrays (typically containg row IDs).
+    // Below we add one query for each column of type Attachments in the document.
+    // We always include this first dummy query because if the array is empty then the final SQL query
+    // will just have `()` causing a syntax error.
+    // We can't just return when there are no Attachments columns
+    // because we may still need to delete all remaining attachments.
+    const attachmentsQueries = ["SELECT '[0]' AS attachment_ids"];
+    for (const [tableId, cols] of Object.entries(this._docSchema)) {
+      for (const [colId, type] of Object.entries(cols)) {
+        if (type === "Attachments") {
+          attachmentsQueries.push(`
+            SELECT t.${quoteIdent(colId)} AS attachment_ids
+            FROM ${quoteIdent(tableId)} AS t
+            WHERE json_valid(attachment_ids)
+          `);
+        }
+      }
+    }
+
+    // `UNION ALL` instead of `UNION` because duplicate values are unlikely and deduplicating is not worth the cost
+    const allAttachmentsQuery = attachmentsQueries.join(' UNION ALL ');
+
+    const sql = `
+      WITH all_attachment_ids(id) AS (
+        SELECT json_each.value AS id
+        FROM json_each(attachment_ids), (${allAttachmentsQuery})
+      )  -- flatten out all the lists of IDs into a simple column of IDs
+      SELECT id, id IN all_attachment_ids AS used
+      FROM _grist_Attachments
+      WHERE used != (timeDeleted IS NULL);  -- only include rows that need updating
+    `;
+    return (await this.all(sql)) as any[];
+  }
+
+  /**
+   * Collect all cells that refer to a particular attachment. Ideally this is
+   * something we could use an index for. Regular indexes in SQLite don't help.
+   * FTS5 works, but is somewhat overkill.
+   */
+  public async findAttachmentReferences(attId: number): Promise<Array<SingleCell>> {
+    const queries: string[] = [];
+    // Switch quotes so to insert a table or column name as a string literal
+    // rather than as an identifier.
+    function asLiteral(name: string) {
+      return quoteIdent(name).replace(/"/g, '\'');
+    }
+    for (const [tableId, cols] of Object.entries(this._docSchema)) {
+      for (const [colId, type] of Object.entries(cols)) {
+        if (type !== "Attachments") { continue; }
+        queries.push(`SELECT
+          t.id as rowId,
+          ${asLiteral(tableId)} as tableId,
+          ${asLiteral(colId)} as colId
+        FROM ${quoteIdent(tableId)} AS t, json_each(t.${quoteIdent(colId)}) as a
+        WHERE a.value = ${attId}`);
+      }
+    }
+    return (await this.all(queries.join(' UNION ALL '))) as any[];
+  }
+
+  /**
+   * Return row IDs of unused attachments in _grist_Attachments.
+   * Uses the timeDeleted column which is updated in ActiveDoc.updateUsedAttachmentsIfNeeded.
+   * @param expiredOnly: if true, only return attachments where timeDeleted is at least
+   *                     ATTACHMENTS_EXPIRY_DAYS days ago.
+   */
+  public async getSoftDeletedAttachmentIds(expiredOnly: boolean): Promise<number[]> {
+    const condition = expiredOnly
+      ? `datetime(timeDeleted, 'unixepoch') < datetime('now', '-${ATTACHMENTS_EXPIRY_DAYS} days')`
+      : "timeDeleted IS NOT NULL";
+
+    const rows = await this.all(`
+      SELECT id
+      FROM _grist_Attachments
+      WHERE ${condition}
+    `);
+    return rows.map(r => r.id);
+  }
+
+  /**
+   * Delete attachments from _gristsys_Files that have no matching metadata row in _grist_Attachments.
+   */
+  public async removeUnusedAttachments() {
+    const result = await this._getDB().run(`
+      DELETE FROM _gristsys_Files
+      WHERE ident IN (
+        SELECT ident
+        FROM _gristsys_Files
+        LEFT JOIN _grist_Attachments
+        ON fileIdent = ident
+        WHERE fileIdent IS NULL
+      )
+    `);
+    if (result.changes > 0) {
+      await this._markAsChanged(Promise.resolve());
+    }
+  }
+
   public all(sql: string, ...args: any[]): Promise<ResultRow[]> {
     return this._getDB().all(sql, ...args);
   }
 
-  public run(sql: string, ...args: any[]): Promise<void> {
+  public run(sql: string, ...args: any[]): Promise<RunResult> {
     return this._markAsChanged(this._getDB().run(sql, ...args));
   }
 
@@ -1274,17 +1465,17 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     return typeof row !== 'undefined';
   }
 
-  public setPluginDataItem(pluginId: string, key: string, value: string): Promise<void> {
-    return this.run('INSERT OR REPLACE into _gristsys_PluginData (pluginId, key, value) values (?, ?, ?)',
+  public async setPluginDataItem(pluginId: string, key: string, value: string): Promise<void> {
+    await this.run('INSERT OR REPLACE into _gristsys_PluginData (pluginId, key, value) values (?, ?, ?)',
       pluginId, key, value);
   }
 
-  public removePluginDataItem(pluginId: string, key: string): Promise<void> {
-    return this.run('DELETE from _gristsys_PluginData where pluginId = ? and key = ?', pluginId, key);
+  public async removePluginDataItem(pluginId: string, key: string): Promise<void> {
+    await this.run('DELETE from _gristsys_PluginData where pluginId = ? and key = ?', pluginId, key);
   }
 
-  public clearPluginDataItem(pluginId: string): Promise<void> {
-    return this.run('DELETE from _gristsys_PluginData where pluginId = ?', pluginId);
+  public async clearPluginDataItem(pluginId: string): Promise<void> {
+    await this.run('DELETE from _gristsys_PluginData where pluginId = ?', pluginId);
   }
 
   /**
@@ -1329,10 +1520,36 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     }
   }
 
+  /**
+   * Return the total size of data in the user + meta tables of the SQLite doc (excluding gristsys
+   * tables). Uses cached results if possible. Any change to data invalidates the cache, via
+   * _markAsChanged().
+   */
+  public async getDataSize(): Promise<number> {
+    return this._cachedDataSize ?? (this._cachedDataSize = await this.getDataSizeUncached());
+  }
+
+  /**
+   * Measure and return the total size of data in the user + meta tables of the SQLite doc
+   * (excluding gristsys tables). Note that this operation involves reading the entire database.
+   */
+  public async getDataSizeUncached(): Promise<number> {
+    const result = await this.get(`
+      SELECT SUM(pgsize - unused) AS totalSize
+      FROM dbstat
+      WHERE NOT (
+        name LIKE 'sqlite_%' OR
+        name LIKE '_gristsys_%'
+      );
+    `);
+    return result!.totalSize;
+  }
+
   private async _markAsChanged<T>(promise: Promise<T>): Promise<T> {
     try {
       return await promise;
     } finally {
+      this._cachedDataSize = null;
       this.storageManager.markAsChanged(this.docName);
     }
   }
@@ -1355,9 +1572,9 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
   /**
    * Internal helper for applying Bulk Update or Add Record sql
    */
-  private _applyMaybeBulkUpdateOrAddSql(sql: string, sqlParams: any[]): Promise<void> {
+  private async _applyMaybeBulkUpdateOrAddSql(sql: string, sqlParams: any[]): Promise<void> {
     if (sqlParams.length === 1) {
-      return this.run(sql, sqlParams[0]);
+      await this.run(sql, sqlParams[0]);
     } else {
       return this.prepare(sql)
         .then(function(stmt) {
@@ -1456,7 +1673,7 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
 
       // For any marshalled objects, check if we can now unmarshall them if they are the
       // native type.
-      if (result.newGristType !== result.oldGristType) {
+      if (result.newGristType !== result.oldGristType || result.newSqlType !== result.oldSqlType) {
         const cells = await this.all(`SELECT id, ${q(colId)} as value FROM ${q(tableId)} ` +
                                      `WHERE typeof(${q(colId)}) = 'blob'`);
         const marshaller = new marshal.Marshaller({version: 2});
@@ -1547,23 +1764,40 @@ export class DocStorage implements ISQLiteDB, OnDemandStorage {
     return sql;
   }
 
-  private async _logDataSize() {
-    // To reduce overhead, don't query and log data size more than once in 5 minutes
-    const now = Date.now();
-    if (now - this._lastLoggedDataSize < 5 * 60 * 1000) {
-      return;
+  // If we are being asked to add a record and then update several of its
+  // columns, compact that into a single action. For fully Grist-managed
+  // documents, this makes no difference. But if the underlying SQLite DB
+  // has extra constraints on columns, it can make a difference.
+  // TODO: consider dealing with other scenarios, especially a BulkAddRecord.
+  private _compressStoredActions(docActions: DocAction[]): DocAction[] {
+    if (docActions.length > 1) {
+      const first = docActions[0];
+      if (first[0] === 'AddRecord' &&
+        docActions.slice(1).every(
+          // Check other actions are UpdateRecords for the same table and row.
+          a => a[0] === 'UpdateRecord' && a[1] === first[1] && a[2] === first[2]
+        )) {
+        const merged = cloneDeep(first);
+        for (const a2 of docActions.slice(1)) {
+          Object.assign(merged[3], a2[3]);
+        }
+        docActions = [merged];
+      }
     }
-    this._lastLoggedDataSize = now;
+    return docActions;
+  }
 
-    const result = await this.get(`
-      SELECT SUM(pgsize - unused) AS totalSize
-      FROM dbstat
-      WHERE NOT (
-        name LIKE 'sqlite_%' OR
-        name LIKE '_gristsys_%'
-      );
-    `);
-    log.rawInfo("Data size from dbstat...", {docId: this.docName, dataSize: result!.totalSize});
+  // If an action can have manualSort removed, go ahead and do it (after cloning),
+  // otherwise return null.
+  private _considerWithoutManualSort(act: DocAction): DocAction|null {
+    if (act[0] === 'AddRecord' || act[0] === 'UpdateRecord' ||
+      act[0] === 'BulkAddRecord' || act[0] === 'BulkUpdateRecord' &&
+      'manualSort' in act[3]) {
+      act = cloneDeep(act);
+      delete act[3].manualSort;
+      return act;
+    }
+    return null;
   }
 }
 
@@ -1586,4 +1820,11 @@ export interface IndexColumns {
 // A summary of a database index, including its name.
 export interface IndexInfo extends IndexColumns {
   indexId: string;     // name of index
+}
+
+/**
+ * Creates an index that allows fast SQL JOIN between _grist_Attachments.fileIdent and _gristsys_Files.ident.
+ */
+export async function createAttachmentsIndex(db: ISQLiteDB) {
+  await db.exec(`CREATE INDEX _grist_Attachments_fileIdent ON _grist_Attachments(fileIdent)`);
 }

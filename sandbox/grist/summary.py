@@ -1,6 +1,5 @@
 from collections import namedtuple
 import json
-import re
 
 import six
 
@@ -20,6 +19,11 @@ def _make_col_info(col=None, **values):
     values.setdefault(key, getattr(col, key) if col else None)
   return ColInfo(**values)
 
+def _make_sum_col_info(col):
+  """Return a ColInfo() for the sum formula column for column col."""
+  return _make_col_info(col=col, isFormula=True,
+                        formula='SUM($group.%s)' % col.colId)
+
 
 def _get_colinfo_dict(col_info, with_id=False):
   """Return a dict suitable to use with AddColumn or AddTable (when with_id=True) actions."""
@@ -30,37 +34,77 @@ def _get_colinfo_dict(col_info, with_id=False):
   return col_values
 
 
-# To generate code, we need to know for each summary table, what its source table is. It would be
-# easy if we had access to metadata records, but (at least for now) we generate all code based on
-# schema only. So we encode the source table name inside of the summary table name.
-#
-# The encoding includes the length of the source table name, to avoid the possibility of ambiguity
-# between the second summary table for "Foo", and the first summary table for "Foo2".
-#
-# Note that it means we need to rename summary tables when the source table is renamed.
-
-def encode_summary_table_name(source_table_name):
+def skip_rules_update(col, col_values):
   """
-  Create a summary table name that reliably encodes the source table name. It can be decoded even
-  if a suffix is added to the returned name.
+  Rules for summary tables can't be derived from source columns. This function
+  removes (and kips original) rules settings when updating summary tables.
   """
-  return "GristSummary_%d_%s" % (len(source_table_name), source_table_name)
+
+  # Remove rules from updates.
+  col_values = {k: v for k, v in six.iteritems(col_values) if k != 'rules'}
+
+  try:
+    # New widgetOptions to use.
+    new_widgetOptions = json.loads(col_values.get('widgetOptions', ''))
+  except ValueError:
+    # If we are not updating widgetOptions (or they are
+    # not a valid json string, i.e. in tests), just return the original updates.
+    return col_values
+
+  try:
+    # Original widgetOptions (maybe with styling rules "ruleOptions").
+    widgetOptions = json.loads(col.widgetOptions or '')
+  except ValueError:
+    widgetOptions = {}
+
+  # Keep the original rulesOptions if any, and ignore any new one.
+  new_widgetOptions.pop("rulesOptions", "")
+  rulesOptions = widgetOptions.get('rulesOptions')
+  if rulesOptions:
+    new_widgetOptions['rulesOptions'] = rulesOptions
+
+  col_values['widgetOptions'] = json.dumps(new_widgetOptions)
+  return col_values
 
 
-_summary_re = re.compile(r'GristSummary_(\d+)_')
+def _copy_widget_options(options):
+  """Copies widgetOptions for a summary group-by column (omitting conditional formatting rules)"""
+  if not options:
+    return options
+  try:
+    options = json.loads(options)
+  except ValueError:
+    # widgetOptions are not always a valid json value (especially in tests)
+    return options
+  return json.dumps({k: v for k, v in options.items() if k != "rulesOptions"})
 
-def decode_summary_table_name(summary_table_name):
+
+def encode_summary_table_name(source_table_id, groupby_col_ids):
   """
-  Extract the name of the source table from the summary table name.
+  Create a summary table name based on the source table ID and the groupby column IDs.
   """
-  m = _summary_re.match(summary_table_name)
-  if m:
-    start = m.end(0)
-    length = int(m.group(1))
-    source_name = summary_table_name[start : start + length]
-    if len(source_name) == length:
-      return source_name
+  result = source_table_id + '_summary'
+  if groupby_col_ids:
+    result += '_' + '_'.join(sorted(groupby_col_ids))
+  return result
+
+
+def decode_summary_table_name(summary_table_info):
+  """
+  Extract the name of the source table from the summary table schema info.
+  """
+  # To generate code, we need to know for each summary table, what its source table is. It would be
+  # easy if we had access to metadata records, but (at least for now) we generate all code based on
+  # schema only. So we use the type of special 'group' column in the summary table.
+  group_col = summary_table_info.columns.get('group')
+  if (
+      group_col
+      and 'getSummarySourceGroup' in group_col.formula
+      and group_col.type.startswith('RefList:')
+  ):
+    return group_col.type[8:]
   return None
+
 
 def _group_colinfo(source_table):
   """Returns ColInfo() for the 'group' column that must be present in every summary table."""
@@ -130,6 +174,7 @@ class SummaryActions(object):
                                               _get_colinfo_dict(ci, with_id=False))
         yield self.docmodel.columns.table.get_record(result['colRef'])
 
+
   def _get_or_create_summary(self, source_table, source_groupby_columns, formula_colinfo):
     """
     Finds a summary table or creates a new one, based on source_table, grouped by the columns
@@ -144,6 +189,7 @@ class SummaryActions(object):
         col=c,
         isFormula=False,
         formula='',
+        widgetOptions=_copy_widget_options(c.widgetOptions),
         type=summary_groupby_col_type(c.type)
       )
       for c in source_groupby_columns
@@ -151,10 +197,12 @@ class SummaryActions(object):
     summary_table = next((t for t in source_table.summaryTables if t.summaryKey == key), None)
     created = False
     if not summary_table:
+      groupby_col_ids = [c.colId for c in groupby_colinfo]
       result = self.useractions.doAddTable(
-        encode_summary_table_name(source_table.tableId),
+        encode_summary_table_name(source_table.tableId, groupby_col_ids),
         [_get_colinfo_dict(ci, with_id=True) for ci in groupby_colinfo + formula_colinfo],
-        summarySourceTableRef=source_table.id)
+        summarySourceTableRef=source_table.id,
+        raw_section=True)
       summary_table = self.docmodel.tables.table.get_record(result['id'])
       created = True
       # Note that in this case, _get_or_add_columns() below should not add any new columns,
@@ -179,23 +227,26 @@ class SummaryActions(object):
   def update_summary_section(self, view_section, source_table, source_groupby_columns):
     source_groupby_colset = set(source_groupby_columns)
     groupby_colids = {c.colId for c in source_groupby_columns}
-    prev_fields = list(view_section.fields)
 
-    # Go through fields figuring out which ones we'll keep.
-    prev_group_fields, formula_fields, delete_fields = [], [], []
-    for field in prev_fields:
+    # Go through columns figuring out which ones we'll keep.
+    prev_group_cols, formula_colinfo = [], []
+    for col in view_section.tableRef.columns:
+      srcCol = col.summarySourceCol
       # Records implement __hash__, so we can look them up in sets.
-      if field.colRef.summarySourceCol in source_groupby_colset:
-        prev_group_fields.append(field)
-      elif field.colRef.isFormula and field.colRef.colId not in groupby_colids:
-        formula_fields.append(field)
+      if srcCol in source_groupby_colset:
+        prev_group_cols.append(col)
+      elif col.isFormula and col.colId not in groupby_colids:
+        formula_colinfo.append(_make_col_info(col))
       else:
-        delete_fields.append(field)
+        # if user is removing a numeric column from the group by columns we must add it back as a
+        # sum formula column
+        self._append_sister_column_if_any(formula_colinfo, source_table, srcCol)
 
-    # Prepare ColInfo for all columns we want to keep.
-    formula_colinfo = [_make_col_info(f.colRef) for f in formula_fields]
+    # All fields with a column that we don't keep, must be deleted
+    colid_keep_set = set(c.colId for c in prev_group_cols + formula_colinfo)
+    delete_fields = [f for f in view_section.fields if f.colRef.colId not in colid_keep_set]
 
-    have_group_col = any(f.colRef.colId == 'group' for f in formula_fields)
+    have_group_col = any(ci.colId == 'group' for ci in formula_colinfo)
     if not have_group_col:
       formula_colinfo.append(_group_colinfo(source_table))
 
@@ -221,10 +272,17 @@ class SummaryActions(object):
     self.docmodel.remove(delete_fields)
 
     # Update fields for all formula fields and reused group-by fields to point to new columns.
+    colid_to_field_map = {field.colRef.colId: field for field in view_section.fields}
+    prev_group_fields = [
+      colid_to_field_map[col.colId] for col in prev_group_cols
+      if col.colId in colid_to_field_map
+    ]
     source_col_map = dict(zip(source_groupby_columns, groupby_columns))
     prev_group_columns = [source_col_map[f.colRef.summarySourceCol] for f in prev_group_fields]
+    visible_formula_columns = [c for c in formula_columns if c.colId in colid_to_field_map]
+    formula_fields = [colid_to_field_map[c.colId] for c in visible_formula_columns]
     self.docmodel.update(formula_fields + prev_group_fields,
-                         colRef=[c.id for c in formula_columns + prev_group_columns])
+                         colRef=[c.id for c in visible_formula_columns + prev_group_columns])
 
     # Finally, we need to create fields for newly-added group-by columns. If there were missing
     # fields for any group-by columns before, they'll be created now.
@@ -261,6 +319,17 @@ class SummaryActions(object):
         return c
     return None
 
+  def _append_sister_column_if_any(self, all_colinfo, source_table, col):
+    """
+    Appends a col info for one sister column of col (in source_table) if it finds one, else, and if
+    col is of numeric type appends the col info for the sum col, else do nothing.
+    """
+    c = self._find_sister_column(source_table, col.colId)
+    if c:
+      all_colinfo.append(_make_col_info(col=c))
+    elif col.type in ('Int', 'Numeric'):
+      all_colinfo.append(_make_sum_col_info(col))
+
 
   def _create_summary_colinfo(self, source_table, source_groupby_columns):
     """Come up automatically with a list of columns to include into a summary table."""
@@ -274,12 +343,7 @@ class SummaryActions(object):
     for col in source_table.columns:
       if col.colId in groupby_col_ids or col.colId == 'group' or not is_visible_column(col.colId):
         continue
-      c = self._find_sister_column(source_table, col.colId)
-      if c:
-        all_colinfo.append(_make_col_info(col=c))
-      elif col.type in ('Int', 'Numeric'):
-        all_colinfo.append(_make_col_info(col=col, isFormula=True,
-                                          formula='SUM($group.%s)' % col.colId))
+      self._append_sister_column_if_any(all_colinfo, source_table, col)
 
     # Add a default 'count' column for the number of records in the group, unless a different
     # 'count' was already added (which we would then prefer as presumably more useful). We add the
@@ -321,9 +385,11 @@ class SummaryActions(object):
     group_args = ', '.join(
       '%s=%s' % (
         c.summarySourceCol.colId,
-        'CONTAINS($%s)' % c.colId
-        if c.summarySourceCol.type.startswith(('ChoiceList', 'RefList:')) else
-        '$%s' % c.colId,
+        (
+          'CONTAINS($%s, match_empty="")' if c.summarySourceCol.type == 'ChoiceList' else
+          'CONTAINS($%s, match_empty=0)' if c.summarySourceCol.type.startswith('Reflist') else
+          '$%s'
+        ) % c.colId,
       )
       for c in field_col_recs if c.summarySourceCol
     )

@@ -77,10 +77,7 @@ class TestUserActions(test_engine.EngineTestCase):
         'type': 'Text'
       }],
       ["AddRecord", "_grist_Views_section_field", 3, {
-        "colRef": 24, "parentId": 1, "parentPos": 3.0
-      }],
-      ["AddRecord", "_grist_Views_section_field", 4, {
-        "colRef": 24, "parentId": 2, "parentPos": 4.0
+        "colRef": 24, "parentId": 2, "parentPos": 3.0
       }],
       ["BulkUpdateRecord", "Schools", [1, 2, 3],
         {"grist_Transform": ["New York", "Colombia", "New York"]}],
@@ -107,7 +104,6 @@ class TestUserActions(test_engine.EngineTestCase):
     self.assertPartialOutActions(out_actions, { "stored": [
       ['ModifyColumn', 'Schools', 'city', {'type': 'Ref:Address'}],
       ['UpdateRecord', 'Schools', 4, {'city': 0}],
-      ['UpdateRecord', '_grist_Views_section_field', 1, {'widgetOptions': ''}],
       ['UpdateRecord', '_grist_Tables_column', 23, {
         'type': 'Ref:Address', 'widgetOptions': 'world'
       }],
@@ -124,7 +120,7 @@ class TestUserActions(test_engine.EngineTestCase):
 
     out_actions = self.remove_column('Schools', 'grist_Transform')
     self.assertPartialOutActions(out_actions, { "stored": [
-      ["BulkRemoveRecord", "_grist_Views_section_field", [3, 4]],
+      ["RemoveRecord", "_grist_Views_section_field", 3],
       ['RemoveRecord', '_grist_Tables_column', 24],
       ['RemoveColumn', 'Schools', 'grist_Transform'],
     ]})
@@ -137,7 +133,7 @@ class TestUserActions(test_engine.EngineTestCase):
     self.assertTables([self.starting_table])
 
     # Create a view + section for the initial table.
-    self.apply_user_action(["CreateViewSection", 1, 0, "record", None])
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", None, None])
 
     # Verify that we got a new view, with one section, and three fields.
     self.assertViews([View(1, sections=[
@@ -147,7 +143,7 @@ class TestUserActions(test_engine.EngineTestCase):
     ]) ])
 
     # Create a new section for the same view, check that only a section is added.
-    self.apply_user_action(["CreateViewSection", 1, 1, "record", None])
+    self.apply_user_action(["CreateViewSection", 1, 1, "record", None, None])
     self.assertTables([self.starting_table])
     self.assertViews([View(1, sections=[
       Section(1, parentKey="record", tableRef=1, fields=[
@@ -159,8 +155,8 @@ class TestUserActions(test_engine.EngineTestCase):
     ]) ])
 
     # Create another section for the same view, this time summarized.
-    self.apply_user_action(["CreateViewSection", 1, 1, "record", [21]])
-    summary_table = Table(2, "GristSummary_7_Address", 0, summarySourceTable=1, columns=[
+    self.apply_user_action(["CreateViewSection", 1, 1, "record", [21], None])
+    summary_table = Table(2, "Address_summary_city", 0, summarySourceTable=1, columns=[
         Column(22, "city", "Text", isFormula=False, formula="", summarySourceCol=21),
         Column(23, "group", "RefList:Address", isFormula=True,
                formula="table.getSummarySourceGroup(rec)", summarySourceCol=0),
@@ -175,9 +171,9 @@ class TestUserActions(test_engine.EngineTestCase):
       Section(2, parentKey="record", tableRef=1, fields=[
         Field(2, colRef=21),
       ]),
-      Section(3, parentKey="record", tableRef=2, fields=[
-        Field(3, colRef=22),
-        Field(4, colRef=24),
+      Section(4, parentKey="record", tableRef=2, fields=[
+        Field(5, colRef=22),
+        Field(6, colRef=24),
       ]),
     ])
     self.assertTables([self.starting_table, summary_table])
@@ -185,7 +181,7 @@ class TestUserActions(test_engine.EngineTestCase):
 
     # Try to create a summary table for an invalid column, and check that it fails.
     with self.assertRaises(ValueError):
-      self.apply_user_action(["CreateViewSection", 1, 1, "record", [23]])
+      self.apply_user_action(["CreateViewSection", 1, 1, "record", [23], None])
     self.assertTables([self.starting_table, summary_table])
     self.assertViews([view])
 
@@ -197,94 +193,71 @@ class TestUserActions(test_engine.EngineTestCase):
     self.assertTables([self.starting_table])
     self.assertViews([])
 
-    # When we create a section/view for new table, we get both a primary view, and the new view we
-    # are creating.
-    self.apply_user_action(["CreateViewSection", 0, 0, "record", None])
-    new_table = Table(2, "Table1", primaryViewId=1, summarySourceTable=0, columns=[
+    # When we create a section/view for new table, we got the new view we are creating,
+    # without primary view.
+    self.apply_user_action(["CreateViewSection", 0, 0, "record", None, None])
+    new_table = Table(2, "Table1", primaryViewId=0, summarySourceTable=0, columns=[
       Column(22, "manualSort", "ManualSortPos", isFormula=False, formula="", summarySourceCol=0),
       Column(23, "A", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(24, "B", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(25, "C", "Any", isFormula=True, formula="", summarySourceCol=0),
     ])
-    primary_view = View(1, sections=[
-      Section(1, parentKey="record", tableRef=2, fields=[
-        Field(1, colRef=23),
-        Field(2, colRef=24),
-        Field(3, colRef=25),
-      ])
-    ])
-    new_view = View(2, sections=[
-      Section(3, parentKey="record", tableRef=2, fields=[
-        Field(7, colRef=23),
-        Field(8, colRef=24),
-        Field(9, colRef=25),
+    new_view = View(1, sections=[
+      Section(2, parentKey="record", tableRef=2, fields=[
+        Field(4, colRef=23),
+        Field(5, colRef=24),
+        Field(6, colRef=25),
       ])
     ])
     self.assertTables([self.starting_table, new_table])
-    self.assertViews([primary_view, new_view])
+    self.assertViews([new_view])
 
     # Create another section in an existing view for a new table.
-    self.apply_user_action(["CreateViewSection", 0, 2, "record", None])
-    new_table2 = Table(3, "Table2", primaryViewId=3, summarySourceTable=0, columns=[
+    self.apply_user_action(["CreateViewSection", 0, 1, "record", None, None])
+    new_table2 = Table(3, "Table2", primaryViewId=0, summarySourceTable=0, columns=[
       Column(26, "manualSort", "ManualSortPos", isFormula=False, formula="", summarySourceCol=0),
       Column(27, "A", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(28, "B", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(29, "C", "Any", isFormula=True, formula="", summarySourceCol=0),
     ])
-    primary_view2 = View(3, sections=[
+    new_view.sections.append(
       Section(4, parentKey="record", tableRef=3, fields=[
         Field(10, colRef=27),
         Field(11, colRef=28),
         Field(12, colRef=29),
       ])
-    ])
-    new_view.sections.append(
-      Section(6, parentKey="record", tableRef=3, fields=[
-        Field(16, colRef=27),
-        Field(17, colRef=28),
-        Field(18, colRef=29),
-      ])
     )
-    # Check that we have a new table, only the primary view as new view; and a new section.
+    # Check that we have a new table, only the new view; and a new section.
     self.assertTables([self.starting_table, new_table, new_table2])
-    self.assertViews([primary_view, new_view, primary_view2])
+    self.assertViews([new_view])
 
     # Check that we can't create a summary of a table grouped by a column that doesn't exist yet.
     with self.assertRaises(ValueError):
-      self.apply_user_action(["CreateViewSection", 0, 2, "record", [31]])
+      self.apply_user_action(["CreateViewSection", 0, 1, "record", [31], None])
     self.assertTables([self.starting_table, new_table, new_table2])
-    self.assertViews([primary_view, new_view, primary_view2])
+    self.assertViews([new_view])
 
     # But creating a new table and showing totals for it is possible though dumb.
-    self.apply_user_action(["CreateViewSection", 0, 2, "record", []])
+    self.apply_user_action(["CreateViewSection", 0, 1, "record", [], None])
 
     # We expect a new table.
-    new_table3 = Table(4, "Table3", primaryViewId=4, summarySourceTable=0, columns=[
+    new_table3 = Table(4, "Table3", primaryViewId=0, summarySourceTable=0, columns=[
       Column(30, "manualSort", "ManualSortPos", isFormula=False, formula="", summarySourceCol=0),
       Column(31, "A", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(32, "B", "Any", isFormula=True, formula="", summarySourceCol=0),
       Column(33, "C", "Any", isFormula=True, formula="", summarySourceCol=0),
     ])
     # A summary of it.
-    summary_table = Table(5, "GristSummary_6_Table3", 0, summarySourceTable=4, columns=[
+    summary_table = Table(5, "Table3_summary", 0, summarySourceTable=4, columns=[
       Column(34, "group", "RefList:Table3", isFormula=True,
              formula="table.getSummarySourceGroup(rec)", summarySourceCol=0),
       Column(35, "count", "Int", isFormula=True, formula="len($group)", summarySourceCol=0),
     ])
-    # The primary view of the new table.
-    primary_view3 = View(4, sections=[
-      Section(7, parentKey="record", tableRef=4, fields=[
-        Field(19, colRef=31),
-        Field(20, colRef=32),
-        Field(21, colRef=33),
-      ])
-    ])
-    # And a new view section for the summary.
-    new_view.sections.append(Section(9, parentKey="record", tableRef=5, fields=[
-      Field(25, colRef=35)
-    ]))
     self.assertTables([self.starting_table, new_table, new_table2, new_table3, summary_table])
-    self.assertViews([primary_view, new_view, primary_view2, primary_view3])
+    new_view.sections.append(Section(7, parentKey="record", tableRef=5, fields=[
+      Field(17, colRef=35)
+    ]))
+    self.assertViews([new_view])
 
   #----------------------------------------------------------------------
 
@@ -301,10 +274,10 @@ class TestUserActions(test_engine.EngineTestCase):
       'size': [1000, 2000, 3000, 4000],
     }])
     # Add a new view; a second section (summary) to it; and a third view.
-    self.apply_user_action(['CreateViewSection', 1, 0, 'detail', None])
-    self.apply_user_action(['CreateViewSection', 1, 2, 'record', [3]])
-    self.apply_user_action(['CreateViewSection', 1, 0, 'chart', None])
-    self.apply_user_action(['CreateViewSection', 0, 2, 'record', None])
+    self.apply_user_action(['CreateViewSection', 1, 0, 'detail', None, None])
+    self.apply_user_action(['CreateViewSection', 1, 2, 'record', [3], None])
+    self.apply_user_action(['CreateViewSection', 1, 0, 'chart', None, None])
+    self.apply_user_action(['CreateViewSection', 0, 2, 'record', None, None])
 
     # Verify the new structure of tables and views.
     self.assertTables([
@@ -314,13 +287,13 @@ class TestUserActions(test_engine.EngineTestCase):
         Column(3, "state", "Text", False, "", 0),
         Column(4, "size",  "Numeric", False, "", 0),
       ]),
-      Table(2, "GristSummary_7_Schools", 0, 1, columns=[
+      Table(2, "Schools_summary_state", 0, 1, columns=[
         Column(5, "state", "Text", False, "", 3),
         Column(6, "group", "RefList:Schools", True, "table.getSummarySourceGroup(rec)", 0),
         Column(7, "count", "Int",     True, "len($group)", 0),
         Column(8, "size",  "Numeric", True, "SUM($group.size)", 0),
       ]),
-      Table(3, 'Table1', 4, 0, columns=[
+      Table(3, 'Table1', 0, 0, columns=[
         Column(9, "manualSort", "ManualSortPos", False, "", 0),
         Column(10, "A", "Any", True, "", 0),
         Column(11, "B", "Any", True, "", 0),
@@ -341,10 +314,10 @@ class TestUserActions(test_engine.EngineTestCase):
           Field(8, colRef=3),
           Field(9, colRef=4),
         ]),
-        Section(4, parentKey="record", tableRef=2, fields=[
-          Field(10, colRef=5),
-          Field(11, colRef=7),
-          Field(12, colRef=8),
+        Section(5, parentKey="record", tableRef=2, fields=[
+          Field(13, colRef=5),
+          Field(14, colRef=7),
+          Field(15, colRef=8),
         ]),
         Section(8, parentKey='record', tableRef=3, fields=[
           Field(21, colRef=10),
@@ -353,32 +326,23 @@ class TestUserActions(test_engine.EngineTestCase):
         ]),
       ]),
       View(3, sections=[
-        Section(5, parentKey="chart", tableRef=1, fields=[
-          Field(13, colRef=2),
-          Field(14, colRef=3),
+        Section(6, parentKey="chart", tableRef=1, fields=[
+          Field(16, colRef=2),
+          Field(17, colRef=3),
         ]),
-      ]),
-      View(4, sections=[
-        Section(6, parentKey='record', tableRef=3, fields=[
-          Field(15, colRef=10),
-          Field(16, colRef=11),
-          Field(17, colRef=12),
-        ]),
-      ]),
+      ])
     ])
     self.assertTableData('_grist_TabBar', cols="subset", data=[
       ["id",  "viewRef"],
       [1,     1],
       [2,     2],
       [3,     3],
-      [4,     4],
     ])
     self.assertTableData('_grist_Pages', cols="subset", data=[
       ["id", "viewRef"],
       [1,    1],
       [2,    2],
-      [3,    3],
-      [4,    4]
+      [3,    3]
     ])
 
   #----------------------------------------------------------------------
@@ -388,7 +352,7 @@ class TestUserActions(test_engine.EngineTestCase):
     self.init_views_sample()
 
     # Remove a view. Ensure related items, sections, fields get removed.
-    self.apply_user_action(["BulkRemoveRecord", "_grist_Views", [2,3]])
+    self.apply_user_action(["BulkRemoveRecord", "_grist_Views", [2, 3]])
 
     # Verify the new structure of tables and views.
     self.assertTables([
@@ -399,7 +363,7 @@ class TestUserActions(test_engine.EngineTestCase):
         Column(4, "size",  "Numeric", False, "", 0),
       ]),
       # Note that the summary table is gone.
-      Table(3, 'Table1', 4, 0, columns=[
+      Table(3, 'Table1', 0, 0, columns=[
         Column(9, "manualSort", "ManualSortPos", False, "", 0),
         Column(10, "A", "Any", True, "", 0),
         Column(11, "B", "Any", True, "", 0),
@@ -413,24 +377,15 @@ class TestUserActions(test_engine.EngineTestCase):
           Field(2, colRef=3),
           Field(3, colRef=4),
         ]),
-      ]),
-      View(4, sections=[
-        Section(6, parentKey='record', tableRef=3, fields=[
-          Field(15, colRef=10),
-          Field(16, colRef=11),
-          Field(17, colRef=12),
-        ]),
-      ]),
+      ])
     ])
     self.assertTableData('_grist_TabBar', cols="subset", data=[
       ["id",  "viewRef"],
       [1,     1],
-      [4,     4],
     ])
     self.assertTableData('_grist_Pages', cols="subset", data=[
       ["id",  "viewRef"],
       [1,     1],
-      [4,     4],
     ])
 
   #----------------------------------------------------------------------
@@ -443,32 +398,131 @@ class TestUserActions(test_engine.EngineTestCase):
     self.assertTableData('_grist_Tables', cols="subset", data=[
       [ 'id', 'tableId',  'primaryViewId'  ],
       [ 1,    'Schools',                1],
-      [ 2,    'GristSummary_7_Schools', 0],
-      [ 3,    'Table1',                 4],
+      [ 2,    'Schools_summary_state', 0],
+      [ 3,    'Table1',                 0],
     ])
     self.assertTableData('_grist_Views', cols="subset", data=[
       [ 'id',   'name',   'primaryViewTable'  ],
       [ 1,      'Schools',    1],
       [ 2,      'New page',   0],
       [ 3,      'New page',   0],
-      [ 4,      'Table1',     3],
     ])
 
-    # Update the names in a few views, and ensure that primary ones cause tables to get renamed.
-    self.apply_user_action(['BulkUpdateRecord', '_grist_Views', [2,3,4],
-                            {'name': ['A', 'B', 'C']}])
+    # Update the names in a few views, and ensure that primary ones won't cause tables to
+    # get renamed.
+    self.apply_user_action(['BulkUpdateRecord', '_grist_Views', [2, 3],
+                            {'name': ['A', 'B']}])
+
     self.assertTableData('_grist_Tables', cols="subset", data=[
       [ 'id', 'tableId',  'primaryViewId'  ],
       [ 1,    'Schools',                1],
-      [ 2,    'GristSummary_7_Schools', 0],
-      [ 3,    'C',                      4],
+      [ 2,    'Schools_summary_state', 0],
+      [ 3,    'Table1',                      0],
     ])
     self.assertTableData('_grist_Views', cols="subset", data=[
       [ 'id',   'name',   'primaryViewTable'  ],
       [ 1,      'Schools',  1],
       [ 2,      'A',        0],
-      [ 3,      'B',        0],
-      [ 4,      'C',        3]
+      [ 3,      'B',        0]
+    ])
+
+    # Now rename a table (by raw view section) and make sure that a view with the same name
+    # was renamed
+    self.apply_user_action(['UpdateRecord', '_grist_Views_section', 2,
+                            {'title': 'Bars'}])
+
+    self.assertTableData('_grist_Tables', cols="subset", data=[
+      ['id', 'tableId'],
+      [1, 'Bars', 1],
+      [2, 'Bars_summary_state', 0],
+      [3, 'Table1', 0],
+    ])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'Bars'],
+      [2, 'A'],
+      [3, 'B']
+    ])
+
+    # Now rename tables so that two tables will have same names, to test if only the view
+    # with a page will be renamed.
+    self.apply_user_action(['UpdateRecord', '_grist_Views_section', 2,
+                            {'title': 'A'}])
+
+    self.assertTableData('_grist_Tables', cols="subset", data=[
+      ['id', 'tableId'],
+      [1, 'A', 1],
+      [2, 'A_summary_state', 0],
+      [3, 'Table1', 0],
+    ])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'A'],
+      [2, 'A'],
+      [3, 'B'],
+    ])
+
+    self.apply_user_action(['UpdateRecord', '_grist_Views_section', 2,
+                            {'title': 'Z'}])
+
+    self.assertTableData('_grist_Tables', cols="subset", data=[
+      ['id', 'tableId', 'primaryViewId', 'rawViewSectionRef'],
+      [1, 'Z', 1, 2],
+      [2, 'Z_summary_state', 0, 4],
+      [3, 'Table1', 0, 7],
+    ])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'Z'],
+      [2, 'Z'],
+      [3, 'B'],
+    ])
+
+    # Add new table, with a view with the same name (Z) and make sure it won't be renamed
+    self.apply_user_action(['AddTable', 'Stations', [
+      {'id': 'city', 'type': 'Text'},
+    ]])
+    self.assertTableData('_grist_Tables', cols="subset", data=[
+      ['id', 'tableId', 'primaryViewId', 'rawViewSectionRef'],
+      [1, 'Z', 1, 2],
+      [2, 'Z_summary_state', 0, 4],
+      [3, 'Table1', 0, 7],
+      [4, 'Stations', 4, 10],
+    ])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'Z'],
+      [2, 'Z'],
+      [3, 'B'],
+      [4, 'Stations'],
+    ])
+    # Replacing only a page name (though primary)
+    self.apply_user_action(['UpdateRecord', '_grist_Views', 4, {'name': 'Z'}])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'Z'],
+      [2, 'Z'],
+      [3, 'B'],
+      [4, 'Z']
+    ])
+
+    # Rename table Z to Schools. Primary view for Stations (Z) should not be renamed.
+    self.apply_user_action(['UpdateRecord', '_grist_Views_section', 2,
+                            {'title': 'Schools'}])
+
+    self.assertTableData('_grist_Tables', cols="subset", data=[
+      ['id', 'tableId'],
+      [1, 'Schools'],
+      [2, 'Schools_summary_state'],
+      [3, 'Table1'],
+      [4, 'Stations'],
+    ])
+    self.assertTableData('_grist_Views', cols="subset", data=[
+      ['id', 'name'],
+      [1, 'Schools'],
+      [2, 'Schools'],
+      [3, 'B'],
+      [4, 'Z']
     ])
 
   #----------------------------------------------------------------------
@@ -476,9 +530,6 @@ class TestUserActions(test_engine.EngineTestCase):
   def test_section_removes(self):
     # Add a couple of tables and views, to trigger creation of some related items.
     self.init_views_sample()
-
-    # Remove a couple of sections. Ensure their fields get removed.
-    self.apply_user_action(['BulkRemoveRecord', '_grist_Views_section', [4, 8]])
 
     self.assertViews([
       View(1, sections=[
@@ -494,20 +545,49 @@ class TestUserActions(test_engine.EngineTestCase):
           Field(8, colRef=3),
           Field(9, colRef=4),
         ]),
+        Section(5, parentKey="record", tableRef=2, fields=[
+          Field(13, colRef=5),
+          Field(14, colRef=7),
+          Field(15, colRef=8),
+        ]),
+        Section(8, parentKey='record', tableRef=3, fields=[
+          Field(21, colRef=10),
+          Field(22, colRef=11),
+          Field(23, colRef=12),
+        ]),
       ]),
       View(3, sections=[
-        Section(5, parentKey="chart", tableRef=1, fields=[
-          Field(13, colRef=2),
-          Field(14, colRef=3),
+        Section(6, parentKey="chart", tableRef=1, fields=[
+          Field(16, colRef=2),
+          Field(17, colRef=3),
+        ]),
+      ])
+    ])
+
+    # Remove a couple of sections. Ensure their fields get removed.
+    self.apply_user_action(['BulkRemoveRecord', '_grist_Views_section', [5, 8]])
+
+    self.assertViews([
+      View(1, sections=[
+        Section(1, parentKey="record", tableRef=1, fields=[
+          Field(1, colRef=2),
+          Field(2, colRef=3),
+          Field(3, colRef=4),
         ]),
       ]),
-      View(4, sections=[
-        Section(6, parentKey='record', tableRef=3, fields=[
-          Field(15, colRef=10),
-          Field(16, colRef=11),
-          Field(17, colRef=12),
-        ]),
+      View(2, sections=[
+        Section(3, parentKey="detail", tableRef=1, fields=[
+          Field(7, colRef=2),
+          Field(8, colRef=3),
+          Field(9, colRef=4),
+        ])
       ]),
+      View(3, sections=[
+        Section(6, parentKey="chart", tableRef=1, fields=[
+          Field(16, colRef=2),
+          Field(17, colRef=3),
+        ]),
+      ])
     ])
 
   #----------------------------------------------------------------------
@@ -526,19 +606,20 @@ class TestUserActions(test_engine.EngineTestCase):
       orig_method()
     self.engine.assert_schema_consistent = types.MethodType(override, self.engine)
 
-    # Do a non-sschema action to ensure it doesn't get called.
+    # Do a non-schema action to ensure it doesn't get called.
     self.apply_user_action(['UpdateRecord', '_grist_Views', 2, {'name': 'A'}])
     self.assertEqual(count_calls[0], 0)
 
     # Do a schema action to ensure it gets called: this causes a table rename.
-    self.apply_user_action(['UpdateRecord', '_grist_Views', 4, {'name': 'C'}])
+    # 7 is id of raw view section for the Tabl1 table
+    self.apply_user_action(['UpdateRecord', '_grist_Views_section', 7, {'title': 'C'}])
     self.assertEqual(count_calls[0], 1)
 
     self.assertTableData('_grist_Tables', cols="subset", data=[
       [ 'id', 'tableId',  'primaryViewId'  ],
       [ 1,    'Schools',                1],
-      [ 2,    'GristSummary_7_Schools', 0],
-      [ 3,    'C',                      4],
+      [ 2,    'Schools_summary_state', 0],
+      [ 3,    'C',                      0],
     ])
 
     # Do another schema and non-schema action.
@@ -740,7 +821,6 @@ class TestUserActions(test_engine.EngineTestCase):
       [   1,             0],
       [   2,             1],
       [   3,             0],
-      [   4,             0],
     ])
 
     # Verify that removing page 1 fixes page 2 indentation.
@@ -749,7 +829,6 @@ class TestUserActions(test_engine.EngineTestCase):
       ['id', 'indentation'],
       [   2,             0],
       [   3,             0],
-      [   4,             0],
     ])
 
     # Removing last page should not fail
@@ -868,7 +947,7 @@ class TestUserActions(test_engine.EngineTestCase):
     # Test filters rename
 
     # Create new view section
-    self.apply_user_action(["CreateViewSection", 1, 0, "record", None])
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", None, None])
 
     # Filter it by first column
     self.apply_user_action(['BulkAddRecord', '_grist_Filters', [None], {
@@ -1187,13 +1266,13 @@ class TestUserActions(test_engine.EngineTestCase):
     for i in range(20):
       self.add_record("Address", None)
       self.assertEqual(i + 1, table._num_rows())
-      self.assertEqual(i + 1, self.engine.count_rows())
+      self.assertEqual({1: i + 1, "total": i + 1}, self.engine.count_rows())
 
   def test_raw_view_section_restrictions(self):
     # load_sample handles loading basic metadata, but doesn't create any view sections
     self.load_sample(self.sample)
     # Create a new table which automatically gets a raw view section
-    self.apply_user_action(["AddEmptyTable"])
+    self.apply_user_action(["AddEmptyTable", None])
 
     # Note the row IDs of the raw view section (2) and fields (4, 5, 6)
     self.assertTableData('_grist_Views_section', cols="subset", data=[
@@ -1242,3 +1321,59 @@ class TestUserActions(test_engine.EngineTestCase):
       [5, 2],
       [6, 2],
     ])
+
+  def test_update_current_time(self):
+    self.load_sample(self.sample)
+    self.apply_user_action(["AddEmptyTable", None])
+    self.add_column('Table1', 'now', isFormula=True, formula='NOW()', type='Any')
+
+    # No records with NOW() in a formula yet, so this action should have no effect at all.
+    out_actions = self.apply_user_action(["UpdateCurrentTime"])
+    self.assertOutActions(out_actions, {})
+
+    class FakeDatetime(object):
+      counter = 0
+
+      @classmethod
+      def now(cls, *_):
+        cls.counter += 1
+        return cls.counter
+
+    import datetime
+    original = datetime.datetime
+    # This monkeypatch depends on NOW() using `import datetime`
+    # as opposed to `from datetime import datetime`
+    datetime.datetime = FakeDatetime
+
+    def check(expected_now):
+      self.assertEqual(expected_now, FakeDatetime.counter)
+      self.assertTableData('Table1', cols="subset", data=[
+        ["id", "now"],
+        [1, expected_now],
+      ])
+
+    try:
+      # The counter starts at 0. Adding an initial record calls FakeDatetime.now() for the 1st time.
+      # The call increments the counter to 1 before returning.
+      self.add_record('Table1')
+      check(1)
+
+      # Testing that unrelated actions don't change the time
+      self.apply_user_action(["AddEmptyTable", None])
+      self.add_record("Table2")
+      self.apply_user_action(["Calculate"])  # only recalculates for fresh docs
+      check(1)
+
+      # Actually testing that the time is updated as requested
+      self.apply_user_action(["UpdateCurrentTime"])
+      check(2)
+      out_actions = self.apply_user_action(["UpdateCurrentTime"])
+      check(3)
+      self.assertOutActions(out_actions, {
+        "direct": [False],
+        "stored": [["UpdateRecord", "Table1", 1, {"now": 3}]],
+        "undo": [["UpdateRecord", "Table1", 1, {"now": 2}]],
+      })
+    finally:
+      # Revert the monkeypatch
+      datetime.datetime = original

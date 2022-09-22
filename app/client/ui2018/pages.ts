@@ -1,7 +1,7 @@
 import { isDesktop } from 'app/client/lib/browserInfo';
 import { cssEditorInput } from "app/client/ui/HomeLeftPane";
 import { itemHeader, itemHeaderWrapper, treeViewContainer } from "app/client/ui/TreeViewComponentCss";
-import { colors } from "app/client/ui2018/cssVars";
+import { theme } from "app/client/ui2018/cssVars";
 import { icon } from "app/client/ui2018/icons";
 import { menu, menuItem, menuText } from "app/client/ui2018/menus";
 import { dom, domComputed, DomElementArg, makeTestId, observable, Observable, styled } from "grainjs";
@@ -15,6 +15,11 @@ export interface PageActions {
   onDuplicate: () => void;
   isRemoveDisabled: () => boolean;
   isReadonly: Observable<boolean>;
+}
+
+function isTargetSelected(target: HTMLElement) {
+  const parentItemHeader = target.closest('.' + itemHeader.className);
+  return parentItemHeader ? parentItemHeader.classList.contains('selected') : false;
 }
 
 // build the dom for a document page entry. It shows an icon (for now the first letter of the name,
@@ -52,7 +57,10 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
       domComputed(isRenaming, (isrenaming) => (
         isrenaming ?
           cssPageItem(
-            cssPageInitial(dom.text((use) => Array.from(use(name))[0])),
+            cssPageInitial(
+              testId('initial'),
+              dom.text((use) => Array.from(use(name))[0])
+              ),
             cssEditorInput(
               {
                 initialValue: name.get() || '',
@@ -68,10 +76,17 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
             // firefox.
           ) :
           cssPageItem(
-            cssPageInitial(dom.text((use) => Array.from(use(name))[0])),
-            cssPageName(dom.text(name), testId('label')),
+            cssPageInitial(
+              testId('initial'),
+              dom.text((use) => Array.from(use(name))[0]),
+            ),
+            cssPageName(
+              dom.text(name),
+              testId('label'),
+              dom.on('click', (ev) => isTargetSelected(ev.target as HTMLElement) && isRenaming.set(true)),
+            ),
             cssPageMenuTrigger(
-              cssPageIcon('Dots'),
+              cssPageMenuIcon('Dots'),
               menu(pageMenu, {placement: 'bottom-start', parentSelectorToMark: '.' + itemHeader.className}),
               dom.on('click', (ev) => { ev.stopPropagation(); ev.preventDefault(); }),
 
@@ -89,7 +104,6 @@ export function buildPageDom(name: Observable<string>, actions: PageActions, ...
 }
 
 const cssPageItem = styled('a', `
-  --icon-color: ${colors.slate};
   display: flex;
   flex-direction: row;
   height: 28px;
@@ -107,9 +121,9 @@ const cssPageItem = styled('a', `
 
 const cssPageInitial = styled('div', `
   flex-shrink: 0;
-  color: white;
+  color: ${theme.pageInitialsFg};
   border-radius: 3px;
-  background-color: ${colors.slate};
+  background-color: ${theme.pageInitialsBg};
   width: 16px;
   height: 16px;
   text-align: center;
@@ -120,6 +134,7 @@ const cssPageName = styled('div', `
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex-grow: 1;
   .${treeViewContainer.className}-close & {
     display: none;
   }
@@ -171,20 +186,21 @@ const cssPageMenuTrigger = styled('div', `
     }
   }
   .${itemHeaderWrapper.className}-not-dragging &:hover, &.weasel-popup-open {
-    background-color: ${colors.darkGrey};
+    background-color: ${theme.pageOptionsHoverBg};
   }
   .${itemHeaderWrapper.className}-not-dragging > .${itemHeader.className}.selected &:hover,
   .${itemHeaderWrapper.className}-not-dragging > .${itemHeader.className}.selected &.weasel-popup-open {
-    background-color: ${colors.slate};
+    background-color: ${theme.pageOptionsSelectedHoverBg};
   }
 
   .${itemHeader.className}.weasel-popup-open, .${itemHeader.className}-renaming {
-    background-color: ${colors.mediumGrey};
+    background-color: ${theme.pageHoverBg};
   }
 `);
 
-const cssPageIcon = styled(icon, `
+const cssPageMenuIcon = styled(icon, `
+  background-color: ${theme.pageOptionsFg};
   .${itemHeader.className}.selected & {
-    background-color: white;
+    background-color: ${theme.pageOptionsHoverFg};
   }
 `);

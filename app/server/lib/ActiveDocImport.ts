@@ -12,11 +12,12 @@ import {ApiError} from 'app/common/ApiError';
 import {BulkColValues, CellValue, fromTableDataAction, TableRecordValue, UserAction} from 'app/common/DocActions';
 import * as gutil from 'app/common/gutil';
 import {DocStateComparison} from 'app/common/UserAPI';
+import {guessColInfoForImports} from 'app/common/ValueGuesser';
 import {ParseFileResult, ParseOptions} from 'app/plugin/FileParserAPI';
 import {GristColumn, GristTable} from 'app/plugin/GristTable';
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
 import {DocSession, OptDocSession} from 'app/server/lib/DocSession';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {globalUploadSet, moveUpload, UploadInfo} from 'app/server/lib/uploads';
 import {buildComparisonQuery} from 'app/server/lib/ExpandedQuery';
 import flatten = require('lodash/flatten');
@@ -97,17 +98,17 @@ export class ActiveDocImport {
    * Cancels import files, removes temporary hidden tables and temporary uploaded files
    *
    * @param {ActiveDoc} activeDoc: Instance of ActiveDoc.
-   * @param {DataSourceTransformed} dataSource: an array of DataSource
+   * @param {number} uploadId: Identifier for the temporary uploaded file(s) to clean up.
    * @param {Array<String>} prevTableIds: Array of tableIds as received from previous `importFiles`
    *  call when re-importing with changed `parseOptions`.
    * @returns {Promise} Promise that's resolved when all actions are applied successfully.
    */
   public async cancelImportFiles(docSession: DocSession,
-                                 dataSource: DataSourceTransformed,
+                                 uploadId: number,
                                  prevTableIds: string[]): Promise<void> {
     await this._removeHiddenTables(docSession, prevTableIds);
     this._activeDoc.stopBundleUserActions(docSession);
-    await globalUploadSet.cleanup(dataSource.uploadId);
+    await globalUploadSet.cleanup(uploadId);
   }
 
   /**
@@ -137,8 +138,7 @@ export class ActiveDocImport {
     mergeCols = stripPrefixes(mergeCols);
 
     // Get column differences between `hiddenTableId` and `destTableId` for rows that exist in both tables.
-    const srcAndDestColIds: [string, string[]][] =
-      destCols.map(c => [c.colId!, [c.colId!.slice(IMPORT_TRANSFORM_COLUMN_PREFIX.length)]]);
+    const srcAndDestColIds: [string, string[]][] = destCols.map(c => [c.colId!, stripPrefixes([c.colId!])]);
     const srcToDestColIds = new Map(srcAndDestColIds);
     const comparisonResult = await this._getTableComparison(hiddenTableId, destTableId!, srcToDestColIds, mergeCols);
 
@@ -152,6 +152,11 @@ export class ActiveDocImport {
 
     // Retrieve the function used to reconcile differences between source and destination.
     const merge = getMergeFunction(mergeStrategy);
+
+    // Destination columns with a blank formula (i.e. skipped columns).
+    const skippedColumnIds = new Set(
+      stripPrefixes(destCols.filter(c => c.formula.trim() === '').map(c => c.colId!))
+    );
 
     const numResultRows = comparisonResult[hiddenTableId + '.id'].length;
     for (let i = 0; i < numResultRows; i++) {
@@ -172,7 +177,12 @@ export class ActiveDocImport {
           // Exclude unchanged cell values from the comparison.
           if (srcVal === destVal) { continue; }
 
-          updatedRecords[srcColId][srcRowId] = [[destVal], [merge(srcVal, destVal)]];
+          const shouldSkip = skippedColumnIds.has(matchingDestColId);
+          updatedRecords[srcColId][srcRowId] = [
+            [destVal],
+            // For skipped columns, always use the destination value.
+            [shouldSkip ? destVal : merge(srcVal, destVal)]
+          ];
         }
       }
 
@@ -232,6 +242,7 @@ export class ActiveDocImport {
 
     // The upload must be within the plugin-accessible directory. Once moved, subsequent calls to
     // moveUpload() will return without having to do anything.
+    if (!this._activeDoc.docPluginManager) { throw new Error('no plugin manager available'); }
     await moveUpload(upload, this._activeDoc.docPluginManager.tmpDir());
 
     const importResult: ImportResult = {options: parseOptions, tables: []};
@@ -262,8 +273,8 @@ export class ActiveDocImport {
   /**
    * Imports the data stored at tmpPath.
    *
-   * Currently it starts a python parser (that relies on the messytables library) as a child process
-   * outside the sandbox, and supports xls(x), csv, txt, and perhaps some other formats. It may
+   * Currently it starts a python parser as a child process
+   * outside the sandbox, and supports xlsx, csv, and perhaps some other formats. It may
    * result in the import of multiple tables, in case of e.g. Excel formats.
    * @param {OptDocSession} docSession: Session instance to use for importing.
    * @param {String} tmpPath: The path from of the original file.
@@ -277,6 +288,7 @@ export class ActiveDocImport {
     const {originalFilename, parseOptions, mergeOptionsMap, isHidden, uploadFileIndex,
            transformRuleMap} = importOptions;
     log.info("ActiveDoc._importFileAsNewTable(%s, %s)", tmpPath, originalFilename);
+    if (!this._activeDoc.docPluginManager) { throw new Error('no plugin manager available'); }
     const optionsAndData: ParseFileResult =
       await this._activeDoc.docPluginManager.parseFile(tmpPath, originalFilename, parseOptions);
     const options = optionsAndData.parseOptions;
@@ -294,7 +306,7 @@ export class ActiveDocImport {
       const origTableName = table.table_name ? table.table_name : '';
       const transformRule = transformRuleMap && transformRuleMap.hasOwnProperty(origTableName) ?
         transformRuleMap[origTableName] : null;
-      const columnMetadata = cleanColumnMetadata(table.column_metadata);
+      const columnMetadata = cleanColumnMetadata(table.column_metadata, table.table_data, this._activeDoc);
       const result: ApplyUAResult = await this._activeDoc.applyUserActions(docSession,
         [["AddTable", hiddenTableName, columnMetadata]]);
       const retValue: AddTableRetValue = result.retValues[0];
@@ -419,7 +431,9 @@ export class ActiveDocImport {
     const columnData: BulkColValues = {};
 
     const srcColIds = srcCols.map(c => c.id as string);
-    const destCols = transformRule.destCols;
+
+    // Only include destination columns that weren't skipped.
+    const destCols = transformRule.destCols.filter(c => c.formula.trim() !== '');
     for (const destCol of destCols) {
       const formula = destCol.formula.trim();
       if (!formula) { continue; }
@@ -486,6 +500,16 @@ export class ActiveDocImport {
     let numNewRecords = 0;
     const updatedRecords: BulkColValues = {};
     const updatedRecordIds: number[] = [];
+
+    // Destination columns with a blank formula (i.e. skipped columns).
+    const skippedColumnIds = new Set(
+      stripPrefixes(destCols.filter(c => c.formula.trim() === '').map(c => c.colId!))
+    );
+
+    // Remove all skipped columns from the map.
+    srcToDestColIds.forEach((destColIds, srcColId) => {
+      srcToDestColIds.set(srcColId, destColIds.filter(id => !skippedColumnIds.has(id)));
+    });
 
     const destColIds = flatten([...srcToDestColIds.values()]);
     for (const id of destColIds) {
@@ -583,8 +607,6 @@ export class ActiveDocImport {
     const srcColIds = srcCols.map(c => c.id as string);
 
     for (const {id, fields} of targetCols) {
-      if (fields.isFormula === true || fields.formula !== '') { continue; }
-
       destCols.push({
         colId: destTableId ? id as string : null,
         label: fields.label as string,
@@ -737,17 +759,24 @@ function getMergeFunction({type}: MergeStrategy): MergeFunction {
  * Tweak the column metadata used in the AddTable action.
  * If `columns` is populated with non-blank column ids, adds labels to all
  * columns using the values set for the column ids.
- * Ensure that columns of type Any start out as formula columns, i.e. empty columns,
- * so that type guessing is triggered when new data is added.
+ * For columns of type Any, guess the type and parse data according to it, or mark as empty
+ * formula columns when they should be empty.
  */
-function cleanColumnMetadata(columns: GristColumn[]) {
-  return columns.map(c => {
+function cleanColumnMetadata(columns: GristColumn[], tableData: unknown[][], activeDoc: ActiveDoc) {
+  return columns.map((c, index) => {
     const newCol: any = {...c};
     if (c.id) {
       newCol.label = c.id;
     }
     if (c.type === "Any") {
-      newCol.isFormula = true;
+      // If import logic left it to us to decide on column type, then use our guessing logic to
+      // pick a suitable type and widgetOptions, and to convert values to it.
+      const origValues = tableData[index] as CellValue[];
+      const {values, colMetadata} = guessColInfoForImports(origValues, activeDoc.docData!);
+      tableData[index] = values;
+      if (colMetadata) {
+        Object.assign(newCol, colMetadata);
+      }
     }
     return newCol;
   });

@@ -8,6 +8,7 @@ from six.moves import xrange
 import column
 import depend
 import docmodel
+import functions
 import logger
 import lookup
 import records
@@ -16,22 +17,6 @@ import usertypes
 
 log = logger.Logger(__name__, logger.INFO)
 
-
-def _make_sample_record(table_id, col_objs):
-  """
-  Helper to create a sample record for a table, used for auto-completions.
-  """
-  # This type gets created with a property for each column. We use property-methods rather than
-  # plain properties because this sample record is created before all tables have initialized, so
-  # reference values (using .sample_record for other tables) are not yet available.
-  RecType = type(table_id, (), {
-    # Note col=col to bind col at lambda-creation time; see
-    # https://stackoverflow.com/questions/10452770/python-lambdas-binding-to-local-values
-    col.col_id: property(lambda self, col=col: col.sample_value())
-    for col in col_objs
-    if column.is_user_column(col.col_id) or col.col_id == 'id'
-  })
-  return RecType()
 
 def get_default_func_name(col_id):
   return "_default_" + col_id
@@ -60,8 +45,6 @@ class UserTable(object):
   def __init__(self, model_class):
     docmodel.enhance_model(model_class)
     self.Model = model_class
-    column_ids = {col for col in model_class.__dict__ if not col.startswith("_")}
-    column_ids.add('id')
     self.table = None
 
   def _set_table_impl(self, table_impl):
@@ -149,6 +132,20 @@ class UserTable(object):
     # result that auto-complete will only return class properties, not member properties added in
     # the constructor.
     return []
+
+  def __getattr__(self, item):
+    if self.table.has_column(item):
+      raise AttributeError(
+        "To retrieve all values in a column, use `{table_id}.all.{item}`. "
+        "Tables have no attribute '{item}'".format(table_id=self.table.table_id, item=item)
+      )
+    super(UserTable, self).__getattribute__(item)
+
+  def __iter__(self):
+    raise TypeError(
+      "To iterate (loop) over all records in a table, use `{table_id}.all`. "
+      "Tables are not directly iterable.".format(table_id=self.table.table_id)
+    )
 
 
 class Table(object):
@@ -248,6 +245,39 @@ class Table(object):
     """
     return len(self._empty_lookup_column._do_fast_empty_lookup())
 
+  @property
+  def sample_record(self):
+    """
+    Used for auto-completion as a record with correct properties of correct types.
+    """
+    # Create a type with a property for each column. We use property-methods rather than
+    # plain attributes because this sample record is created before all tables have initialized, so
+    # reference values (using .sample_record for other tables) are not yet available.
+    props = {}
+    for col in self.all_columns.values():
+      if not (column.is_user_column(col.col_id) or col.col_id == 'id'):
+        continue
+      # Note c=col to bind at lambda-creation time; see
+      # https://stackoverflow.com/questions/10452770/python-lambdas-binding-to-local-values
+      props[col.col_id] = property(lambda _self, c=col: c.sample_value())
+      if col.col_id == 'id':
+        # The column lookup below doesn't work for the id column
+        continue
+      # For columns with a visible column (i.e. most Reference/ReferenceList columns),
+      # we also want to show how to get that visible column instead of the 'raw' record
+      # returned by the reference column itself.
+      col_rec = self._engine.docmodel.get_column_rec(self.table_id, col.col_id)
+      visible_col_id = col_rec.visibleCol.colId
+      if visible_col_id:
+        # This creates a fake attribute like `RefCol.VisibleCol` which isn't valid syntax normally,
+        # to show the `.VisibleCol` part before the user has typed the `.`
+        props[col.col_id + "." + visible_col_id] = property(
+          lambda _self, c=col, v=visible_col_id: getattr(c.sample_value(), v)
+        )
+
+    RecType = type(self.table_id, (), props)
+    return RecType()
+
   def _rebuild_model(self, user_table):
     """
     Sets class-wide properties from a new Model class for the table (inner class within the table
@@ -266,9 +296,6 @@ class Table(object):
     for col_id, col_model in col_items:
       default_func = self.Model.__dict__.get(get_default_func_name(col_id))
       new_cols[col_id] = self._create_or_update_col(col_id, col_model, default_func)
-
-    # Used for auto-completion as a record with correct properties of correct types.
-    self.sample_record = _make_sample_record(self.table_id, six.itervalues(new_cols))
 
     # Note that we reuse previous special columns like lookup maps, since those not affected by
     # column changes should stay the same. These get removed when unneeded using other means.
@@ -319,12 +346,10 @@ class Table(object):
     if summary_table._summary_simple:
       @usertypes.formulaType(usertypes.Reference(summary_table.table_id))
       def _updateSummary(rec, table):  # pylint: disable=unused-argument
-        try:
-          # summary table output should be treated as we treat formula columns, for acl purposes
-          self._engine.user_actions.enter_indirection()
+        # summary table output should be treated as we treat formula columns, for acl purposes
+        with self._engine.user_actions.indirect_actions():
           return summary_table.lookupOrAddDerived(**{c: getattr(rec, c) for c in groupby_cols})
-        finally:
-          self._engine.user_actions.leave_indirection()
+
     else:
       @usertypes.formulaType(usertypes.ReferenceList(summary_table.table_id))
       def _updateSummary(rec, table):  # pylint: disable=unused-argument
@@ -333,8 +358,8 @@ class Table(object):
         lookup_values = []
         for group_col in groupby_cols:
           lookup_value = getattr(rec, group_col)
-          if isinstance(self.all_columns[group_col],
-                        (column.ChoiceListColumn, column.ReferenceListColumn)):
+          group_col_obj = self.all_columns[group_col]
+          if isinstance(group_col_obj, (column.ChoiceListColumn, column.ReferenceListColumn)):
             # Check that ChoiceList/ReferenceList cells have appropriate types.
             # Don't iterate over characters of a string.
             if isinstance(lookup_value, (six.binary_type, six.text_type)):
@@ -344,6 +369,13 @@ class Table(object):
               lookup_value = set(lookup_value)
             except TypeError:
               return []
+
+            if not lookup_value:
+              if isinstance(group_col_obj, column.ChoiceListColumn):
+                lookup_value = {""}
+              else:
+                lookup_value = {0}
+
           else:
             lookup_value = [lookup_value]
           lookup_values.append(lookup_value)
@@ -363,14 +395,11 @@ class Table(object):
             new_row_ids.append(None)
 
         if new_row_ids and not self._engine.is_triggered_by_table_action(summary_table.table_id):
-          try:
-            # summary table output should be treated as we treat formula columns, for acl purposes
-            self._engine.user_actions.enter_indirection()
+          # summary table output should be treated as we treat formula columns, for acl purposes
+          with self._engine.user_actions.indirect_actions():
             result += self._engine.user_actions.BulkAddRecord(
               summary_table.table_id, new_row_ids, values_to_add
             )
-          finally:
-            self._engine.user_actions.leave_indirection()
 
         return result
 
@@ -459,11 +488,11 @@ class Table(object):
     for col_id in sorted(kwargs):
       value = kwargs[col_id]
       if isinstance(value, lookup._Contains):
-        value = value.value
         # While users should use CONTAINS on lookup values,
         # the marker is moved to col_id so that the LookupMapColumn knows how to
         # update its index correctly for that column.
-        col_id = lookup._Contains(col_id)
+        col_id = value._replace(value=col_id)
+        value = value.value
       else:
         col = self.get_column(col_id)
         # Convert `value` to the correct type of rich value for that column
@@ -527,10 +556,14 @@ class Table(object):
       # _summary_source_table._summary_simple determines whether
       # the column named self._summary_helper_col_id is a single reference
       # or a reference list.
-      lookup_value = rec if self._summary_simple else lookup._Contains(rec)
-      return self._summary_source_table.lookup_records(**{
+      lookup_value = rec if self._summary_simple else functions.CONTAINS(rec)
+      result = self._summary_source_table.lookup_records(**{
         self._summary_helper_col_id: lookup_value
       })
+
+      # Remove rows with empty groups
+      self._engine.docmodel.setAutoRemove(rec, not result)
+      return result
     else:
       return None
 
@@ -591,8 +624,8 @@ class Table(object):
 
   # Called when record.foo is accessed
   def _get_col_value(self, col_id, row_id, relation):
-    [value] = self._get_col_subset(col_id, [row_id], relation)
-    return value
+    [value] = self._get_col_subset_raw(col_id, [row_id], relation)
+    return records.adjust_record(relation, value)
 
   def _attribute_error(self, col_id, relation):
     self._engine._use_node(self._new_columns_node, relation)
@@ -600,8 +633,28 @@ class Table(object):
 
   # Called when record_set.foo is accessed
   def _get_col_subset(self, col_id, row_ids, relation):
+    values = self._get_col_subset_raw(col_id, row_ids, relation)
+
+    # When all the values are the same type of Record (i.e. all references to the same table)
+    # combine them into a single RecordSet for that table instead of a list
+    # so that more attribute accesses can be chained,
+    # e.g. record_set.foo.bar where `foo` is a Reference column.
+    value_types = list(set(map(type, values)))
+    if len(value_types) == 1 and issubclass(value_types[0], records.Record):
+      return records.RecordSet(
+        values[0]._table,
+        # This is different from row_ids: these are the row IDs referenced by these Records,
+        # whereas row_ids are where the values were being stored.
+        [val._row_id for val in values],
+        relation.compose(values[0]._source_relation),
+      )
+    else:
+      return [records.adjust_record(relation, value) for value in values]
+
+  # Internal helper to optimise _get_col_value
+  # so that it doesn't make a singleton RecordSet just to immediately unpack it
+  def _get_col_subset_raw(self, col_id, row_ids, relation):
     col = self.all_columns[col_id]
     # creates a dependency and brings formula columns up-to-date.
     self._engine._use_node(col.node, relation, row_ids)
-    # TODO: when column is a reference, support property access in return value
-    return [records.adjust_record(relation, col.get_cell_value(row_id)) for row_id in row_ids]
+    return [col.get_cell_value(row_id) for row_id in row_ids]
