@@ -10,11 +10,11 @@ First, a note: I've had to make some changes for local development:
 
 ## Start development
 
-Use `npm run start` to setup a local dev server.
+Use `yarn start` to startup a dev server at <http://localhost:8484>.
 
 ## Modifications of the original software
 
-> These notes are necessary in order to comply with the Apache License 2.0 whcih states that modifications of the original software must be documented.
+> These notes are necessary in order to comply with the Apache License 2.0 which states that modifications of the original software must be documented.
 
 This fork of `grist-core` modifies the original software in the following ways:
 
