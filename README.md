@@ -12,15 +12,28 @@ First, a note: I've had to make some changes for local development:
 
 Use `yarn start` to startup a dev server at <http://localhost:8484>.
 
-## Modifications of the original software
-
-> These notes are necessary in order to comply with the Apache License 2.0 which states that modifications of the original software must be documented.
+## Our modifications of Grist
 
 This fork of `grist-core` modifies the original software in the following ways:
 
 - UI text is changed (from English to German)
 - elements that are connected to the commercial Grist product are removed (such as links to the pricing page of Grist)
 - color and branding changes
+
+### Keeping our fork in sync
+
+Grist is currently in very active development, so we need to make sure that we periodically update our fork to receive the latest patches and features.
+
+**Recommended workflow:**
+
+1. Make sure you have the upstream repository [configured as a remote](https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/working-with-forks/configuring-a-remote-for-a-fork). Then fetch it via `git fetch upstream`
+2. Create a new branch for the upstream sync: `git checkout -b chore/sync-with-upstream`
+3. Merge upstream into the new branch: `git merge upstream/{main|master}`
+4. Fix potential merge conflicts. Because we've made some adjustments, merge conflicts might occur. In that case you will have to decide on a per case basis, which changes will persist. We've mostly made changes to the UI texts (English -> German), so if a bigger upstream change affects the text rendering, we should probably accept the changes of upstream and update our text changes afterwards. The same goes for CSS: first accept the upstream changes and then replace the relevant parts with our updated CSS variable values again.
+
+> In the future we could improve some of our customization flow according to [Grist's recommendations](https://support.getgrist.com/self-managed/#customization). This won't work for text changes since text content is mostly hard-coded into Grist.
+
+---
 
 _Original README below:_
 
