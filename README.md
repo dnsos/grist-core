@@ -1,5 +1,7 @@
 ![](https://img.shields.io/badge/Built%20with%20%E2%9D%A4%EF%B8%8F-at%20Technologiestiftung%20Berlin-blue)
 
+> **Attention**: This fork was an experiment. We are not using it anymore and this repository is archived. 
+
 # Grist @ CityLAB Berlin
 
 First, a note: I've had to make some changes for local development:
