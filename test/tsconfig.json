@@ -1,14 +1,18 @@
 {
   "extends": "../buildtools/tsconfig-base.json",
   "include": [
+    "*",
     "**/*",
     "../app/server/declarations.d.ts",
     "../app/server/declarations/**/*.d.ts",
     "../stubs/app/server/declarations.d.ts",
     "../stubs/app/server/declarations/**/*.d.ts"
   ],
+  "files": [
+    "chai-as-promised.js"
+  ],
   "references": [
     { "path": "../app" },
-    { "path": "../stubs/app" },
+    { "path": "../stubs/app" }
   ]
 }

@@ -70,13 +70,14 @@
 import {ErrorWithCode} from 'app/common/ErrorWithCode';
 import {timeFormat} from 'app/common/timeFormat';
 import * as docUtils from 'app/server/lib/docUtils';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {fromCallback} from 'app/server/lib/serverUtils';
 
 import * as sqlite3 from '@gristlabs/sqlite3';
-import * as assert from 'assert';
+import assert from 'assert';
 import {each} from 'bluebird';
 import * as fse from 'fs-extra';
+import {RunResult} from 'sqlite3';
 import fromPairs = require('lodash/fromPairs');
 import isEqual = require('lodash/isEqual');
 import noop = require('lodash/noop');
@@ -132,7 +133,7 @@ export interface MigrationHooks {
  */
 export interface ISQLiteDB {
   exec(sql: string): Promise<void>;
-  run(sql: string, ...params: any[]): Promise<void>;
+  run(sql: string, ...params: any[]): Promise<RunResult>;
   get(sql: string, ...params: any[]): Promise<ResultRow|undefined>;
   all(sql: string, ...params: any[]): Promise<ResultRow[]>;
   prepare(sql: string, ...params: any[]): Promise<sqlite3.Statement>;
@@ -148,7 +149,7 @@ export interface ISQLiteDB {
  *    SQLiteDB.openDB(): Opens a DB, and initialize or migrate it to correct schema.
  *    db.execTransaction(cb): Runs a callback in the context of a new DB transaction.
  */
-export class SQLiteDB {
+export class SQLiteDB implements ISQLiteDB {
   /**
    * Opens a database or creates a new one, according to OpenMode enum. The schemaInfo specifies
    * how to initialize a new database, and how to migrate an existing one from an older version.
@@ -165,7 +166,7 @@ export class SQLiteDB {
 
     // It's possible that userVersion is 0 for a non-empty DB if it was created without this
     // module. In that case, we apply migrations starting with the first one.
-    if (userVersion === 0 && (await isEmpty(db))) {
+    if (userVersion === 0 && (await isGristEmpty(db))) {
       await db._initNewDB(schemaInfo);
     } else if (mode === OpenMode.CREATE_EXCL) {
       await db.close();
@@ -202,7 +203,7 @@ export class SQLiteDB {
 
     let _db: sqlite3.Database;
     await fromCallback(cb => { _db = new sqlite3.Database(dbPath, sqliteMode, cb); });
-
+    limitAttach(_db!, 0);  // Outside of VACUUM, we don't allow ATTACH.
     if (SQLiteDB._addOpens(dbPath, 1) > 1) {
       log.warn("SQLiteDB[%s] avoid opening same DB more than once", dbPath);
     }
@@ -288,8 +289,17 @@ export class SQLiteDB {
     return fromCallback(cb => this._db.exec(sql, cb));
   }
 
-  public run(sql: string, ...params: any[]): Promise<void> {
-    return fromCallback(cb => this._db.run(sql, ...params, cb));
+  public run(sql: string, ...params: any[]): Promise<RunResult> {
+    return new Promise((resolve, reject) => {
+      function callback(this: RunResult, err: Error | null) {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(this);
+        }
+      }
+      this._db.run(sql, ...params, callback);
+    });
   }
 
   public get(sql: string, ...params: any[]): Promise<ResultRow|undefined> {
@@ -319,10 +329,19 @@ export class SQLiteDB {
       this._needVacuum = true;
       return false;
     }
-    await this.exec("VACUUM");
+    await this.vacuum();
     log.info("SQLiteDB[%s]: DB VACUUMed", this._dbPath);
     this._needVacuum = false;
     return true;
+  }
+
+  public async vacuum(): Promise<void> {
+    limitAttach(this._db, 1);  // VACUUM implementation uses ATTACH.
+    try {
+      await this.exec("VACUUM");
+    } finally {
+      limitAttach(this._db, 0);  // Outside of VACUUM, we don't allow ATTACH.
+    }
   }
 
   /**
@@ -330,11 +349,19 @@ export class SQLiteDB {
    * to db.run, e.g. [sqlString, [params...]].
    */
   public runEach(...statements: Array<string | [string, any[]]>): Promise<void> {
-    return each(statements, (stmt: any) => {
-      return (Array.isArray(stmt) ? this.run(stmt[0], ...stmt[1]) :
-              this.exec(stmt))
-        .catch(err => { log.warn(`SQLiteDB: Failed to run ${stmt}`); throw err; });
-    });
+    return each(statements,
+      async (stmt: any) => {
+        try {
+          return await (Array.isArray(stmt) ?
+              this.run(stmt[0], ...stmt[1]) :
+              this.exec(stmt)
+          );
+        } catch (err) {
+          log.warn(`SQLiteDB: Failed to run ${stmt}`);
+          throw err;
+        }
+      }
+    );
   }
 
   public close(): Promise<void> {
@@ -347,16 +374,9 @@ export class SQLiteDB {
    * is sqlite's rowid for the last insert made on this database connection. This method
    * is only useful if the sql is actually an INSERT operation, but we don't check this.
    */
-  public runAndGetId(sql: string, ...params: any[]): Promise<number> {
-    return new Promise<number>((resolve, reject) => {
-      this._db.run(sql, ...params, function(this: any, err: any) {
-        if (err) {
-          reject(err);
-        } else {
-          resolve(this.lastID);
-        }
-      });
-    });
+  public async runAndGetId(sql: string, ...params: any[]): Promise<number> {
+    const result = await this.run(sql, ...params);
+    return result.lastID;
   }
 
   /**
@@ -480,7 +500,7 @@ export class SQLiteDB {
         });
         success = true;
         // After a migration, reduce the sqlite file size. This must be run outside a transaction.
-        await this.run("VACUUM");
+        await this.vacuum();
 
         log.info("SQLiteDB[%s]: DB backed up to %s, migrated to %s",
           this._dbPath, backupPath, targetVer);
@@ -517,15 +537,15 @@ export class SQLiteDB {
 // dummy DB, and we use it to do sanity checking, in particular after migrations. To avoid
 // creating dummy DBs multiple times, the result is cached, keyed by the "create" function itself.
 const dbMetadataCache: Map<DBFunc, DBMetadata> = new Map();
-interface DBMetadata {
+export interface DBMetadata {
   [tableName: string]: {
     [colName: string]: string;      // Maps column name to SQLite type, e.g. "TEXT".
   };
 }
 
-// Helper to see if a database is empty.
-async function isEmpty(db: SQLiteDB): Promise<boolean> {
-  return (await db.get("SELECT count(*) as count FROM sqlite_master"))!.count === 0;
+// Helper to see if a database is empty of grist metadata tables.
+async function isGristEmpty(db: SQLiteDB): Promise<boolean> {
+  return (await db.get("SELECT count(*) as count FROM sqlite_master WHERE name LIKE '_grist%'"))!.count === 0;
 }
 
 /**
@@ -546,4 +566,13 @@ async function createBackupFile(filePath: string, versionNum: number): Promise<s
 export function quoteIdent(ident: string): string {
   assert(/^[\w.]+$/.test(ident), `SQL identifier is not valid: ${ident}`);
   return `"${ident}"`;
+}
+
+/**
+ * Limit the number of ATTACHed databases permitted.
+ */
+export function limitAttach(db: sqlite3.Database, maxAttach: number) {
+  // Pardon the casts, types are out of date.
+  const SQLITE_LIMIT_ATTACHED = (sqlite3 as any).LIMIT_ATTACHED;
+  (db as any).configure('limit', SQLITE_LIMIT_ATTACHED, maxAttach);
 }

@@ -30,6 +30,10 @@ declare module "redis" {
   class RedisClient {
     public eval(args: any[], callback?: (err: Error | null, res: any) => void): any;
 
+    public subscribe(channel: string): void;
+    public on(eventType: string, callback: (...args: any[]) => void): void;
+    public publishAsync(channel: string, message: string): Promise<number>;
+
     public delAsync(key: string): Promise<'OK'>;
     public flushdbAsync(): Promise<void>;
     public getAsync(key: string): Promise<string|null>;
@@ -66,10 +70,13 @@ declare module "redis" {
     public sadd(key: string, val: string): Multi;
     public set(key: string, val: string): Multi;
     public setex(key: string, ttl: number, val: string): Multi;
+    public ttl(key: string): Multi;
     public smembers(key: string): Multi;
     public srandmember(key: string): Multi;
     public srem(key: string, val: string): Multi;
     public rpush(key: string, ...vals: string[]): Multi;
     public ltrim(key: string, start: number, end: number): Multi;
+    public incr(key: string): Multi;
+    public expire(key: string, seconds: number): Multi;
   }
 }

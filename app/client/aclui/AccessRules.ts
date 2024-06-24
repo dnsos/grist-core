@@ -12,7 +12,7 @@ import {TableData} from 'app/client/models/TableData';
 import {shadowScroll} from 'app/client/ui/shadowScroll';
 import {bigBasicButton, bigPrimaryButton} from 'app/client/ui2018/buttons';
 import {squareCheckbox} from 'app/client/ui2018/checkbox';
-import {colors, testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
 import {textInput} from 'app/client/ui2018/editableLabel';
 import {cssIconButton, icon} from 'app/client/ui2018/icons';
 import {menu, menuItemAsync} from 'app/client/ui2018/menus';
@@ -26,6 +26,7 @@ import {
   summarizePermissionSet
 } from 'app/common/ACLPermissions';
 import {ACLRuleCollection, SPECIAL_RULES_TABLE_ID} from 'app/common/ACLRuleCollection';
+import {AclTableDescription, getTableTitle} from 'app/common/ActiveDocAPI';
 import {BulkColValues, getColValues, RowRecord, UserAction} from 'app/common/DocActions';
 import {
   FormulaProperties,
@@ -35,7 +36,7 @@ import {
   UserAttributeRule
 } from 'app/common/GranularAccessClause';
 import {isHiddenCol} from 'app/common/gristTypes';
-import {isObject} from 'app/common/gutil';
+import {isNonNullish} from 'app/common/gutil';
 import {SchemaTypes} from 'app/common/schema';
 import {MetaRowRecord} from 'app/common/TableData';
 import {
@@ -108,8 +109,8 @@ export class AccessRules extends Disposable {
   // Error or warning message to show next to Save/Reset buttons if non-empty.
   private _errorMessage = Observable.create(this, '');
 
-  // Map of tableId to the list of columns for all tables in the document.
-  private _aclResources: {[tableId: string]: string[]} = {};
+  // Map of tableId to basic metadata for all tables in the document.
+  private _aclResources = new Map<string, AclTableDescription>();
 
   private _aclUsersPopup = ACLUsersPopup.create(this);
 
@@ -168,9 +169,15 @@ export class AccessRules extends Disposable {
     this.update().catch((e) => this._errorMessage.set(e.message));
   }
 
-  public get allTableIds() { return Object.keys(this._aclResources).sort(); }
+  public get allTableIds() { return Array.from(this._aclResources.keys()).sort(); }
   public get userAttrRules() { return this._userAttrRules; }
   public get userAttrChoices() { return this._userAttrChoices; }
+
+  public getTableTitle(tableId: string) {
+    const table = this._aclResources.get(tableId);
+    if (!table) { return `#Invalid (${tableId})`; }
+    return getTableTitle(table);
+  }
 
   /**
    * Replace internal state from the rules in DocData.
@@ -180,11 +187,12 @@ export class AccessRules extends Disposable {
     this._errorMessage.set('');
     const rules = this._ruleCollection;
 
-    [ , , this._aclResources] = await Promise.all([
+    const [ , , aclResources] = await Promise.all([
       rules.update(this._gristDoc.docData, {log: console}),
       this._updateDocAccessData(),
       this._gristDoc.docComm.getAclResources(),
     ]);
+    this._aclResources = new Map(Object.entries(aclResources));
     if (this.isDisposed()) { return; }
 
     this._tableRules.set(
@@ -328,7 +336,7 @@ export class AccessRules extends Disposable {
               // Add the table on a timeout, to avoid disabling the clicked menu item
               // synchronously, which prevents the menu from closing on click.
               menuItemAsync(() => this._addTableRules(tableId),
-                tableId,
+                this.getTableTitle(tableId),
                 dom.cls('disabled', (use) => use(this._tableRules).some(t => t.tableId === tableId)),
               )
             ),
@@ -416,7 +424,7 @@ export class AccessRules extends Disposable {
   // Returns '' if valid, or an error string if not. Exempt colIds will not trigger an error.
   public checkTableColumns(tableId: string, colIds?: string[], exemptColIds?: string[]): string {
     if (!tableId || tableId === SPECIAL_RULES_TABLE_ID) { return ''; }
-    const tableColIds = this._aclResources[tableId];
+    const tableColIds = this._aclResources.get(tableId)?.colIds;
     if (!tableColIds) { return `Invalid table: ${tableId}`; }
     if (colIds) {
       const validColIds = new Set([...tableColIds, ...exemptColIds || []]);
@@ -429,7 +437,7 @@ export class AccessRules extends Disposable {
 
   // Returns a list of valid colIds for the given table, or undefined if the table isn't valid.
   public getValidColIds(tableId: string): string[]|undefined {
-    return this._aclResources[tableId]?.filter(id => !isHiddenCol(id)).sort();
+    return this._aclResources.get(tableId)?.colIds.filter(id => !isHiddenCol(id)).sort();
   }
 
   private _addTableRules(tableId: string) {
@@ -512,7 +520,7 @@ class TableRules extends Disposable {
   public buildDom() {
     return cssSection(
       cssSectionHeading(
-        dom('span', 'Rules for table ', cssTableName(this.tableId)),
+        dom('span', 'Rules for table ', cssTableName(this._accessRules.getTableTitle(this.tableId))),
         cssIconButton(icon('Dots'), {style: 'margin-left: auto'},
           menu(() => [
             menuItemAsync(() => this._addColumnRuleSet(), 'Add Column Rule'),
@@ -1055,8 +1063,14 @@ class ObsUserAttributeRule extends Disposable {
             testId('rule-userattr-attr'),
           ),
           cssCell1(
-            aclSelect(this._tableId, this._accessRules.allTableIds,
-              {defaultLabel: '[Select Table]'}),
+            aclSelect(
+              this._tableId,
+              this._accessRules.allTableIds.map(tableId => ({
+                value: tableId,
+                label: this._accessRules.getTableTitle(tableId),
+              })),
+              {defaultLabel: '[Select Table]'},
+            ),
             testId('rule-userattr-table'),
           ),
           cssCell1(
@@ -1331,7 +1345,7 @@ function syncRecords(tableData: TableData, newRecords: RowRecord[],
     const newRec = newRecordMap.get(uniqueId(r));
     const updated = newRec && {...r, ...newRec, id: r.id};
     return updated && !isEqual(updated, r) ? [r, updated] : null;
-  }).filter(isObject);
+  }).filter(isNonNullish);
 
   console.log("syncRecords: removing [%s], adding [%s], updating [%s]",
     removedRecords.map(uniqueId).join(", "),
@@ -1431,45 +1445,50 @@ const cssSectionHeading = styled('div', `
   align-items: center;
   margin-bottom: 8px;
   font-weight: bold;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 
 const cssTableName = styled('span', `
-  color: ${colors.dark};
+  color: ${theme.text};
 `);
 
 const cssInput = styled(textInput, `
+  color: ${theme.inputFg};
+  background-color: ${theme.inputBg};
   width: 100%;
   border: 1px solid transparent;
   cursor: pointer;
 
   &:hover {
-    border: 1px solid ${colors.darkGrey};
+    border: 1px solid ${theme.inputBorder};
   }
   &:focus {
-    box-shadow: inset 0 0 0 1px ${colors.cursor};
-    border-color: ${colors.cursor};
+    box-shadow: inset 0 0 0 1px ${theme.controlFg};
+    border-color: ${theme.controlFg};
     cursor: unset;
   }
   &[disabled] {
-    color: ${colors.dark};
-    background-color: ${colors.mediumGreyOpaque};
+    color: ${theme.inputDisabledFg};
+    background-color: ${theme.inputDisabledBg};
     box-shadow: unset;
     border-color: transparent;
+  }
+  &::placeholder {
+    color: ${theme.inputPlaceholderFg};
   }
 `);
 
 const cssConditionError = styled('div', `
   margin-top: 4px;
   width: 100%;
-  color: ${colors.error};
+  color: ${theme.errorText};
 `);
 
 /**
  * Fairly general table styles.
  */
 const cssTableRounded = styled('div', `
-  border: 1px solid ${colors.slate};
+  border: 1px solid ${theme.accessRulesTableBorder};
   border-radius: 8px;
   overflow: hidden;
 `);
@@ -1477,7 +1496,7 @@ const cssTableRounded = styled('div', `
 // Row with a border
 const cssTableRow = styled('div', `
   display: flex;
-  border-bottom: 1px solid ${colors.slate};
+  border-bottom: 1px solid ${theme.accessRulesTableBorder};
   &:last-child {
     border-bottom: none;
   }
@@ -1485,8 +1504,8 @@ const cssTableRow = styled('div', `
 
 // Darker table header
 const cssTableHeaderRow = styled(cssTableRow, `
-  background-color: ${colors.mediumGrey};
-  color: ${colors.dark};
+  background-color: ${theme.accessRulesTableHeaderBg};
+  color: ${theme.accessRulesTableHeaderFg};
 `);
 
 // Cell for table column header.
@@ -1503,7 +1522,7 @@ const cssCell = styled('div', `
   overflow: hidden;
 
   &-rborder {
-    border-right: 1px solid ${colors.slate};
+    border-right: 1px solid ${theme.accessRulesTableBorder};
   }
   &-center {
     text-align: center;
@@ -1537,6 +1556,7 @@ const cssRuleBody = styled('div', `
 `);
 
 const cssRuleDescription = styled('div', `
+  color: ${theme.text};
   display: flex;
   align-items: center;
   margin: 16px 0 8px 0;
@@ -1554,6 +1574,6 @@ const cssCenterContent = styled('div', `
 `);
 
 const cssDefaultLabel = styled('div', `
-  color: ${colors.slate};
+  color: ${theme.accessRulesTableBodyFg};
   font-weight: bold;
 `);

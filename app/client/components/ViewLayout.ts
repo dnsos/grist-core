@@ -1,4 +1,4 @@
-import * as BaseView from 'app/client/components/BaseView';
+import BaseView from 'app/client/components/BaseView';
 import {ChartView} from 'app/client/components/ChartView';
 import * as commands from 'app/client/components/commands';
 import {CustomView} from 'app/client/components/CustomView';
@@ -14,15 +14,15 @@ import {ViewRec, ViewSectionRec} from 'app/client/models/DocModel';
 import {reportError} from 'app/client/models/errors';
 import {filterBar} from 'app/client/ui/FilterBar';
 import {viewSectionMenu} from 'app/client/ui/ViewSectionMenu';
-import {colors, mediaSmall, testId} from 'app/client/ui2018/cssVars';
-import {editableLabel} from 'app/client/ui2018/editableLabel';
+import {buildWidgetTitle} from 'app/client/ui/WidgetTitle';
+import {mediaSmall, testId, theme} from 'app/client/ui2018/cssVars';
+import {icon} from 'app/client/ui2018/icons';
 import {DisposableWithEvents} from 'app/common/DisposableWithEvents';
 import {mod} from 'app/common/gutil';
-import {computedArray, Disposable, dom, fromKo, Holder, IDomComponent, styled, subscribe} from 'grainjs';
 import {Observable} from 'grainjs';
 import * as ko from 'knockout';
 import * as _ from 'underscore';
-import {icon} from 'app/client/ui2018/icons';
+import {computedArray, Disposable, dom, fromKo, Holder, IDomComponent, styled, subscribe} from 'grainjs';
 
 // tslint:disable:no-console
 
@@ -166,10 +166,10 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
   // Freezes the layout until the passed in promise resolves. This is useful to achieve a single
   // layout rebuild when multiple user actions needs to apply, simply pass in a promise that resolves
   // when all user actions have resolved.
-  public async freezeUntil(promise: Promise<unknown>): Promise<void> {
+  public async freezeUntil<T>(promise: Promise<T>): Promise<T> {
     this._freeze = true;
     try {
-      await promise;
+      return await promise;
     } finally {
       this._freeze = false;
       this._rebuildLayout(this.layoutSpec.peek());
@@ -183,7 +183,12 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
   }
 
   private _buildLeafContent(sectionRowId: number) {
-    return buildViewSectionDom(this.gristDoc, sectionRowId, this._isResizing, this.viewModel);
+    return buildViewSectionDom({
+       gristDoc: this.gristDoc,
+       sectionRowId,
+       isResizing: this._isResizing,
+       viewModel: this.viewModel
+    });
   }
 
   /**
@@ -264,10 +269,73 @@ export class ViewLayout extends DisposableWithEvents implements IDomComponent {
   }
 }
 
+export function buildViewSectionDom(options: {
+  gristDoc: GristDoc,
+  sectionRowId: number,
+  isResizing?: Observable<boolean>
+  viewModel?: ViewRec,
+  // Should show drag anchor.
+  draggable?: boolean, /* defaults to true */
+  // Should show green bar on the left (but preserves active-section class).
+  focusable?: boolean, /* defaults to true */
+  tableNameHidden?: boolean,
+  widgetNameHidden?: boolean,
+}) {
+  const isResizing = options.isResizing ?? Observable.create(null, false);
+  const {gristDoc, sectionRowId, viewModel, draggable = true, focusable = true} = options;
+
+  // Creating normal section dom
+  const vs: ViewSectionRec = gristDoc.docModel.viewSections.getRowModel(sectionRowId);
+  return dom('div.view_leaf.viewsection_content.flexvbox.flexauto',
+    testId(`viewlayout-section-${sectionRowId}`),
+    !options.isResizing ? dom.autoDispose(isResizing) : null,
+    cssViewLeaf.cls(''),
+    cssViewLeafInactive.cls('', (use) => !vs.isDisposed() && !use(vs.hasFocus)),
+    dom.cls('active_section', vs.hasFocus),
+    dom.cls('active_section--no-indicator', !focusable),
+    dom.maybe<BaseView|null>((use) => use(vs.viewInstance), (viewInstance) => dom('div.viewsection_title.flexhbox',
+      dom('span.viewsection_drag_indicator.glyphicon.glyphicon-option-vertical',
+        // Makes element grabbable only if grist is not readonly.
+        dom.cls('layout_grabbable', (use) => !use(gristDoc.isReadonlyKo)),
+        !draggable ? dom.style("visibility", "hidden") : null
+      ),
+      dom.maybe((use) => use(use(viewInstance.viewSection.table).summarySourceTable), () =>
+        cssSigmaIcon('Pivot', testId('sigma'))),
+      buildWidgetTitle(vs, options, testId('viewsection-title'), cssTestClick(testId("viewsection-blank"))),
+      viewInstance.buildTitleControls(),
+      dom('span.viewsection_buttons',
+        dom.create(viewSectionMenu, gristDoc.docModel, vs, gristDoc.isReadonly)
+      )
+     )),
+    dom.maybe((use) => use(vs.activeFilterBar) || use(vs.isRaw) && use(vs.activeFilters).length,
+      () => dom.create(filterBar, vs)),
+    dom.maybe<BaseView|null>(vs.viewInstance, (viewInstance) =>
+      dom('div.view_data_pane_container.flexvbox',
+        cssResizing.cls('', isResizing),
+        dom.maybe(viewInstance.disableEditing, () =>
+          dom('div.disable_viewpane.flexvbox', 'No data')
+        ),
+        dom.maybe(viewInstance.isTruncated, () =>
+          dom('div.viewsection_truncated', 'Not all data is shown')
+        ),
+        dom.cls((use) => 'viewsection_type_' + use(vs.parentKey)),
+        viewInstance.viewPane
+      )
+    ),
+    dom.on('mousedown', () => { viewModel?.activeSectionId(sectionRowId); }),
+  );
+}
+
+// With new widgetPopup it is hard to click on viewSection without a activating it, hence we
+// add a little blank space to use in test.
+const cssTestClick = styled(`div`, `
+  min-width: 2px;
+`);
+
 const cssSigmaIcon = styled(icon, `
   bottom: 1px;
   margin-right: 5px;
-  background-color: ${colors.slate}
+  background-color: ${theme.lightText}
 `);
 
 const cssViewLeaf = styled('div', `
@@ -284,12 +352,12 @@ const cssViewLeafInactive = styled('div', `
       overflow: hidden;
       background: repeating-linear-gradient(
         -45deg,
-        ${colors.mediumGreyOpaque},
-        ${colors.mediumGreyOpaque} 10px,
-        ${colors.lightGrey} 10px,
-        ${colors.lightGrey} 20px
+        ${theme.widgetInactiveStripesDark},
+        ${theme.widgetInactiveStripesDark} 10px,
+        ${theme.widgetInactiveStripesLight} 10px,
+        ${theme.widgetInactiveStripesLight} 20px
       );
-      border: 1px solid ${colors.darkGrey};
+      border: 1px solid ${theme.widgetBorder};
       border-radius: 4px;
       padding: 0 2px;
     }
@@ -354,56 +422,3 @@ const cssLayoutBox = styled('div', `
 const cssResizing = styled('div', `
   pointer-events: none;
 `);
-
-
-export function buildViewSectionDom(
-  gristDoc: GristDoc,
-  sectionRowId: number,
-  isResizing: Observable<boolean> = Observable.create(null, false),
-  viewModel?: ViewRec,
-) {
-  // Creating normal section dom
-  const vs: ViewSectionRec = gristDoc.docModel.viewSections.getRowModel(sectionRowId);
-  return dom('div.view_leaf.viewsection_content.flexvbox.flexauto',
-    testId(`viewlayout-section-${sectionRowId}`),
-
-    cssViewLeaf.cls(''),
-    cssViewLeafInactive.cls('', (use) => !vs.isDisposed() && !use(vs.hasFocus)),
-    dom.cls('active_section', vs.hasFocus),
-
-    dom.maybe<BaseView|null>((use) => use(vs.viewInstance), (viewInstance) => dom('div.viewsection_title.flexhbox',
-      dom('span.viewsection_drag_indicator.glyphicon.glyphicon-option-vertical',
-        // Makes element grabbable only if grist is not readonly.
-        dom.cls('layout_grabbable', (use) => !use(gristDoc.isReadonlyKo))),
-      dom.maybe((use) => use(use(viewInstance.viewSection.table).summarySourceTable), () =>
-        cssSigmaIcon('Pivot', testId('sigma'))),
-      dom('div.viewsection_titletext_container.flexitem.flexhbox',
-        dom('span.viewsection_titletext', editableLabel(
-          fromKo(vs.titleDef),
-          (val) => vs.titleDef.saveOnly(val),
-          testId('viewsection-title'),
-        )),
-      ),
-      viewInstance.buildTitleControls(),
-      dom('span.viewsection_buttons',
-        dom.create(viewSectionMenu, gristDoc.docModel, vs, gristDoc.isReadonly)
-      )
-     )),
-    dom.maybe((use) => use(vs.activeFilterBar) || use(vs.isRaw) && use(vs.activeFilters).length,
-      () => dom.create(filterBar, vs)),
-    dom.maybe<BaseView|null>(vs.viewInstance, (viewInstance) =>
-      dom('div.view_data_pane_container.flexvbox',
-        cssResizing.cls('', isResizing),
-        dom.maybe(viewInstance.disableEditing, () =>
-          dom('div.disable_viewpane.flexvbox', 'No data')
-        ),
-        dom.maybe(viewInstance.isTruncated, () =>
-          dom('div.viewsection_truncated', 'Not all data is shown')
-        ),
-        dom.cls((use) => 'viewsection_type_' + use(vs.parentKey)),
-        viewInstance.viewPane
-      )
-    ),
-    dom.on('mousedown', () => { viewModel?.activeSectionId(sectionRowId); }),
-  );
-}

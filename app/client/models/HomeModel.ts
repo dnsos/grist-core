@@ -13,7 +13,7 @@ import {SortPref, UserOrgPrefs, ViewPref} from 'app/common/Prefs';
 import * as roles from 'app/common/roles';
 import {Document, Organization, Workspace} from 'app/common/UserAPI';
 import {bundleChanges, Computed, Disposable, Observable, subscribe} from 'grainjs';
-import * as moment from 'moment';
+import moment from 'moment';
 import flatten = require('lodash/flatten');
 import sortBy = require('lodash/sortBy');
 
@@ -150,10 +150,9 @@ export class HomeModelImpl extends Disposable implements HomeModel, ViewSettings
     return destWS && roles.canEdit(destWS.access) ? destWS : null;
   });
 
-  // Whether to show intro: no docs (other than examples) and user may create docs.
+  // Whether to show intro: no docs (other than examples).
   public readonly showIntro = Computed.create(this, this.workspaces, (use, wss) => (
-    wss.every((ws) => ws.isSupportWorkspace || ws.docs.length === 0) &&
-    Boolean(use(this.newDocWorkspace))));
+    wss.every((ws) => ws.isSupportWorkspace || ws.docs.length === 0)));
 
   private _userOrgPrefs = Observable.create<UserOrgPrefs|undefined>(this, this._app.currentOrg?.userOrgPrefs);
 
@@ -187,6 +186,8 @@ export class HomeModelImpl extends Disposable implements HomeModel, ViewSettings
       clientScope);
     const importSources = ImportSourceElement.fromArray(pluginManager.pluginsList);
     this.importSources.set(importSources);
+
+    this._app.refreshOrgUsage().catch(reportError);
   }
 
   // Accessor for the AppModel containing this HomeModel.

@@ -4,18 +4,26 @@ import { ActionGroup } from 'app/common/ActionGroup';
 import { createEmptyActionSummary } from 'app/common/ActionSummary';
 import { ServerQuery } from 'app/common/ActiveDocAPI';
 import { ApiError } from 'app/common/ApiError';
-import { AddRecord, BulkAddRecord, BulkColValues, BulkRemoveRecord, BulkUpdateRecord } from 'app/common/DocActions';
+import {
+  AddRecord,
+  BulkAddRecord,
+  BulkColValues,
+  BulkRemoveRecord,
+  BulkUpdateRecord,
+} from 'app/common/DocActions';
 import { RemoveRecord, ReplaceTableData, UpdateRecord } from 'app/common/DocActions';
 import { CellValue, ColValues, DocAction, getTableId, isSchemaAction } from 'app/common/DocActions';
 import { TableDataAction, UserAction } from 'app/common/DocActions';
 import { DocData } from 'app/common/DocData';
 import { UserOverride } from 'app/common/DocListAPI';
+import { DocUsageSummary, FilteredDocUsageSummary } from 'app/common/DocUsage';
 import { normalizeEmail } from 'app/common/emails';
 import { ErrorWithCode } from 'app/common/ErrorWithCode';
 import { AclMatchInput, InfoEditor, InfoView } from 'app/common/GranularAccessClause';
 import { UserInfo } from 'app/common/GranularAccessClause';
-import { isCensored } from 'app/common/gristTypes';
-import { getSetMapValue, isObject, pruneArray } from 'app/common/gutil';
+import * as gristTypes from 'app/common/gristTypes';
+import { getSetMapValue, isNonNullish, pruneArray } from 'app/common/gutil';
+import { SingleCell } from 'app/common/TableData';
 import { canEdit, canView, isValidRole, Role } from 'app/common/roles';
 import { FullUser, UserAccessData } from 'app/common/UserAPI';
 import { HomeDBManager } from 'app/gen-server/lib/HomeDBManager';
@@ -24,7 +32,8 @@ import { compileAclFormula } from 'app/server/lib/ACLFormula';
 import { DocClients } from 'app/server/lib/DocClients';
 import { getDocSessionAccess, getDocSessionAltSessionId, getDocSessionUser,
          OptDocSession } from 'app/server/lib/DocSession';
-import * as log from 'app/server/lib/log';
+import { DocStorage } from 'app/server/lib/DocStorage';
+import log from 'app/server/lib/log';
 import { IPermissionInfo, PermissionInfo, PermissionSetWithContext } from 'app/server/lib/PermissionInfo';
 import { TablePermissionSetWithContext } from 'app/server/lib/PermissionInfo';
 import { integerParam } from 'app/server/lib/requestUtils';
@@ -99,7 +108,13 @@ const SURPRISING_ACTIONS = new Set([
                                    ]);
 
 // Actions we'll allow unconditionally for now.
-const OK_ACTIONS = new Set(['Calculate']);
+const OK_ACTIONS = new Set(['Calculate', 'UpdateCurrentTime']);
+
+interface DocUpdateMessage {
+  actionGroup: ActionGroup;
+  docActions: DocAction[];
+  docUsage: DocUsageSummary;
+}
 
 /**
  * Granular access for a single bundle, in different phases.
@@ -108,7 +123,7 @@ export interface GranularAccessForBundle {
   canApplyBundle(): Promise<void>;
   appliedBundle(): Promise<void>;
   finishedBundle(): Promise<void>;
-  sendDocUpdateForBundle(actionGroup: ActionGroup): Promise<void>;
+  sendDocUpdateForBundle(actionGroup: ActionGroup, docUsage: DocUsageSummary): Promise<void>;
 }
 
 /**
@@ -174,6 +189,7 @@ export class GranularAccess implements GranularAccessForBundle {
 
   public constructor(
     private _docData: DocData,
+    private _docStorage: DocStorage,
     private _docClients: DocClients,
     private _fetchQueryFromDB: (query: ServerQuery) => Promise<TableDataAction>,
     private _recoveryMode: boolean,
@@ -227,6 +243,57 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
+   * Get content of a given cell, if user has read access.
+   * Throws if not.
+   */
+  public async getCellValue(docSession: OptDocSession, cell: SingleCell): Promise<CellValue> {
+    function fail(): never {
+      throw new ErrorWithCode('ACL_DENY', 'Cannot access cell');
+    }
+    const pset = await this.getTableAccess(docSession, cell.tableId);
+    const tableAccess = this.getReadPermission(pset);
+    if (tableAccess === 'deny') { fail(); }
+    const rows = await this._fetchQueryFromDB({
+      tableId: cell.tableId,
+      filters: { id: [cell.rowId] }
+    });
+    if (!rows || rows[2].length === 0) { fail(); }
+    const rec = new RecordView(rows, 0);
+    const input: AclMatchInput = {user: await this._getUser(docSession), rec, newRec: rec};
+    const rowPermInfo = new PermissionInfo(this._ruler.ruleCollection, input);
+    const rowAccess = rowPermInfo.getTableAccess(cell.tableId).perms.read;
+    if (rowAccess === 'deny') { fail(); }
+    if (rowAccess !== 'allow') {
+      const colAccess = rowPermInfo.getColumnAccess(cell.tableId, cell.colId).perms.read;
+      if (colAccess === 'deny') { fail(); }
+    }
+    const colValues = rows[3];
+    if (!(cell.colId in colValues)) { fail(); }
+    return rec.get(cell.colId);
+  }
+
+  /**
+   * Checks whether the specified cell is accessible by the user, and contains
+   * the specified attachment. Throws with ACL_DENY code if not.
+   */
+  public async assertAttachmentAccess(docSession: OptDocSession, cell: SingleCell, attId: number): Promise<void> {
+    const value = await this.getCellValue(docSession, cell);
+
+    // Need to check column is actually an attachment column.
+    if (this._docStorage.getColumnType(cell.tableId, cell.colId) !== 'Attachments') {
+      throw new ErrorWithCode('ACL_DENY', 'not an attachment column');
+    }
+
+    // Check that material in cell includes the attachment.
+    if (!gristTypes.isList(value)) {
+      throw new ErrorWithCode('ACL_DENY', 'not a list');
+    }
+    if (value.indexOf(attId) <= 0) {
+      throw new ErrorWithCode('ACL_DENY', 'attachment not present in cell');
+    }
+  }
+
+  /**
    * Called after UserAction[]s have been applied in the sandbox, and DocAction[]s have been
    * computed, but before we have committed those DocAction[]s to the database.  If this
    * throws an exception, the sandbox changes will be reverted.
@@ -244,7 +311,7 @@ export class GranularAccess implements GranularAccessForBundle {
     // An alternative to this check would be to sandwich user-defined access rules
     // between some defaults.  Currently the defaults have lower priority than
     // user-defined access rules.
-    if (!canEdit(await this._getNominalAccess(docSession))) {
+    if (!canEdit(await this.getNominalAccess(docSession))) {
       throw new ErrorWithCode('ACL_DENY', 'Only owners or editors can modify documents');
     }
     if (this._ruler.haveRules()) {
@@ -362,10 +429,13 @@ export class GranularAccess implements GranularAccessForBundle {
   /**
    * Filter an ActionGroup to be sent to a client.
    */
-  public async filterActionGroup(docSession: OptDocSession, actionGroup: ActionGroup): Promise<ActionGroup> {
-    if (await this.allowActionGroup(docSession, actionGroup)) { return actionGroup; }
+  public async filterActionGroup(
+    docSession: OptDocSession,
+    actionGroup: ActionGroup,
+    options: {role?: Role | null} = {}
+  ): Promise<ActionGroup> {
+    if (await this.allowActionGroup(docSession, actionGroup, options)) { return actionGroup; }
     // For now, if there's any nuance at all, suppress the summary and description.
-    // TODO: create an empty action summary, to be sure not to leak anything important.
     const result: ActionGroup = { ...actionGroup };
     result.actionSummary = createEmptyActionSummary();
     result.desc = '';
@@ -376,8 +446,33 @@ export class GranularAccess implements GranularAccessForBundle {
    * Check whether an ActionGroup can be sent to the client.  TODO: in future, we'll want
    * to filter acceptable parts of ActionGroup, rather than denying entirely.
    */
-  public async allowActionGroup(docSession: OptDocSession, actionGroup: ActionGroup): Promise<boolean> {
-    return this.canReadEverything(docSession);
+  public async allowActionGroup(
+    docSession: OptDocSession,
+    _actionGroup: ActionGroup,
+    options: {role?: Role | null} = {}
+  ): Promise<boolean> {
+    return this.canReadEverything(docSession, options);
+  }
+
+  /**
+   * Filter DocUsageSummary to be sent to a client.
+   */
+  public async filterDocUsageSummary(
+    docSession: OptDocSession,
+    docUsage: DocUsageSummary,
+    options: {role?: Role | null} = {}
+  ): Promise<FilteredDocUsageSummary> {
+    const result: FilteredDocUsageSummary = { ...docUsage };
+    const role = options.role ?? await this.getNominalAccess(docSession);
+    const hasEditRole = canEdit(role);
+    if (!hasEditRole) { result.dataLimitStatus = null; }
+    const hasFullReadAccess = await this.canReadEverything(docSession);
+    if (!hasEditRole || !hasFullReadAccess) {
+      result.rowCount = 'hidden';
+      result.dataSizeBytes = 'hidden';
+      result.attachmentsSizeBytes = 'hidden';
+    }
+    return result;
   }
 
   /**
@@ -577,8 +672,11 @@ export class GranularAccess implements GranularAccessForBundle {
    * Check whether user can read everything in document.  Checks both home-level and doc-level
    * permissions.
    */
-  public async canReadEverything(docSession: OptDocSession): Promise<boolean> {
-    const access = await this._getNominalAccess(docSession);
+  public async canReadEverything(
+    docSession: OptDocSession,
+    options: {role?: Role | null} = {}
+  ): Promise<boolean> {
+    const access = options.role ?? await this.getNominalAccess(docSession);
     if (!canView(access)) { return false; }
     const permInfo = await this._getAccess(docSession);
     return this.getReadPermission(permInfo.getFullAccess()) === 'allow';
@@ -621,7 +719,7 @@ export class GranularAccess implements GranularAccessForBundle {
    * Check whether user has owner-level access to the document.
    */
   public async isOwner(docSession: OptDocSession): Promise<boolean> {
-    const access = await this._getNominalAccess(docSession);
+    const access = await this.getNominalAccess(docSession);
     return access === 'owners';
   }
 
@@ -709,11 +807,11 @@ export class GranularAccess implements GranularAccessForBundle {
   /**
    * Broadcast document changes to all clients, with appropriate filtering.
    */
-  public async sendDocUpdateForBundle(actionGroup: ActionGroup) {
+  public async sendDocUpdateForBundle(actionGroup: ActionGroup, docUsage: DocUsageSummary) {
     if (!this._activeBundle) { throw new Error('no active bundle'); }
     const { docActions, docSession } = this._activeBundle;
     const client = docSession && docSession.client || null;
-    const message = { actionGroup, docActions };
+    const message: DocUpdateMessage = { actionGroup, docActions, docUsage };
     await this._docClients.broadcastDocMessage(client, 'docUserAction',
                                                message,
                                                (_docSession) => this._filterDocUpdate(_docSession, message));
@@ -767,6 +865,23 @@ export class GranularAccess implements GranularAccessForBundle {
       }
     }
     return result;
+  }
+
+  /**
+   * Get the role the session user has for this document.  User may be overridden,
+   * in which case the role of the override is returned.
+   * The forkingAsOwner flag of docSession should not be respected for non-owners,
+   * so that the pseudo-ownership it offers is restricted to granular access within a
+   * document (as opposed to document-level operations).
+   */
+  public async getNominalAccess(docSession: OptDocSession): Promise<Role|null> {
+    const linkParameters = docSession.authorizer?.getLinkParameters() || {};
+    const baseAccess = getDocSessionAccess(docSession);
+    if ((linkParameters.aclAsUserId || linkParameters.aclAsUser) && baseAccess === 'owners') {
+      const info = await this._getUser(docSession);
+      return info.Access;
+    }
+    return baseAccess;
   }
 
   // AddOrUpdateRecord requires broad read access to a table.
@@ -825,23 +940,6 @@ export class GranularAccess implements GranularAccessForBundle {
   }
 
   /**
-   * Get the role the session user has for this document.  User may be overridden,
-   * in which case the role of the override is returned.
-   * The forkingAsOwner flag of docSession should not be respected for non-owners,
-   * so that the pseudo-ownership it offers is restricted to granular access within a
-   * document (as opposed to document-level operations).
-   */
-  private async _getNominalAccess(docSession: OptDocSession): Promise<Role> {
-    const linkParameters = docSession.authorizer?.getLinkParameters() || {};
-    const baseAccess = getDocSessionAccess(docSession);
-    if ((linkParameters.aclAsUserId || linkParameters.aclAsUser) && baseAccess === 'owners') {
-      const info = await this._getUser(docSession);
-      return info.Access as Role;
-    }
-    return baseAccess;
-  }
-
-  /**
    * Asserts that user has schema access.
    */
   private async _assertSchemaAccess(docSession: OptDocSession) {
@@ -866,18 +964,18 @@ export class GranularAccess implements GranularAccessForBundle {
    * This filters a message being broadcast to all clients to be appropriate for one
    * particular client, if that client may need some material filtered out.
    */
-  private async _filterDocUpdate(docSession: OptDocSession, message: {
-    actionGroup: ActionGroup,
-    docActions: DocAction[]
-  }) {
+  private async _filterDocUpdate(docSession: OptDocSession, message: DocUpdateMessage) {
     if (!this._activeBundle) { throw new Error('no active bundle'); }
-    if (!this._ruler.haveRules() && !this._activeBundle.hasDeliberateRuleChange) {
-      return message;
-    }
+    const role = await this.getNominalAccess(docSession);
     const result = {
-      actionGroup: await this.filterActionGroup(docSession, message.actionGroup),
-      docActions: await this.filterOutgoingDocActions(docSession, message.docActions),
+      ...message,
+      docUsage: await this.filterDocUsageSummary(docSession, message.docUsage, {role}),
     };
+    if (!this._ruler.haveRules() && !this._activeBundle.hasDeliberateRuleChange) {
+      return result;
+    }
+    result.actionGroup = await this.filterActionGroup(docSession, message.actionGroup, {role});
+    result.docActions = await this.filterOutgoingDocActions(docSession, message.docActions);
     if (result.docActions.length === 0) { return null; }
     return result;
   }
@@ -1001,7 +1099,7 @@ export class GranularAccess implements GranularAccessForBundle {
       this._makeAdditions(rowsAfter, forceAdds),
       this._removeRows(action, removals),
       this._makeRemovals(rowsAfter, forceRemoves),
-    ].filter(isObject);
+    ].filter(isNonNullish);
 
     // Check whether there are column rules for this table, and if so whether they are row
     // dependent.  If so, we may need to update visibility of cells not mentioned in the
@@ -1343,7 +1441,7 @@ export class GranularAccess implements GranularAccessForBundle {
 
     // If aclAsUserId/aclAsUser is set, then override user for acl purposes.
     if (linkParameters.aclAsUserId || linkParameters.aclAsUser) {
-      if (access !== 'owners') { throw new Error('only an owner can override user'); }
+      if (access !== 'owners') { throw new ErrorWithCode('ACL_DENY', 'only an owner can override user'); }
       if (attrs.override) {
         // Used cached properties.
         access = attrs.override.access;
@@ -1684,7 +1782,7 @@ export class GranularAccess implements GranularAccessForBundle {
       return [filteredAction];
     }
 
-    return filterColValues(filteredAction, (idx) => censoredRows.has(idx), isCensored);
+    return filterColValues(filteredAction, (idx) => censoredRows.has(idx), gristTypes.isCensored);
   }
 
   /**
@@ -2072,6 +2170,13 @@ const dummyAccessCheck: IAccessCheck = {
 
 /**
  * Manage censoring metadata.
+ *
+ * For most metadata, censoring means blanking out certain fields, rather than removing rows,
+ * (because the latter was too big of a change). In particular, these changes are relied on by
+ * other code:
+ *
+ *  - Censored tables (from _grist_Tables) have cleared tableId field. To check for it, use the
+ *    isTableCensored() helper in app/common/isHiddenTable.ts. This is used by exports to Excel.
  */
 export class CensorshipInfo {
   public censoredTables = new Set<number>();
@@ -2095,6 +2200,7 @@ export class CensorshipInfo {
     const columnCode = (tableRef: number, colId: string) => `${tableRef} ${colId}`;
     const censoredColumnCodes: Set<string> = new Set();
     const tableRefToTableId: Map<number, string> = new Map();
+    const tableRefToIndex: Map<number, number> = new Map();
     const uncensoredTables: Set<number> = new Set();
     // Scan for forbidden tables.
     let rec = new RecordView(tables._grist_Tables, undefined);
@@ -2104,6 +2210,7 @@ export class CensorshipInfo {
       const tableId = rec.get('tableId') as string;
       const tableRef = ids[idx];
       tableRefToTableId.set(tableRef, tableId);
+      tableRefToIndex.set(tableRef, idx);
       const tableAccess = permInfo.getTableAccess(tableId);
       if (tableAccess.perms.read === 'deny') {
         this.censoredTables.add(tableRef);
@@ -2155,6 +2262,29 @@ export class CensorshipInfo {
       if (!this.censoredSections.has(rec.get('parentId') as number) &&
           !this.censoredColumns.has(rec.get('colRef') as number)) { continue; }
       this.censoredFields.add(ids[idx]);
+    }
+
+    // Now undo some of the above...
+    // Specifically, when a summary table is not censored, uncensor the source table's raw view section,
+    // so that the user can see the source table's title,
+    // which is used to construct the summary table's title. The section's fields remain censored.
+    // This would also be a sensible place to uncensor the source tableId, but that causes other problems.
+    rec = new RecordView(tables._grist_Tables, undefined);
+    ids = getRowIdsFromDocAction(tables._grist_Tables);
+    for (let idx = 0; idx < ids.length; idx++) {
+      rec.index = idx;
+      const tableRef = ids[idx];
+      const sourceTableRef = rec.get('summarySourceTable') as number;
+      const sourceTableIndex = tableRefToIndex.get(sourceTableRef);
+      if (
+        this.censoredTables.has(tableRef) ||
+        !sourceTableRef ||
+        sourceTableIndex === undefined ||
+        !this.censoredTables.has(sourceTableRef)
+      ) { continue; }
+      rec.index = sourceTableIndex;
+      const rawViewSectionRef = rec.get('rawViewSectionRef') as number;
+      this.censoredSections.delete(rawViewSectionRef);
     }
   }
 

@@ -1,5 +1,6 @@
 import json
 import re
+from collections import defaultdict
 
 import six
 from six.moves import xrange
@@ -27,6 +28,11 @@ log = logger.Logger(__name__, logger.INFO)
 # This should make it at least barely possible to share documents by people who are not all on the
 # same Grist version (even so, it will require more work). It should also make it somewhat safe to
 # upgrade and then open the document with a previous version.
+#
+# After each migration you probably should run these commands:
+# ./test/upgradeDocument public_samples/*.grist
+# UPDATE_REGRESSION_DATA=1 GREP_TESTS=DocRegressionTests ./test/testrun.sh server
+# ./test/upgradeDocument test/fixtures/docs/Hello.grist
 
 all_migrations = {}
 
@@ -378,7 +384,8 @@ def migration7(tdset):
     groupby_colrefs = [int(x) for x in m.group(2).strip("_").split("_")]
     # Prepare a new-style name for the summary table. Be sure not to conflict with existing tables
     # or with each other (i.e. don't rename multiple tables to the same name).
-    new_name = summary.encode_summary_table_name(source_table_name)
+    groupby_col_ids = [columns_map_by_ref[c].colId for c in groupby_colrefs]
+    new_name = summary.encode_summary_table_name(source_table_name, groupby_col_ids)
     new_name = identifiers.pick_table_ident(new_name, avoid=table_name_set)
     table_name_set.add(new_name)
     log.warn("Upgrading summary table %s for %s(%s) to %s" % (
@@ -699,6 +706,12 @@ def migration17(tdset):
       actions.ModifyColumn(tables_map[c.parentId].tableId, c.colId, {'type': 'Attachments'})
       for c in affected_cols
     )
+    # Update the types in the metadata tables
+    doc_actions.append(actions.BulkUpdateRecord(
+      '_grist_Tables_column',
+      [c.id for c in affected_cols],
+      {'type': ['Attachments' for c in affected_cols]}
+    ))
     # Update the values to lists
     for c in affected_cols:
       if c.isFormula:
@@ -710,12 +723,6 @@ def migration17(tdset):
         actions.BulkUpdateRecord(table_id, table.row_ids,
           {c.colId: [conv(val) for val in table.columns[c.colId]]})
       )
-    # Update the types in the metadata tables
-    doc_actions.append(actions.BulkUpdateRecord(
-      '_grist_Tables_column',
-      [c.id for c in affected_cols],
-      {'type': ['Attachments' for c in affected_cols]}
-    ))
 
   return tdset.apply_doc_actions(doc_actions)
 
@@ -898,3 +905,190 @@ def migration26(tdset):
     new_view_section_id += 1
 
   return tdset.apply_doc_actions(doc_actions)
+
+
+@migration(schema_version=27)
+def migration27(tdset):
+  return tdset.apply_doc_actions([
+    add_column('_grist_Tables_column', 'rules', 'RefList:_grist_Tables_column'),
+    add_column('_grist_Views_section_field', 'rules', 'RefList:_grist_Tables_column'),
+  ])
+
+
+@migration(schema_version=28)
+def migration28(tdset):
+  doc_actions = [add_column('_grist_Attachments', 'timeDeleted', 'DateTime')]
+
+  tables = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables"]))
+  columns = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables_column"]))
+
+  for table in tables:
+    for col in columns:
+      if table.id == col.parentId and col.type == "Attachments":
+        # This looks like it doesn't change anything,
+        # but it makes DocStorage realise that the sqlType has changed
+        # so it converts marshalled blobs to JSON
+        doc_actions.append(actions.ModifyColumn(table.tableId, col.colId, {"type": "Attachments"}))
+
+  return tdset.apply_doc_actions(doc_actions)
+
+
+@migration(schema_version=29)
+def migration29(tdset):
+  # This migration is fixing an error on summary tables with conditional rules.
+  # On summary tables all formula columns with the same name were updated together,
+  # which caused a situation where some summary columns have rules from diffrent tables.
+  # This migration is removing those rules in such columns.
+
+  tables = {table.id: table
+          for table in actions.transpose_bulk_action(tdset.all_tables["_grist_Tables"])}
+  columns = {col.id: col
+          for col in actions.transpose_bulk_action(tdset.all_tables["_grist_Tables_column"])}
+  doc_actions = []
+
+  def is_valid_rule(parentId, rule_id):
+    # Valid rule should be an existing column,
+    rule_col = columns.get(rule_id)
+    # in the same table.
+    return rule_col and rule_col.parentId == parentId
+
+  for col in columns.values():
+    if col.rules:
+      # Parse rules (they are a json encoded array like '[15]')
+      rules = safe_parse(col.rules)
+      # Remove all conditional styles if anything about rules is invalid.
+      if not (
+        isinstance(rules, list) and
+        all(is_valid_rule(col.parentId, ruleId) for ruleId in rules)
+      ):
+        doc_actions.append(actions.UpdateRecord('_grist_Tables_column', col.id, {
+          "rules": None,
+          "widgetOptions": summary._copy_widget_options(col.widgetOptions)
+        }))
+
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=30)
+def migration30(tdset):
+  """
+  Add raw view sections for each summary table. This is similar to migration 26, but for
+  summary tables instead of user tables.
+  """
+  doc_actions = []
+
+  tables = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables"]))
+  columns = list(actions.transpose_bulk_action(tdset.all_tables["_grist_Tables_column"]))
+
+  new_view_section_id = next_id(tdset, "_grist_Views_section")
+
+  for table in sorted(tables, key=lambda t: t.tableId):
+    if not table.summarySourceTable:
+      continue
+
+    table_columns = [
+      col for col in columns
+      if table.id == col.parentId and is_visible_column(col.colId)
+    ]
+    table_columns.sort(key=lambda c: c.parentPos)
+    fields = {
+      "parentId": [new_view_section_id] * len(table_columns),
+      "colRef": [col.id for col in table_columns],
+      "parentPos": [col.parentPos for col in table_columns],
+    }
+    field_ids = [None] * len(table_columns)
+
+    doc_actions += [
+      actions.AddRecord(
+        "_grist_Views_section", new_view_section_id, {
+          "tableRef": table.id,
+          "parentId": 0,
+          "parentKey": "record",
+          "title": "",
+          "defaultWidth": 100,
+          "borderWidth": 1,
+        }
+      ),
+      actions.UpdateRecord(
+        "_grist_Tables", table.id, {
+          "rawViewSectionRef": new_view_section_id,
+        })
+      ,
+      actions.BulkAddRecord(
+        "_grist_Views_section_field", field_ids, fields
+      ),
+    ]
+
+    new_view_section_id += 1
+
+  return tdset.apply_doc_actions(doc_actions)
+
+
+@migration(schema_version=31)
+def migration31(tdset):
+  columns = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Tables_column']))
+  tables = list(actions.transpose_bulk_action(tdset.all_tables['_grist_Tables']))
+  acl_resources = list(actions.transpose_bulk_action(tdset.all_tables['_grist_ACLResources']))
+
+  tables_by_ref = {t.id: t for t in tables}
+  columns_by_table_ref = defaultdict(list)
+  for col in columns:
+    columns_by_table_ref[col.parentId].append(col)
+
+  table_name_set = {t.tableId for t in tables}
+
+  table_renames = []      # List of (table, new_name) pairs
+
+  for t in six.itervalues(tables_by_ref):
+    if not t.summarySourceTable:
+      continue
+    source_table = tables_by_ref[t.summarySourceTable]
+    # Prepare a new-style name for the summary table. Be sure not to conflict with existing tables
+    # or with each other (i.e. don't rename multiple tables to the same name).
+    groupby_col_ids = [c.colId for c in columns_by_table_ref[t.id] if c.summarySourceCol]
+    new_name = summary.encode_summary_table_name(source_table.tableId, groupby_col_ids)
+    if new_name == t.tableId:
+      continue
+    new_name = identifiers.pick_table_ident(new_name, avoid=table_name_set)
+    table_name_set.add(new_name)
+    log.warn("Upgrading summary table %s for %s(%s) to %s" % (
+      t.tableId, source_table.tableId, groupby_col_ids, new_name))
+
+    # Schedule a rename of the summary table.
+    table_renames.append((t, new_name))
+
+  doc_actions = [
+    actions.RenameTable(t.tableId, new)
+    for (t, new) in table_renames
+  ]
+  if table_renames:
+    doc_actions.append(
+      actions.BulkUpdateRecord(
+        '_grist_Tables', [t.id for t, new in table_renames],
+        {'tableId': [new for t, new in table_renames]}
+      )
+    )
+
+  # Update formulas in all columns containing old-style names like 'GristSummary_'
+  for col in columns:
+    if 'GristSummary_' not in col.formula:
+      continue
+    formula = col.formula
+    for table, new_name in table_renames:
+      # Use regex to only match whole words
+      formula = re.sub(r'\b%s\b' % table.tableId, new_name, formula)
+    doc_actions.append(actions.UpdateRecord('_grist_Tables_column', col.id, {'formula': formula}))
+
+  table_renames_dict = {t.tableId: new for t, new in table_renames}
+  for resource in acl_resources:
+    new_name = table_renames_dict.get(resource.tableId)
+    if new_name:
+      doc_actions.append(
+        actions.UpdateRecord('_grist_ACLResources', resource.id, {'tableId': new_name})
+      )
+  return tdset.apply_doc_actions(doc_actions)
+
+@migration(schema_version=32)
+def migration32(tdset):
+  return tdset.apply_doc_actions([
+    add_column('_grist_Views_section', 'rules', 'RefList:_grist_Tables_column'),
+  ])

@@ -1,25 +1,13 @@
-import {Comm, CommMessage} from 'app/client/components/Comm';
+import {Comm} from 'app/client/components/Comm';
 import {reportError, reportMessage} from 'app/client/models/errors';
 import {Notifier} from 'app/client/models/NotifyModel';
-import {ActionGroup} from 'app/common/ActionGroup';
 import {ActiveDocAPI, ApplyUAOptions, ApplyUAResult} from 'app/common/ActiveDocAPI';
-import {DocAction, UserAction} from 'app/common/DocActions';
+import {CommMessage} from 'app/common/CommTypes';
+import {UserAction} from 'app/common/DocActions';
 import {OpenLocalDocResult} from 'app/common/DocListAPI';
 import {docUrl} from 'app/common/urlUtils';
 import {Events as BackboneEvents} from 'backbone';
 import {Disposable, Emitter} from 'grainjs';
-
-// tslint:disable:no-console
-
-export interface DocUserAction extends CommMessage {
-  docFD: number;
-  fromSelf?: boolean;
-  data: {
-    docActions: DocAction[];
-    actionGroup: ActionGroup;
-    error?: string;
-  };
-}
 
 const SLOW_NOTIFICATION_TIMEOUT_MS = 1000; // applies to user actions only
 
@@ -58,6 +46,7 @@ export class DocComm extends Disposable implements ActiveDocAPI {
   public getAclResources = this._wrapMethod("getAclResources");
   public waitForInitialization = this._wrapMethod("waitForInitialization");
   public getUsersForViewAs = this._wrapMethod("getUsersForViewAs");
+  public getAccessToken = this._wrapMethod("getAccessToken");
 
   public changeUrlIdEmitter = this.autoDispose(new Emitter());
 

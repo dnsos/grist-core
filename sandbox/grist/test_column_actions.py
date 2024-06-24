@@ -185,9 +185,10 @@ class TestColumnActions(test_engine.EngineTestCase):
   def init_sample_data(self):
     # Add a new view with a section, and a new table to that view, and a summary table.
     self.load_sample(self.sample2)
-    self.apply_user_action(["CreateViewSection", 1, 0, "record", None])
-    self.apply_user_action(["CreateViewSection", 0, 1, "record", None])
-    self.apply_user_action(["CreateViewSection", 1, 1, "record", [12]])
+    self.apply_user_action(["CreateViewSection", 1, 0, "record", None, None])
+    self.apply_user_action(["AddEmptyTable", None])
+    self.apply_user_action(["CreateViewSection", 2, 1, "record", None, None])
+    self.apply_user_action(["CreateViewSection", 1, 1, "record", [12], None])
     self.apply_user_action(["BulkAddRecord", "Table1", [None]*3, {
       "A": ["a", "b", "c"],
       "B": ["d", "e", "f"],
@@ -207,7 +208,7 @@ class TestColumnActions(test_engine.EngineTestCase):
         Column(16, "B", "Text", False, "", 0),
         Column(17, "C", "Any", True, "", 0),
       ]),
-      Table(3, "GristSummary_7_Address", 0, 1, columns=[
+      Table(3, "Address_summary_state", 0, 1, columns=[
         Column(18, "state", "Text", False, "", summarySourceCol=12),
         Column(19, "group", "RefList:Address", True, summarySourceCol=0,
                formula="table.getSummarySourceGroup(rec)"),
@@ -227,10 +228,10 @@ class TestColumnActions(test_engine.EngineTestCase):
           Field(11, colRef=16),
           Field(12, colRef=17),
         ]),
-        Section(5, parentKey="record", tableRef=3, fields=[
-          Field(13, colRef=18),
-          Field(14, colRef=20),
-          Field(15, colRef=21),
+        Section(6, parentKey="record", tableRef=3, fields=[
+          Field(16, colRef=18),
+          Field(17, colRef=20),
+          Field(18, colRef=21),
         ]),
       ]),
       View(2, sections=[
@@ -248,7 +249,7 @@ class TestColumnActions(test_engine.EngineTestCase):
       [ 2,   "b", "e", None,    2.0],
       [ 3,   "c", "f", None,    3.0],
     ])
-    self.assertTableData("GristSummary_7_Address", cols="subset", data=[
+    self.assertTableData("Address_summary_state", cols="subset", data=[
       [ "id", "state", "count", "amount"          ],
       [ 1,    "NY",     7,      1.+2+6+7+8+10+11  ],
       [ 2,    "WA",     1,      3.                ],
@@ -296,7 +297,7 @@ class TestColumnActions(test_engine.EngineTestCase):
         Column(15, "A", "Text", False, "", 0),
         Column(17, "C", "Any", True, "", 0),
       ]),
-      Table(3, "GristSummary_7_Address", 0, 1, columns=[
+      Table(3, "Address_summary_state", 0, 1, columns=[
         Column(18, "state", "Text", False, "", summarySourceCol=12),
         Column(19, "group", "RefList:Address", True, summarySourceCol=0,
                formula="table.getSummarySourceGroup(rec)"),
@@ -314,10 +315,10 @@ class TestColumnActions(test_engine.EngineTestCase):
           Field(10, colRef=15),
           Field(12, colRef=17),
         ]),
-        Section(5, parentKey="record", tableRef=3, fields=[
-          Field(13, colRef=18),
-          Field(14, colRef=20),
-          Field(15, colRef=21),
+        Section(6, parentKey="record", tableRef=3, fields=[
+          Field(16, colRef=18),
+          Field(17, colRef=20),
+          Field(18, colRef=21),
         ]),
       ]),
       View(2, sections=[
@@ -355,10 +356,10 @@ class TestColumnActions(test_engine.EngineTestCase):
         Column(17, "C", "Any", True, "", 0),
       ]),
       # Note that the summary table here switches to a new one, without the deleted group-by.
-      Table(4, "GristSummary_7_Address2", 0, 1, columns=[
-        Column(22, "count", "Int", True, summarySourceCol=0, formula="len($group)"),
-        Column(23, "amount", "Numeric", True, summarySourceCol=0, formula="SUM($group.amount)"),
-        Column(24, "group", "RefList:Address", True, summarySourceCol=0,
+      Table(4, "Address_summary", 0, 1, columns=[
+        Column(23, "count", "Int", True, summarySourceCol=0, formula="len($group)"),
+        Column(24, "amount", "Numeric", True, summarySourceCol=0, formula="SUM($group.amount)"),
+        Column(22, "group", "RefList:Address", True, summarySourceCol=0,
                formula="table.getSummarySourceGroup(rec)"),
       ]),
     ])
@@ -371,9 +372,9 @@ class TestColumnActions(test_engine.EngineTestCase):
           Field(10, colRef=15),
           Field(12, colRef=17),
         ]),
-        Section(5, parentKey="record", tableRef=4, fields=[
-          Field(14, colRef=22),
-          Field(15, colRef=23),
+        Section(6, parentKey="record", tableRef=4, fields=[
+          Field(17, colRef=23),
+          Field(18, colRef=24),
         ]),
       ]),
       View(2, sections=[
@@ -405,7 +406,7 @@ class TestColumnActions(test_engine.EngineTestCase):
       [ 2,   "b", None,    2.0],
       [ 3,   "c", None,    3.0],
     ])
-    self.assertTableData("GristSummary_7_Address2", cols="subset", data=[
+    self.assertTableData("Address_summary", cols="subset", data=[
       [ "id", "count", "amount"          ],
       [ 1,     7+1+1+2,   1.+2+6+7+8+10+11+3+4+5+9  ],
     ])

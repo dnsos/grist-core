@@ -1,110 +1,188 @@
-import {getLoginOrSignupUrl} from 'app/client/models/gristUrlState';
+import {getLoginOrSignupUrl, urlState} from 'app/client/models/gristUrlState';
 import {HomeModel} from 'app/client/models/HomeModel';
+import {productPill} from 'app/client/ui/AppHeader';
 import * as css from 'app/client/ui/DocMenuCss';
 import {createDocAndOpen, importDocAndOpen} from 'app/client/ui/HomeLeftPane';
-import {bigBasicButton} from 'app/client/ui2018/buttons';
-import {mediaXSmall, testId} from 'app/client/ui2018/cssVars';
+import {bigBasicButton, cssButton} from 'app/client/ui2018/buttons';
+import {testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {cssLink} from 'app/client/ui2018/links';
-import {commonUrls} from 'app/common/gristUrls';
-import {dom, DomContents, DomCreateFunc, styled} from 'grainjs';
+import {commonUrls, shouldHideUiElement} from 'app/common/gristUrls';
+import {FullUser} from 'app/common/LoginSessionAPI';
+import * as roles from 'app/common/roles';
+import {Computed, dom, DomContents, styled} from 'grainjs';
+import { manageTeamUsersApp } from './OpenUserManager';
+
 
 export function buildHomeIntro(homeModel: HomeModel): DomContents {
+  const isViewer = homeModel.app.currentOrg?.access === roles.VIEWER;
   const user = homeModel.app.currentValidUser;
-  if (user) {
-    return [
-      css.docListHeader(`Willkommen bei Grist, ${user.name}!`, testId('welcome-title')),
-      cssIntroSplit(
-        cssIntroLeft(
-          cssIntroImage({src: 'https://www.getgrist.com/themes/grist/assets/images/empty-folder.png'}),
-          testId('intro-image'),
-        ),
-        cssIntroRight(
-          cssParagraph(
-            'Schaue das Video, wie man ',
-            cssLink({href: 'https://support.getgrist.com/creating-doc/', target: '_blank'}, 'ein Dokument erstellt'),
-            '.', dom('br'),
-            'Finde weitere Infos im ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
-            testId('welcome-text')
-          ),
-          makeCreateButtons(homeModel),
-        ),
-      ),
-    ];
+  const isAnonym = !user;
+  const isPersonal = !homeModel.app.isTeamSite;
+  if (isAnonym) {
+    return makeAnonIntro(homeModel);
+  } else if (isPersonal) {
+    return makePersonalIntro(homeModel, user);
+  } else { // isTeamSite
+    if (isViewer) {
+      return makeViewerTeamSiteIntro(homeModel);
+    } else {
+      return makeTeamSiteIntro(homeModel);
+    }
+  }
+}
+
+export function buildWorkspaceIntro(homeModel: HomeModel): DomContents {
+  const isViewer = homeModel.currentWS.get()?.access === roles.VIEWER;
+  const isAnonym = !homeModel.app.currentValidUser;
+  const emptyLine = cssIntroLine(testId('empty-workspace-info'), "This workspace is empty.");
+  if (isAnonym || isViewer) {
+    return emptyLine;
   } else {
     return [
-      cssIntroSplit(
-        cssIntroLeft(
-          cssLink({href: 'https://support.getgrist.com/creating-doc/', target: '_blank'},
-            cssIntroImage({src: 'https://www.getgrist.com/themes/grist/assets/images/video-create-doc.png'}),
-          ),
-          testId('intro-image'),
-        ),
-        cssIntroRight(
-          css.docListHeader('Willkommen bei Grist!', testId('welcome-title')),
-          cssParagraph(
-            'Dies ist eine Test-Instanz der Software Grist, adaptiert und bereitgestellt vom CityLAB Berlin. ',
-            'Um deine Arbeit zu speichern musst du dich aber ',
-            cssLink({href: getLoginOrSignupUrl()}, 'anmelden'), '.', dom('br'),
-            'Hier geht\'s zum ', cssLink({href: commonUrls.help, target: '_blank'}, 'Help Center'), '.',
-            testId('welcome-text')
-          ),
-          makeCreateButtons(homeModel),
-        ),
-      ),
+      emptyLine,
+      buildButtons(homeModel, {
+        invite: false,
+        templates: false,
+        import: true,
+        empty: true
+      })
     ];
   }
 }
 
-function makeCreateButtons(homeModel: HomeModel) {
+function makeViewerTeamSiteIntro(homeModel: HomeModel) {
+  const personalOrg = Computed.create(null, use => use(homeModel.app.topAppModel.orgs).find(o => o.owner));
+  const docLink = (dom.maybe(personalOrg, org => {
+    return cssLink(
+      urlState().setLinkUrl({org: org.domain ?? undefined}),
+      'personal site',
+      testId('welcome-personal-url'));
+  }));
+  return [
+    css.docListHeader(
+      dom.autoDispose(personalOrg),
+      `Welcome to ${homeModel.app.currentOrgName}`,
+      productPill(homeModel.app.currentOrg, {large: true}),
+      testId('welcome-title')
+    ),
+    cssIntroLine(
+      testId('welcome-info'),
+      "You have read-only access to this site. Currently there are no documents.", dom('br'),
+      "Any documents created in this site will appear here."),
+    cssIntroLine(
+      'Interested in using Grist outside of your team? Visit your free ', docLink, '.',
+      testId('welcome-text')
+    )
+  ];
+}
+
+function makeTeamSiteIntro(homeModel: HomeModel) {
+  const sproutsProgram = cssLink({href: commonUrls.sproutsProgram, target: '_blank'}, 'Sprouts Program');
+  return [
+    css.docListHeader(
+      `Welcome to ${homeModel.app.currentOrgName}`,
+      productPill(homeModel.app.currentOrg, {large: true}),
+      testId('welcome-title')
+    ),
+    cssIntroLine('Get started by inviting your team and creating your first Grist document.'),
+    (shouldHideUiElement('helpCenter') ? null :
+      cssIntroLine(
+        'Learn more in our ', helpCenterLink(), ', or find an expert via our ', sproutsProgram, '.',
+        testId('welcome-text')
+      )
+    ),
+    makeCreateButtons(homeModel)
+  ];
+}
+
+function makePersonalIntro(homeModel: HomeModel, user: FullUser) {
+  return [
+    css.docListHeader(`Welcome to Grist, ${user.name}!`, testId('welcome-title')),
+    cssIntroLine('Get started by creating your first Grist document.'),
+    (shouldHideUiElement('helpCenter') ? null :
+      cssIntroLine('Visit our ', helpCenterLink(), ' to learn more.',
+        testId('welcome-text'))
+    ),
+    makeCreateButtons(homeModel),
+  ];
+}
+
+function makeAnonIntro(homeModel: HomeModel) {
+  const signUp = cssLink({href: getLoginOrSignupUrl()}, 'Sign up');
+  return [
+    css.docListHeader(`Welcome to Grist!`, testId('welcome-title')),
+    cssIntroLine('Get started by exploring templates, or creating your first Grist document.'),
+    cssIntroLine(signUp, ' to save your work.',
+      (shouldHideUiElement('helpCenter') ? null : [' Visit our ', helpCenterLink(), ' to learn more.']),
+      testId('welcome-text')),
+    makeCreateButtons(homeModel),
+  ];
+}
+
+function helpCenterLink() {
+  return cssLink({href: commonUrls.help, target: '_blank'}, cssInlineIcon('Help'), 'Help Center');
+}
+
+function buildButtons(homeModel: HomeModel, options: {
+  invite: boolean,
+  templates: boolean,
+  import: boolean,
+  empty: boolean,
+}) {
   return cssBtnGroup(
+    !options.invite ? null :
+    cssBtn(cssBtnIcon('Help'), 'Team einladen', testId('intro-invite'),
+      cssButton.cls('-primary'),
+      dom.on('click', () => manageTeamUsersApp(homeModel.app)),
+    ),
+    !options.templates ? null :
+    cssBtn(cssBtnIcon('FieldTable'), 'Templates durchsuchen', testId('intro-templates'),
+      cssButton.cls('-primary'),
+      dom.hide(shouldHideUiElement("templates")),
+      urlState().setLinkUrl({homePage: 'templates'}),
+    ),
+    !options.import ? null :
     cssBtn(cssBtnIcon('Import'), 'Dokument importieren', testId('intro-import-doc'),
       dom.on('click', () => importDocAndOpen(homeModel)),
     ),
+    !options.empty ? null :
     cssBtn(cssBtnIcon('Page'), 'Leeres Dokument erstellen', testId('intro-create-doc'),
       dom.on('click', () => createDocAndOpen(homeModel)),
     ),
   );
 }
 
-const cssIntroSplit = styled(css.docBlock, `
-  display: flex;
-  align-items: center;
-
-  @media ${mediaXSmall} {
-    & {
-      display: block;
-    }
-  }
-`);
-
-const cssIntroLeft = styled('div', `
-  flex: 0.4 1 0px;
-  overflow: hidden;
-  max-height: 150px;
-  text-align: center;
-  margin: 32px 0;
-`);
-
-const cssIntroRight = styled('div', `
-  flex: 0.6 1 0px;
-  overflow: auto;
-  margin-left: 8px;
-`);
+function makeCreateButtons(homeModel: HomeModel) {
+  const canManageTeam = homeModel.app.isTeamSite &&
+    roles.canEditAccess(homeModel.app.currentOrg?.access || null);
+  return buildButtons(homeModel, {
+    invite: canManageTeam,
+    templates: !canManageTeam,
+    import: true,
+    empty: true
+  });
+}
 
 const cssParagraph = styled(css.docBlock, `
+  color: ${theme.text};
   line-height: 1.6;
+`);
+
+const cssIntroLine = styled(cssParagraph, `
+  font-size: ${vars.introFontSize};
+  margin-bottom: 8px;
 `);
 
 const cssBtnGroup = styled('div', `
   display: inline-flex;
   flex-direction: column;
   align-items: stretch;
-  margin-top: -16px;
 `);
 
 const cssBtn = styled(bigBasicButton, `
-  display: block;
+  display: flex;
+  align-items: center;
   margin-right: 16px;
   margin-top: 16px;
   text-align: left;
@@ -114,11 +192,6 @@ const cssBtnIcon = styled(icon, `
   margin-right: 8px;
 `);
 
-// Helper to create an image scaled down to half of its intrinsic size.
-// Based on https://stackoverflow.com/a/25026615/328565
-const cssIntroImage: DomCreateFunc<HTMLDivElement> =
-  (...args) => _cssImageWrap1(_cssImageWrap2(_cssImageScaled(...args)));
-
-const _cssImageWrap1 = styled('div', `width: 200%; margin-left: -50%;`);
-const _cssImageWrap2 = styled('div', `display: inline-block;`);
-const _cssImageScaled = styled('img', `width: 50%;`);
+const cssInlineIcon = styled(icon, `
+  margin: -2px 4px 2px 4px;
+`);

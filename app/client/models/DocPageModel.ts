@@ -17,9 +17,11 @@ import {confirmModal} from 'app/client/ui2018/modals';
 import {AsyncFlow, CancelledError, FlowRunner} from 'app/common/AsyncFlow';
 import {delay} from 'app/common/delay';
 import {OpenDocMode, UserOverride} from 'app/common/DocListAPI';
+import {FilteredDocUsageSummary} from 'app/common/DocUsage';
+import {Product} from 'app/common/Features';
 import {IGristUrlState, parseUrlId, UrlIdParts} from 'app/common/gristUrls';
 import {getReconnectTimeout} from 'app/common/gutil';
-import {canEdit} from 'app/common/roles';
+import {canEdit, isOwner} from 'app/common/roles';
 import {Document, NEW_DOCUMENT_CODE, Organization, UserAPI, Workspace} from 'app/common/UserAPI';
 import {Holder, Observable, subscribe} from 'grainjs';
 import {Computed, Disposable, dom, DomArg, DomElementArg} from 'grainjs';
@@ -43,6 +45,13 @@ export interface DocPageModel {
 
   appModel: AppModel;
   currentDoc: Observable<DocInfo|null>;
+  currentDocUsage: Observable<FilteredDocUsageSummary|null>;
+
+  /**
+   * Initially set to the product referenced by `currentDoc`, and updated whenever `currentDoc`
+   * changes, or a doc usage message is received from the server.
+   */
+  currentProduct: Observable<Product|null>;
 
   // This block is to satisfy previous interface, but usable as this.currentDoc.get().id, etc.
   currentDocId: Observable<string|undefined>;
@@ -69,6 +78,11 @@ export interface DocPageModel {
   renameDoc(value: string): Promise<void>;
   updateCurrentDoc(urlId: string, openMode: OpenDocMode): Promise<Document>;
   refreshCurrentDoc(doc: DocInfo): Promise<Document>;
+  updateCurrentDocUsage(docUsage: FilteredDocUsageSummary): void;
+  // Offer to open document in recovery mode, if user is owner, and report
+  // the error that prompted the offer. If user is not owner, just flag that
+  // document needs attention of an owner.
+  offerRecovery(err: Error): void;
 }
 
 export interface ImportSource {
@@ -81,6 +95,13 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
   public readonly pageType = "doc";
 
   public readonly currentDoc = Observable.create<DocInfo|null>(this, null);
+  public readonly currentDocUsage = Observable.create<FilteredDocUsageSummary|null>(this, null);
+
+  /**
+   * Initially set to the product referenced by `currentDoc`, and updated whenever `currentDoc`
+   * changes, or a doc usage message is received from the server.
+   */
+  public readonly currentProduct = Observable.create<Product|null>(this, null);
 
   public readonly currentUrlId = Computed.create(this, this.currentDoc, (use, doc) => doc ? doc.urlId : undefined);
   public readonly currentDocId = Computed.create(this, this.currentDoc, (use, doc) => doc ? doc.id : undefined);
@@ -138,6 +159,14 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
         }
       }
     }));
+
+    this.autoDispose(this.currentOrg.addListener((org) => {
+      // Whenever the current doc is updated, set the current product to be the
+      // one referenced by the updated doc.
+      if (org?.billingAccount?.product.name !== this.currentProduct.get()?.name) {
+        this.currentProduct.set(org?.billingAccount?.product ?? null);
+      }
+    }));
   }
 
   public createLeftPane(leftPanelOpen: Observable<boolean>) {
@@ -187,6 +216,10 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
     return this.updateCurrentDoc(doc.urlId || doc.id, doc.openMode);
   }
 
+  public updateCurrentDocUsage(docUsage: FilteredDocUsageSummary) {
+    this.currentDocUsage.set(docUsage);
+  }
+
   // Replace the URL without reloading the doc.
   public updateUrlNoReload(urlId: string, urlOpenMode: OpenDocMode, options: {replace: boolean}) {
     const state = urlState().state.get();
@@ -194,6 +227,28 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
     // We preemptively update _openerDocKey so that the URL update doesn't trigger a reload.
     this._openerDocKey = this._getDocKey(nextState);
     return urlState().pushUrl(nextState, {avoidReload: true, ...options});
+  }
+
+  public offerRecovery(err: Error) {
+    const isDenied = (err as any).code === 'ACL_DENY';
+    const isDocOwner = isOwner(this.currentDoc.get());
+    confirmModal(
+      "Error accessing document",
+      "Reload",
+      async () => window.location.reload(true),
+      isDocOwner ? `You can try reloading the document, or using recovery mode. ` +
+        `Recovery mode opens the document to be fully accessible to owners, and ` +
+        `inaccessible to others. It also disables formulas. ` +
+        `[${err.message}]` :
+        isDenied ? `Sorry, access to this document has been denied. [${err.message}]` :
+        `Document owners can attempt to recover the document. [${err.message}]`,
+      {  hideCancel: true,
+         extraButtons: (isDocOwner && !isDenied) ? bigBasicButton('Enter recovery mode', dom.on('click', async () => {
+           await this._api.getDocAPI(this.currentDocId.get()!).recover(true);
+           window.location.reload(true);
+         }), testId('modal-recovery-mode')) : null,
+      },
+    );
   }
 
   private _onOpenError(err: Error) {
@@ -205,22 +260,7 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
     // Expected errors (e.g. Access Denied) produce a separate error page. For unexpected errors,
     // show a modal, and include a toast for the sake of the "Report error" link.
     reportError(err);
-    const isOwner = this.currentDoc.get()?.access === 'owners';
-    confirmModal(
-      "Error opening document",
-      "Reload",
-      async () => window.location.reload(true),
-      isOwner ? `You can try reloading the document, or using recovery mode. ` +
-        `Recovery mode opens the document to be fully accessible to owners, and ` +
-        `inaccessible to others. ` +
-        `[${err.message}]` : err.message,
-      {  hideCancel: true,
-         extraButtons: isOwner ? bigBasicButton('Enter recovery mode', dom.on('click', async () => {
-           await this._api.getDocAPI(this.currentDocId.get()!).recover(true);
-           window.location.reload(true);
-         }), testId('modal-recovery-mode')) : null,
-      },
-    );
+    this.offerRecovery(err);
   }
 
   private async _openDoc(flow: AsyncFlow, urlId: string, urlOpenMode: OpenDocMode | undefined,
@@ -252,6 +292,9 @@ export class DocPageModelImpl extends Disposable implements DocPageModel {
       doc.isRecoveryMode = Boolean(openDocResponse.recoveryMode);
       doc.userOverride = openDocResponse.userOverride || null;
       this.currentDoc.set({...doc});
+    }
+    if (openDocResponse.docUsage) {
+      this.updateCurrentDocUsage(openDocResponse.docUsage);
     }
     const gdModule = await gristDocModulePromise;
     const docComm = gdModule.DocComm.create(flow, comm, openDocResponse, doc.id, this.appModel.notifier);

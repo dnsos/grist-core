@@ -9,7 +9,7 @@ import {getAuthorizedUserId, getUserId, getUserProfiles, RequestWithLogin} from 
 import {getSessionUser, linkOrgWithEmail} from 'app/server/lib/BrowserSession';
 import {expressWrap} from 'app/server/lib/expressWrap';
 import {RequestWithOrg} from 'app/server/lib/extractOrg';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {addPermit, clearSessionCacheIfNeeded, getDocScope, getScope, integerParam,
         isParameterOn, sendOkReply, sendReply, stringParam} from 'app/server/lib/requestUtils';
 import {IWidgetRepository} from 'app/server/lib/WidgetRepository';
@@ -19,7 +19,7 @@ import {User} from './entity/User';
 import {HomeDBManager} from './lib/HomeDBManager';
 
 // Special public organization that contains examples and templates.
-const TEMPLATES_ORG_DOMAIN = process.env.GRIST_ID_PREFIX ?
+export const TEMPLATES_ORG_DOMAIN = process.env.GRIST_ID_PREFIX ?
   `templates-${process.env.GRIST_ID_PREFIX}` :
   'templates';
 
@@ -73,11 +73,11 @@ export function addOrg(
   userId: number,
   props: Partial<OrganizationProperties>,
   options?: {
-    planType?: 'free'
+    planType?: string,
   }
 ): Promise<number> {
   return dbManager.connection.transaction(async manager => {
-    const user = await manager.findOne(User, userId);
+    const user = await manager.findOne(User, {where: {id: userId}});
     if (!user) { return handleDeletedUser(); }
     const query = await dbManager.addOrg(user, props, {
       ...options,
@@ -146,6 +146,15 @@ export class ApiServer {
       return sendReply(req, res, query);
     }));
 
+    // GET /api/orgs/:oid/usage
+    // Get usage summary of all un-deleted documents in the organization.
+    // Only accessible to org owners.
+    this._app.get('/api/orgs/:oid/usage', expressWrap(async (req, res) => {
+      const org = getOrgKey(req);
+      const usage = await this._dbManager.getOrgUsageSummary(getScope(req), org);
+      return sendOkReply(req, res, usage);
+    }));
+
     // POST /api/orgs
     // Body params: name (required), domain
     // Create a new org.
@@ -194,7 +203,7 @@ export class ApiServer {
       return sendReply(req, res, query);
     }));
 
-    // // DELETE /api/workspaces/:wid
+    // DELETE /api/workspaces/:wid
     // Delete the specified workspace and all included docs.
     this._app.delete('/api/workspaces/:wid', expressWrap(async (req, res) => {
       const wsId = integerParam(req.params.wid, 'wid');
@@ -287,7 +296,7 @@ export class ApiServer {
     // GET /api/docs/:did
     // Get information about a document.
     this._app.get('/api/docs/:did', expressWrap(async (req, res) => {
-      const query = await this._dbManager.getDoc(getDocScope(req));
+      const query = await this._dbManager.getDoc(req);
       return sendOkReply(req, res, query);
     }));
 
@@ -379,11 +388,30 @@ export class ApiServer {
       res.sendStatus(200);
     }));
 
+    this._app.post('/api/profile/isConsultant', expressWrap(async (req, res) => {
+      const userId = getAuthorizedUserId(req);
+      if (userId !== this._dbManager.getSupportUserId()) {
+        throw new ApiError('Only support user can enable/disable isConsultant', 401);
+      }
+      const isConsultant: boolean | undefined = req.body.isConsultant;
+      const targetUserId: number | undefined = req.body.userId;
+      if (isConsultant === undefined) {
+        throw new ApiError('Missing body param: isConsultant', 400);
+      }
+      if (targetUserId === undefined) {
+        throw new ApiError('Missing body param: targetUserId', 400);
+      }
+      await this._dbManager.updateUserOptions(targetUserId, {
+        isConsultant
+      });
+      res.sendStatus(200);
+    }));
+
     // GET /api/profile/apikey
     // Get user's apiKey
     this._app.get('/api/profile/apikey', expressWrap(async (req, res) => {
       const userId = getUserId(req);
-      const user = await User.findOne(userId);
+      const user = await User.findOne({where: {id: userId}});
       if (user) {
         // The null value is of no interest to the user, let's show empty string instead.
         res.send(user.apiKey || '');
@@ -398,7 +426,7 @@ export class ApiServer {
       const userId = getAuthorizedUserId(req);
       const force = req.body ? req.body.force : false;
       const manager = this._dbManager.connection.manager;
-      let user = await manager.findOne(User, userId);
+      let user = await manager.findOne(User, {where: {id: userId}});
       if (!user) { return handleDeletedUser(); }
       if (!user.apiKey || force) {
         user = await updateApiKeyWithRetry(manager, user);
@@ -413,7 +441,7 @@ export class ApiServer {
     this._app.delete('/api/profile/apikey', expressWrap(async (req, res) => {
       const userId = getAuthorizedUserId(req);
       await this._dbManager.connection.transaction(async manager => {
-        const user = await manager.findOne(User, userId);
+        const user = await manager.findOne(User, {where: {id: userId}});
         if (!user) { return handleDeletedUser(); }
         user.apiKey = null;
         await manager.save(User, user);

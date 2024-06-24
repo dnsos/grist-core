@@ -1,8 +1,8 @@
-import * as billingPageCss from 'app/client/ui/BillingPageCss';
-import { basicButton } from 'app/client/ui2018/buttons';
+import { basicButton, textButton } from 'app/client/ui2018/buttons';
+import { theme, vars } from 'app/client/ui2018/cssVars';
+import { icon } from 'app/client/ui2018/icons';
 import { confirmModal } from 'app/client/ui2018/modals';
-
-import { Disposable, dom, IDomArgs, makeTestId, Observable, observable, styled } from "grainjs";
+import { Disposable, dom, IDomArgs, makeTestId, Observable, observable, styled } from 'grainjs';
 
 interface IWidgetOptions {
   apiKey: Observable<string>;
@@ -64,7 +64,7 @@ export class ApiKey extends Disposable {
             this._inputArgs
           ),
           cssTextBtn(
-            cssBillingIcon('Remove'), 'Remove',
+            cssTextBtnIcon('Remove'), 'Remove',
             dom.on('click', () => this._showRemoveKeyModal()),
             testId('delete'),
             dom.boolAttr('disabled', (use) => use(this._loading) || this._anonymous)
@@ -120,11 +120,17 @@ export class ApiKey extends Disposable {
 }
 
 const description = styled('div', `
-  color: #8a8a8a;
-  font-size: 13px;
+  margin-top: 8px;
+  color: ${theme.lightText};
+  font-size: ${vars.mediumFontSize};
 `);
 
 const cssInput = styled('input', `
+  background-color: transparent;
+  color: ${theme.inputFg};
+  border: 1px solid ${theme.inputBorder};
+  padding: 4px;
+  border-radius: 3px;
   outline: none;
   flex: 1 0 0;
 `);
@@ -133,9 +139,12 @@ const cssRow = styled('div', `
   display: flex;
 `);
 
-const cssTextBtn = styled(billingPageCss.billingTextBtn, `
+const cssTextBtn = styled(textButton, `
+  text-align: left;
   width: 90px;
   margin-left: 16px;
 `);
 
-const cssBillingIcon = billingPageCss.billingIcon;
+const cssTextBtnIcon = styled(icon, `
+  margin: 0 4px 2px 0;
+`);

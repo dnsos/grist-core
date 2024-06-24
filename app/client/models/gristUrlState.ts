@@ -24,7 +24,8 @@
  */
 import {unsavedChanges} from 'app/client/components/UnsavedChanges';
 import {UrlState} from 'app/client/lib/UrlState';
-import {decodeUrl, encodeUrl, getSlugIfNeeded, GristLoadConfig, IGristUrlState} from 'app/common/gristUrls';
+import {decodeUrl, encodeUrl, getSlugIfNeeded, GristLoadConfig, IGristUrlState,
+        parseFirstUrlPart} from 'app/common/gristUrls';
 import {addOrgToPath} from 'app/common/urlUtils';
 import {Document} from 'app/common/UserAPI';
 import isEmpty = require('lodash/isEmpty');
@@ -64,46 +65,42 @@ export function getMainOrgUrl(): string { return urlState().makeUrl({}); }
 // When on a document URL, returns the URL with just the doc ID, omitting other bits (like page).
 export function getCurrentDocUrl(): string { return urlState().makeUrl({docPage: undefined}); }
 
-// Get url for the login page, which will then redirect to nextUrl (current page by default).
+// Get url for the login page, which will then redirect to `nextUrl` (current page by default).
 export function getLoginUrl(nextUrl: string | null = _getCurrentUrl()): string {
-  return _getLoginLogoutUrl('login', nextUrl ?? undefined);
+  return _getLoginLogoutUrl('login', nextUrl);
 }
 
-// Get url for the signup page, which will then redirect to nextUrl (current page by default).
+// Get url for the signup page, which will then redirect to `nextUrl` (current page by default).
 export function getSignupUrl(nextUrl: string = _getCurrentUrl()): string {
   return _getLoginLogoutUrl('signup', nextUrl);
 }
 
-// Get url for the logout page, which will then redirect to nextUrl (signed-out page by default).
-export function getLogoutUrl(nextUrl: string = getSignedOutUrl()): string {
-  return _getLoginLogoutUrl('logout', nextUrl);
+// Get url for the logout page.
+export function getLogoutUrl(): string {
+  return _getLoginLogoutUrl('logout');
 }
 
-// Get url for the login page, which will then redirect to nextUrl (current page by default).
+// Get url for the signin page, which will then redirect to `nextUrl` (current page by default).
 export function getLoginOrSignupUrl(nextUrl: string = _getCurrentUrl()): string {
   return _getLoginLogoutUrl('signin', nextUrl);
 }
 
-// Get url for the reset password page.
-export function getResetPwdUrl(): string {
-  const startUrl = new URL(window.location.href);
-  startUrl.pathname = '/resetPassword';
-  return startUrl.href;
-}
-
-// Returns the URL for the "you are signed out" page.
-export function getSignedOutUrl(): string { return getMainOrgUrl() + "signed-out"; }
-
-// Helper which returns the URL of the current page, except when it's the "/signed-out" page, in
-// which case returns the org URL. This is a good URL to use for a post-login redirect.
+// Returns the relative URL (i.e. path) of the current page, except when it's the
+// "/signed-out" page, in which case it returns the home page ("/").
+// This is a good URL to use for a post-login redirect.
 function _getCurrentUrl(): string {
-  return window.location.pathname.endsWith("/signed-out") ? getMainOrgUrl() : window.location.href;
+  const {hash, pathname, search} = new URL(window.location.href);
+  if (pathname.endsWith('/signed-out')) { return '/'; }
+
+  return parseFirstUrlPart('o', pathname).path + search + hash;
 }
 
-// Helper for getLoginUrl()/getLogoutUrl().
-function _getLoginLogoutUrl(method: 'login'|'logout'|'signin'|'signup', nextUrl?: string): string {
+// Returns the URL for the given login page, with 'next' param optionally set.
+function _getLoginLogoutUrl(page: 'login'|'logout'|'signin'|'signup', nextUrl?: string | null): string {
   const startUrl = new URL(window.location.href);
-  startUrl.pathname = addOrgToPath('', window.location.href, true) + '/' + method;
+  startUrl.pathname = addOrgToPath('', window.location.href, true) + '/' + page;
+  startUrl.search = '';
+  startUrl.hash = '';
   if (nextUrl) { startUrl.searchParams.set('next', nextUrl); }
   return startUrl.href;
 }
@@ -145,7 +142,7 @@ export class UrlStateImpl {
    */
   public updateState(prevState: IGristUrlState, newState: IGristUrlState): IGristUrlState {
     const keepState = (newState.org || newState.ws || newState.homePage || newState.doc || isEmpty(newState) ||
-                       newState.account || newState.billing  || newState.welcome) ?
+                       newState.account || newState.billing  || newState.activation || newState.welcome) ?
       (prevState.org ? {org: prevState.org} : {}) :
       prevState;
     return {...keepState, ...newState};
@@ -166,12 +163,17 @@ export class UrlStateImpl {
     const accountReload = Boolean(prevState.account) !== Boolean(newState.account);
     // Reload when moving to/from a billing page.
     const billingReload = Boolean(prevState.billing) !== Boolean(newState.billing);
+    // Reload when moving to/from an activation page.
+    const activationReload = Boolean(prevState.activation) !== Boolean(newState.activation);
     // Reload when moving to/from a welcome page.
     const welcomeReload = Boolean(prevState.welcome) !== Boolean(newState.welcome);
     // Reload when link keys change, which changes what the user can access
     const linkKeysReload = !isEqual(prevState.params?.linkParameters, newState.params?.linkParameters);
-    return Boolean(orgReload || accountReload || billingReload || gristConfig.errPage
-      || docReload || welcomeReload || linkKeysReload);
+    // Reload when moving to/from the Grist sign-up page.
+    const signupReload = [prevState.login, newState.login].includes('signup')
+      && prevState.login !== newState.login;
+    return Boolean(orgReload || accountReload || billingReload || activationReload
+      || gristConfig.errPage || docReload || welcomeReload || linkKeysReload || signupReload);
   }
 
   /**

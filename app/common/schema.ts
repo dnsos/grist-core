@@ -4,7 +4,7 @@ import { GristObjCode } from "app/plugin/GristData";
 
 // tslint:disable:object-literal-key-quotes
 
-export const SCHEMA_VERSION = 26;
+export const SCHEMA_VERSION = 32;
 
 export const schema = {
 
@@ -38,6 +38,7 @@ export const schema = {
     summarySourceCol    : "Ref:_grist_Tables_column",
     displayCol          : "Ref:_grist_Tables_column",
     visibleCol          : "Ref:_grist_Tables_column",
+    rules               : "RefList:_grist_Tables_column",
     recalcWhen          : "Int",
     recalcDeps          : "RefList:_grist_Tables_column",
   },
@@ -114,6 +115,7 @@ export const schema = {
     linkSrcColRef       : "Ref:_grist_Tables_column",
     linkTargetColRef    : "Ref:_grist_Tables_column",
     embedId             : "Text",
+    rules               : "RefList:_grist_Tables_column",
   },
 
   "_grist_Views_section_field": {
@@ -125,6 +127,7 @@ export const schema = {
     displayCol          : "Ref:_grist_Tables_column",
     visibleCol          : "Ref:_grist_Tables_column",
     filter              : "Text",
+    rules               : "RefList:_grist_Tables_column",
   },
 
   "_grist_Validations": {
@@ -146,6 +149,7 @@ export const schema = {
     fileSize            : "Int",
     imageHeight         : "Int",
     imageWidth          : "Int",
+    timeDeleted         : "DateTime",
     timeUploaded        : "DateTime",
   },
 
@@ -226,6 +230,7 @@ export interface SchemaTypes {
     summarySourceCol: number;
     displayCol: number;
     visibleCol: number;
+    rules: [GristObjCode.List, ...number[]]|null;
     recalcWhen: number;
     recalcDeps: [GristObjCode.List, ...number[]]|null;
   };
@@ -302,6 +307,7 @@ export interface SchemaTypes {
     linkSrcColRef: number;
     linkTargetColRef: number;
     embedId: string;
+    rules: [GristObjCode.List, ...number[]]|null;
   };
 
   "_grist_Views_section_field": {
@@ -313,6 +319,7 @@ export interface SchemaTypes {
     displayCol: number;
     visibleCol: number;
     filter: string;
+    rules: [GristObjCode.List, ...number[]]|null;
   };
 
   "_grist_Validations": {
@@ -334,6 +341,7 @@ export interface SchemaTypes {
     fileSize: number;
     imageHeight: number;
     imageWidth: number;
+    timeDeleted: number;
     timeUploaded: number;
   };
 

@@ -1,8 +1,10 @@
 import * as sqlite3 from '@gristlabs/sqlite3';
+import {ApiError} from 'app/common/ApiError';
 import {mapGetOrSet} from 'app/common/AsyncCreate';
 import {delay} from 'app/common/delay';
 import {DocEntry} from 'app/common/DocListAPI';
 import {DocSnapshots} from 'app/common/DocSnapshot';
+import {DocumentUsage} from 'app/common/DocUsage';
 import {buildUrlId, parseUrlId} from 'app/common/gristUrls';
 import {KeyedOps} from 'app/common/KeyedOps';
 import {DocReplacementOptions, NEW_DOCUMENT_CODE} from 'app/common/UserAPI';
@@ -10,7 +12,7 @@ import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
 import {checksumFile} from 'app/server/lib/checksumFile';
 import {DocSnapshotInventory, DocSnapshotPruner} from 'app/server/lib/DocSnapshots';
 import {IDocWorkerMap} from 'app/server/lib/DocWorkerMap';
-import {ChecksummedExternalStorage, DELETED_TOKEN, ExternalStorage} from 'app/server/lib/ExternalStorage';
+import {ChecksummedExternalStorage, DELETED_TOKEN, ExternalStorage, Unchanged} from 'app/server/lib/ExternalStorage';
 import {HostedMetadataManager} from 'app/server/lib/HostedMetadataManager';
 import {ICreate} from 'app/server/lib/ICreate';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
@@ -18,7 +20,7 @@ import {LogMethods} from "app/server/lib/LogMethods";
 import {fromCallback} from 'app/server/lib/serverUtils';
 import * as fse from 'fs-extra';
 import * as path from 'path';
-import * as uuidv4 from "uuid/v4";
+import uuidv4 from "uuid/v4";
 import { OpenMode, SQLiteDB } from './SQLiteDB';
 
 // Check for a valid document id.
@@ -45,12 +47,15 @@ function checkValidDocId(docId: string): void {
   }
 }
 
-interface HostedStorageOptions {
+export interface HostedStorageOptions {
   secondsBeforePush: number;
   secondsBeforeFirstRetry: number;
   pushDocUpdateTimes: boolean;
-  testExternalStorageDoc?: ExternalStorage;
-  testExternalStorageMeta?: ExternalStorage;
+  // A function returning the core ExternalStorage implementation,
+  // which may then be wrapped in additional layer(s) of ExternalStorage.
+  // See ICreate.ExternalStorage.
+  // Uses S3 by default in hosted Grist.
+  externalStorageCreator?: (purpose: 'doc'|'meta') => ExternalStorage;
 }
 
 const defaultOptions: HostedStorageOptions = {
@@ -124,16 +129,15 @@ export class HostedStorageManager implements IDocStorageManager {
     private _docsRoot: string,
     private _docWorkerId: string,
     private _disableS3: boolean,
-    extraS3Prefix: string,
     private _docWorkerMap: IDocWorkerMap,
     dbManager: HomeDBManager,
     create: ICreate,
     options: HostedStorageOptions = defaultOptions
   ) {
+    const creator = options.externalStorageCreator || ((purpose) => create.ExternalStorage(purpose, ''));
     // We store documents either in a test store, or in an s3 store
     // at s3://<s3Bucket>/<s3Prefix><docId>.grist
-    const externalStoreDoc = options.testExternalStorageDoc ||
-      (this._disableS3 ? undefined : create.ExternalStorage('doc', extraS3Prefix));
+    const externalStoreDoc = this._disableS3 ? undefined : creator('doc');
     if (!externalStoreDoc) { this._disableS3 = true; }
     const secondsBeforePush = options.secondsBeforePush;
     if (options.pushDocUpdateTimes) {
@@ -154,7 +158,7 @@ export class HostedStorageManager implements IDocStorageManager {
       this._ext = this._getChecksummedExternalStorage('doc', this._baseStore,
                                                       this._latestVersions, options);
 
-      const baseStoreMeta = options.testExternalStorageMeta || create.ExternalStorage('meta', extraS3Prefix);
+      const baseStoreMeta = creator('meta');
       if (!baseStoreMeta) {
         throw new Error('bug: external storage should be created for "meta" if it is created for "doc"');
       }
@@ -162,12 +166,19 @@ export class HostedStorageManager implements IDocStorageManager {
                                                           this._latestMetaVersions,
                                                           options);
 
-      this._inventory = new DocSnapshotInventory(this._ext, this._extMeta,
-                                                 async docId => {
-                                                   const dir = this.getAssetPath(docId);
-                                                   await fse.mkdirp(dir);
-                                                   return path.join(dir, 'meta.json');
-                                                 });
+      this._inventory = new DocSnapshotInventory(
+        this._ext,
+        this._extMeta,
+        async docId => {
+          const dir = this.getAssetPath(docId);
+          await fse.mkdirp(dir);
+          return path.join(dir, 'meta.json');
+        },
+        async docId => {
+          const product = await dbManager.getDocProduct(docId);
+          return product?.features.snapshotWindow;
+        },
+      );
 
       // The pruner could use an inconsistent store without any real loss overall,
       // but tests are easier if it is consistent.
@@ -314,6 +325,8 @@ export class HostedStorageManager implements IDocStorageManager {
       // NOTE: fse.remove succeeds also when the file does not exist.
       await fse.remove(this._getHashFile(this.getPath(docId)));
       this.markAsChanged(docId, 'edit');
+      // Invalidate usage; it'll get re-computed the next time the document is opened.
+      this.scheduleUsageUpdate(docId, null, true);
     } catch (err) {
       this._log.error(docId, "problem replacing doc: %s", err);
       await fse.move(tmpPath, docPath, {overwrite: true});
@@ -426,6 +439,13 @@ export class HostedStorageManager implements IDocStorageManager {
     this._uploads.expediteOperations();
   }
 
+  // forcibly stop operations that might otherwise retry indefinitely,
+  // for testing purposes.
+  public async testStopOperations() {
+    this._uploads.stopOperations();
+    await this._uploads.wait();
+  }
+
   /**
    * Finalize any operations involving the named document.
    */
@@ -475,6 +495,27 @@ export class HostedStorageManager implements IDocStorageManager {
   }
 
   /**
+   * Schedule an update to a document's usage column.
+   *
+   * If `minimizeDelay` is true, HostedMetadataManager will attempt to
+   * minimize delays by scheduling the update to occur as soon as possible.
+   */
+  public scheduleUsageUpdate(
+    docName: string,
+    docUsage: DocumentUsage|null,
+    minimizeDelay = false
+  ): void {
+    const {forkId, snapshotId} = parseUrlId(docName);
+    if (!this._metadataManager || forkId || snapshotId) { return; }
+
+    this._metadataManager.scheduleUpdate(
+      docName,
+      {usage: docUsage},
+      minimizeDelay
+    );
+  }
+
+  /**
    * Check if there is a pending change to be pushed to S3.
    */
   public needsUpdate(): boolean {
@@ -515,9 +556,9 @@ export class HostedStorageManager implements IDocStorageManager {
    * This is called when a document was edited by the user.
    */
   private _markAsEdited(docName: string, timestamp: string): void {
-    if (parseUrlId(docName).snapshotId) { return; }
+    if (parseUrlId(docName).snapshotId || !this._metadataManager) { return; }
     // Schedule a metadata update for the modified doc.
-    if (this._metadataManager) { this._metadataManager.scheduleUpdate(docName, timestamp); }
+    this._metadataManager.scheduleUpdate(docName, {updatedAt: timestamp});
   }
 
   /**
@@ -556,9 +597,9 @@ export class HostedStorageManager implements IDocStorageManager {
         // skip S3, just use file system
         let present: boolean = await fse.pathExists(this.getPath(docName));
         if ((forkId || snapshotId) && !present) {
-          if (!canCreateFork) { throw new Error(`Cannot create fork`); }
+          if (!canCreateFork) { throw new ApiError("Document fork not found", 404); }
           if (snapshotId && snapshotId !== 'current') {
-            throw new Error(`cannot find snapshot ${snapshotId} of ${docName}`);
+            throw new ApiError(`cannot find snapshot ${snapshotId} of ${docName}`, 404);
           }
           if (await fse.pathExists(this.getPath(trunkId))) {
             await fse.copy(this.getPath(trunkId), this.getPath(docName));
@@ -641,10 +682,10 @@ export class HostedStorageManager implements IDocStorageManager {
     if (!await this._ext.exists(destIdWithoutSnapshot)) {
       if (!options.trunkId) { return false; }   // Document not found in S3
       // No such fork in s3 yet, try from trunk (if we are allowed to create the fork).
-      if (!options.canCreateFork) { throw new Error('Cannot create fork'); }
+      if (!options.canCreateFork) { throw new ApiError("Document fork not found", 404); }
       // The special NEW_DOCUMENT_CODE trunk means we should create an empty document.
       if (options.trunkId === NEW_DOCUMENT_CODE) { return false; }
-      if (!await this._ext.exists(options.trunkId)) { throw new Error('Cannot find original'); }
+      if (!await this._ext.exists(options.trunkId)) { throw new ApiError('Cannot find original', 404); }
       sourceDocId = options.trunkId;
     }
     await this._ext.downloadTo(sourceDocId, destId, this.getPath(destId), options.snapshotId);
@@ -698,19 +739,29 @@ export class HostedStorageManager implements IDocStorageManager {
         ...label && {label},
         t,
       };
-      const prevSnapshotId = this._latestVersions.get(docId) || null;
-      const newSnapshotId = await this._ext.upload(docId, tmpPath, metadata);
-      if (!newSnapshotId) {
-        // This is unexpected.
-        throw new Error('No snapshotId allocated after upload');
+      let changeMade: boolean = false;
+      await this._inventory.uploadAndAdd(docId, async () => {
+        const prevSnapshotId = this._latestVersions.get(docId) || null;
+        const newSnapshotId = await this._ext.upload(docId, tmpPath as string, metadata);
+        if (newSnapshotId === Unchanged) {
+          // Nothing uploaded because nothing changed
+          return { prevSnapshotId };
+        }
+        if (!newSnapshotId) {
+          // This is unexpected.
+          throw new Error('No snapshotId allocated after upload');
+        }
+        const snapshot = {
+          lastModified: t,
+          snapshotId: newSnapshotId,
+          metadata
+        };
+        changeMade = true;
+        return { snapshot, prevSnapshotId };
+      });
+      if (changeMade) {
+        await this._onInventoryChange(docId);
       }
-      const snapshot = {
-        lastModified: t,
-        snapshotId: newSnapshotId,
-        metadata
-      };
-      await this._inventory.add(docId, snapshot, prevSnapshotId);
-      await this._onInventoryChange(docId);
     } finally {
       // Clean up backup.
       // NOTE: fse.remove succeeds also when the file does not exist.

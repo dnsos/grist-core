@@ -4,16 +4,17 @@
  */
 import {HomeDBManager} from 'app/gen-server/lib/HomeDBManager';
 import {ActionHistoryImpl} from 'app/server/lib/ActionHistoryImpl';
-import {assertAccess, getOrSetDocAuth, getUserId, RequestWithLogin} from 'app/server/lib/Authorizer';
+import {assertAccess, getOrSetDocAuth, RequestWithLogin} from 'app/server/lib/Authorizer';
 import {Client} from 'app/server/lib/Client';
-import * as Comm from 'app/server/lib/Comm';
+import {Comm} from 'app/server/lib/Comm';
 import {DocSession, docSessionFromRequest} from 'app/server/lib/DocSession';
 import {filterDocumentInPlace} from 'app/server/lib/filterUtils';
+import {GristServer} from 'app/server/lib/GristServer';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
-import * as log from 'app/server/lib/log';
-import {integerParam, optStringParam, stringParam} from 'app/server/lib/requestUtils';
+import log from 'app/server/lib/log';
+import {getDocId, integerParam, optStringParam, stringParam} from 'app/server/lib/requestUtils';
 import {OpenMode, quoteIdent, SQLiteDB} from 'app/server/lib/SQLiteDB';
-import * as contentDisposition from 'content-disposition';
+import contentDisposition from 'content-disposition';
 import * as express from 'express';
 import * as fse from 'fs-extra';
 import * as mimeTypes from 'mime-types';
@@ -21,12 +22,15 @@ import * as path from 'path';
 
 export interface AttachOptions {
   comm: Comm;                             // Comm object for methods called via websocket
+  gristServer: GristServer;
 }
 
 export class DocWorker {
   private _comm: Comm;
-  constructor(private _dbManager: HomeDBManager, {comm}: AttachOptions) {
-    this._comm = comm;
+  private _gristServer: GristServer;
+  constructor(private _dbManager: HomeDBManager, options: AttachOptions) {
+    this._comm = options.comm;
+    this._gristServer = options.gristServer;
   }
 
   public async getAttachment(req: express.Request, res: express.Response): Promise<void> {
@@ -34,7 +38,13 @@ export class DocWorker {
       const docSession = this._getDocSession(stringParam(req.query.clientId, 'clientId'),
                                              integerParam(req.query.docFD, 'docFD'));
       const activeDoc = docSession.activeDoc;
-      const ext = path.extname(stringParam(req.query.ident, 'ident'));
+      const colId = stringParam(req.query.colId, 'colId');
+      const tableId = stringParam(req.query.tableId, 'tableId');
+      const rowId = integerParam(req.query.rowId, 'rowId');
+      const cell = {colId, tableId, rowId};
+      const attId = integerParam(req.query.attId, 'attId');
+      const attRecord = activeDoc.getAttachmentMetadata(attId);
+      const ext = path.extname(attRecord.fileIdent);
       const type = mimeTypes.lookup(ext);
 
       let inline = Boolean(req.query.inline);
@@ -44,7 +54,7 @@ export class DocWorker {
       // Construct a content-disposition header of the form 'inline|attachment; filename="NAME"'
       const contentDispType = inline ? "inline" : "attachment";
       const contentDispHeader = contentDisposition(stringParam(req.query.name, 'name'), {type: contentDispType});
-      const data = await activeDoc.getAttachmentData(docSession, stringParam(req.query.ident, 'ident'));
+      const data = await activeDoc.getAttachmentData(docSession, attRecord, cell);
       res.status(200)
         .type(ext)
         .set('Content-Disposition', contentDispHeader)
@@ -58,11 +68,10 @@ export class DocWorker {
   public async downloadDoc(req: express.Request, res: express.Response,
                            storageManager: IDocStorageManager): Promise<void> {
     const mreq = req as RequestWithLogin;
-    if (!mreq.docAuth || !mreq.docAuth.docId) { throw new Error('Cannot find document'); }
-    const docId = mreq.docAuth.docId;
+    const docId = getDocId(mreq);
 
     // Query DB for doc metadata to get the doc title.
-    const doc = await this._dbManager.getDoc({userId: getUserId(req), org: mreq.org, urlId: docId});
+    const doc = await this._dbManager.getDoc(req);
     const docTitle = doc.name;
 
     // Get a copy of document for downloading.
@@ -76,7 +85,11 @@ export class DocWorker {
     return res.type('application/x-sqlite3')
       .download(tmpPath, (optStringParam(req.query.title) || docTitle || 'document') + ".grist", async (err: any) => {
         if (err) {
-          log.error(`Download failure for doc ${docId}`, err);
+          if (err.message && /Request aborted/.test(err.message)) {
+            log.warn(`Download request aborted for doc ${docId}`, err);
+          } else {
+            log.error(`Download failure for doc ${docId}`, err);
+          }
         }
         await fse.unlink(tmpPath);
       });
@@ -112,6 +125,7 @@ export class DocWorker {
       getAclResources:          activeDocMethod.bind(null, 'viewers', 'getAclResources'),
       waitForInitialization:    activeDocMethod.bind(null, 'viewers', 'waitForInitialization'),
       getUsersForViewAs:        activeDocMethod.bind(null, 'viewers', 'getUsersForViewAs'),
+      getAccessToken:           activeDocMethod.bind(null, 'viewers', 'getAccessToken'),
     });
   }
 
@@ -151,7 +165,7 @@ export class DocWorker {
       }
       if (!urlId) { return res.status(403).send({error: 'missing document id'}); }
 
-      const docAuth = await getOrSetDocAuth(mreq, this._dbManager, urlId);
+      const docAuth = await getOrSetDocAuth(mreq, this._dbManager, this._gristServer, urlId);
       assertAccess('viewers', docAuth);
       next();
     } catch (err) {
@@ -193,6 +207,6 @@ async function removeData(filename: string) {
   }
   const history = new ActionHistoryImpl(db);
   await history.deleteActions(1);
-  await db.run('VACUUM');
+  await db.vacuum();
   await db.close();
 }

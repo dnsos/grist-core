@@ -51,13 +51,19 @@ export type IconName = "ChartArea" |
   "DragDrop" |
   "Dropdown" |
   "DropdownUp" |
+  "Empty" |
   "Expand" |
   "EyeHide" |
   "EyeShow" |
   "Feedback" |
   "Filter" |
   "FilterSimple" |
+  "Fireworks" |
   "Folder" |
+  "FontBold" |
+  "FontItalic" |
+  "FontStrikethrough" |
+  "FontUnderline" |
   "FunctionResult" |
   "Help" |
   "Home" |
@@ -82,8 +88,10 @@ export type IconName = "ChartArea" |
   "PinBig" |
   "PinSmall" |
   "Pivot" |
+  "PivotLight" |
   "Plus" |
   "Public" |
+  "PublicColor" |
   "PublicFilled" |
   "Redo" |
   "Remove" |
@@ -95,6 +103,7 @@ export type IconName = "ChartArea" |
   "Settings" |
   "Share" |
   "Sort" |
+  "Sparks" |
   "Tick" |
   "TickSolid" |
   "Undo" |
@@ -168,13 +177,19 @@ export const IconList: IconName[] = ["ChartArea",
   "DragDrop",
   "Dropdown",
   "DropdownUp",
+  "Empty",
   "Expand",
   "EyeHide",
   "EyeShow",
   "Feedback",
   "Filter",
   "FilterSimple",
+  "Fireworks",
   "Folder",
+  "FontBold",
+  "FontItalic",
+  "FontStrikethrough",
+  "FontUnderline",
   "FunctionResult",
   "Help",
   "Home",
@@ -199,8 +214,10 @@ export const IconList: IconName[] = ["ChartArea",
   "PinBig",
   "PinSmall",
   "Pivot",
+  "PivotLight",
   "Plus",
   "Public",
+  "PublicColor",
   "PublicFilled",
   "Redo",
   "Remove",
@@ -212,6 +229,7 @@ export const IconList: IconName[] = ["ChartArea",
   "Settings",
   "Share",
   "Sort",
+  "Sparks",
   "Tick",
   "TickSolid",
   "Undo",

@@ -3,14 +3,20 @@
  * so is friendlier and clearer to derive TypeScript classes from.
  */
 import {DocComm} from 'app/client/components/DocComm';
+import {GristDoc} from 'app/client/components/GristDoc';
 import {DocData} from 'app/client/models/DocData';
 import {ViewFieldRec} from 'app/client/models/entities/ViewFieldRec';
 import {SaveableObjObservable} from 'app/client/models/modelUtil';
-import {cssLabel, cssRow} from 'app/client/ui/RightPanel';
-import {colorSelect} from 'app/client/ui2018/ColorSelect';
+import {CellStyle} from 'app/client/widgets/CellStyle';
 import {BaseFormatter} from 'app/common/ValueFormatter';
-import {Computed, Disposable, DomContents, fromKo, Observable} from 'grainjs';
-
+import {
+  Disposable,
+  dom,
+  DomContents,
+  fromKo,
+  IDisposableOwnerT,
+  Observable,
+} from 'grainjs';
 
 export interface Options {
   // A hex value to set the default widget text color. Default to '#000000' if omitted.
@@ -25,50 +31,45 @@ export abstract class NewAbstractWidget extends Disposable {
   /**
    * Override the create() method to match the parameters of create() expected by FieldBuilder.
    */
-  public static create(field: ViewFieldRec) {
-    return Disposable.create.call(this as any, null, field);
+  // We copy Disposable.create() signature (the second one) to pacify typescript, but code must
+  // use the first signature, which is compatible with old-style constructors.
+  public static create<T extends new (...args: any[]) => any>(field: ViewFieldRec): InstanceType<T>;
+  public static create<T extends new (...args: any[]) => any>(
+    this: T, owner: IDisposableOwnerT<InstanceType<T>>|null, ...args: ConstructorParameters<T>): InstanceType<T>;
+  public static create(...args: any[]) {
+    return Disposable.create.call(this as any, null, ...args);
   }
 
   protected options: SaveableObjObservable<any>;
   protected valueFormatter: Observable<BaseFormatter>;
   protected textColor: Observable<string>;
   protected fillColor: Observable<string>;
+  protected readonly defaultTextColor: string;
 
   constructor(protected field: ViewFieldRec, opts: Options = {}) {
     super();
-    const {defaultTextColor = '#000000'} = opts;
     this.options = field.widgetOptionsJson;
-    this.textColor = Computed.create(this, (use) => (
-      use(this.field.textColor) || defaultTextColor
-    )).onWrite((val) => this.field.textColor(val === defaultTextColor ? undefined : val));
-    this.fillColor = fromKo(this.field.fillColor);
-
     this.valueFormatter = fromKo(field.formatter);
+    this.defaultTextColor = opts?.defaultTextColor || '#000000';
   }
 
   /**
    * Builds the DOM showing configuration buttons and fields in the sidebar.
    */
-  public buildConfigDom(): DomContents { return null; }
+  public buildConfigDom(): DomContents {
+    return null;
+  }
 
   /**
    * Builds the transform prompt config DOM in the few cases where it is necessary.
    * Child classes need not override this function if they do not require transform config options.
    */
-  public buildTransformConfigDom(): DomContents { return null; }
+  public buildTransformConfigDom(): DomContents {
+    return null;
+  }
 
-  public buildColorConfigDom(): Element[] {
-    return [
-      cssLabel('CELL COLOR'),
-      cssRow(
-        colorSelect(
-          this.textColor,
-          this.fillColor,
-          // Calling `field.widgetOptionsJson.save()` saves both fill and text color settings.
-          () => this.field.widgetOptionsJson.save()
-        )
-      )
-    ];
+  public buildColorConfigDom(gristDoc: GristDoc): DomContents {
+    return dom.create(CellStyle, this.field, gristDoc, this.defaultTextColor);
   }
 
   /**
@@ -88,5 +89,7 @@ export abstract class NewAbstractWidget extends Disposable {
   /**
    * Returns the docComm object for communicating with the server.
    */
-  protected _getDocComm(): DocComm { return this._getDocData().docComm; }
+  protected _getDocComm(): DocComm {
+    return this._getDocData().docComm;
+  }
 }

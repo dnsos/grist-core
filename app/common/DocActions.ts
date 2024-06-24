@@ -3,8 +3,8 @@
  */
 
 // Some definitions have moved to be part of plugin API.
-import { CellValue, RowRecord } from 'app/plugin/GristData';
-export { CellValue, RowRecord } from 'app/plugin/GristData';
+import { BulkColValues, CellValue, RowRecord } from 'app/plugin/GristData';
+export type { BulkColValues, CellValue, RowRecord };
 
 // Part of a special CellValue used for comparisons, embedding several versions of a CellValue.
 export interface AllCellVersions {
@@ -108,7 +108,6 @@ export function getTableId(action: DocAction): string {
 // Helper types used in the definitions above.
 
 export interface ColValues { [colId: string]: CellValue; }
-export interface BulkColValues { [colId: string]: CellValue[]; }
 export interface ColInfoMap { [colId: string]: ColInfo; }
 
 export interface ColInfo {
@@ -145,6 +144,9 @@ export interface TableRecordValue {
 
 export type UserAction = Array<string|number|object|boolean|null|undefined>;
 
+// Actions that trigger formula calculations in the data engine
+export const CALCULATING_USER_ACTIONS = new Set(['Calculate', 'UpdateCurrentTime', 'RespondToRequests']);
+
 /**
  * Gives a description for an action which involves setting values to a selection.
  * @param {Array} action - The (Bulk)AddRecord/(Bulk)UpdateRecord action to describe.
@@ -171,7 +173,7 @@ export function getNumRows(action: DocAction): number {
 export function toTableDataAction(tableId: string, colValues: TableColValues): TableDataAction {
   const colData = {...colValues};   // Make a copy to avoid changing passed-in arguments.
   const rowIds: number[] = colData.id;
-  delete colData.id;
+  delete (colData as BulkColValues).id;
   return ['TableData', tableId, rowIds, colData];
 }
 
@@ -187,7 +189,7 @@ export function fromTableDataAction(tableData: TableDataAction): TableColValues 
  * Convert a list of rows into an object with columns of values, used for
  * BulkAddRecord/BulkUpdateRecord actions.
  */
-export function getColValues(records: RowRecord[]): BulkColValues {
+export function getColValues(records: Partial<RowRecord>[]): BulkColValues {
   const colIdSet = new Set<string>();
   for (const r of records) {
     for (const c of Object.keys(r)) {
@@ -198,7 +200,7 @@ export function getColValues(records: RowRecord[]): BulkColValues {
   }
   const result: BulkColValues = {};
   for (const colId of colIdSet) {
-    result[colId] = records.map(r => r[colId]);
+    result[colId] = records.map(r => r[colId]!);
   }
   return result;
 }

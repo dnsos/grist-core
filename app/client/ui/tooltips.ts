@@ -6,9 +6,10 @@
  */
 
 import {prepareForTransition} from 'app/client/ui/transitions';
-import {testId} from 'app/client/ui2018/cssVars';
+import {testId, theme} from 'app/client/ui2018/cssVars';
+import {IconName} from 'app/client/ui2018/IconList';
 import {icon} from 'app/client/ui2018/icons';
-import {dom, DomContents, DomElementMethod, styled} from 'grainjs';
+import {dom, DomContents, DomElementArg, DomElementMethod, styled} from 'grainjs';
 import Popper from 'popper.js';
 
 export interface ITipOptions {
@@ -193,14 +194,42 @@ export function tooltipCloseButton(ctl: ITooltipControl): HTMLElement {
   );
 }
 
+/**
+ * Renders an icon that shows a tooltip with the specified `tipContent` on hover.
+ */
+export function iconTooltip(
+  iconName: IconName,
+  tipContent: ITooltipContentFunc,
+  ...domArgs: DomElementArg[]
+) {
+  return cssIconTooltip(iconName,
+    hoverTooltip(tipContent, {
+      openDelay: 0,
+      closeDelay: 0,
+      openOnClick: true,
+    }),
+    ...domArgs,
+  );
+}
+
+/**
+ * Renders an info icon that shows a tooltip with the specified `tipContent` on hover.
+ */
+export function infoTooltip(tipContent: DomContents, ...domArgs: DomElementArg[]) {
+  return iconTooltip('Info',
+    () => cssInfoTooltipBody(tipContent),
+    ...domArgs,
+  );
+}
+
 const cssTooltip = styled('div', `
   position: absolute;
   z-index: 5000;      /* should be higher than a modal */
-  background-color: rgba(0, 0, 0, 0.75);
+  background-color: ${theme.tooltipBg};
   border-radius: 3px;
   box-shadow: 0 0 2px rgba(0,0,0,0.5);
   text-align: center;
-  color: white;
+  color: ${theme.tooltipFg};
   width: auto;
   font-family: sans-serif;
   font-size: 10pt;
@@ -217,11 +246,23 @@ const cssTooltipCloseButton = styled('div', `
   line-height: 16px;
   text-align: center;
   margin: -4px -4px -4px 8px;
-  --icon-color: white;
+  --icon-color: ${theme.tooltipCloseButtonFg};
   border-radius: 16px;
 
   &:hover {
-    background-color: white;
-    --icon-color: black;
+    background-color: ${theme.tooltipCloseButtonHoverBg};
+    --icon-color: ${theme.tooltipCloseButtonHoverFg};
   }
+`);
+
+const cssIconTooltip = styled(icon, `
+  height: 12px;
+  width: 12px;
+  background-color: ${theme.tooltipIcon};
+  flex-shrink: 0;
+`);
+
+const cssInfoTooltipBody = styled('div', `
+  text-align: left;
+  max-width: 200px;
 `);

@@ -1,27 +1,28 @@
 /* globals alert, document, $ */
 
-var _         = require('underscore');
-var ko        = require('knockout');
+const _         = require('underscore');
+const ko        = require('knockout');
 const debounce = require('lodash/debounce');
 
-var gutil             = require('app/common/gutil');
-var BinaryIndexedTree = require('app/common/BinaryIndexedTree');
-var MANUALSORT        = require('app/common/gristTypes').MANUALSORT;
+const gutil             = require('app/common/gutil');
+const BinaryIndexedTree = require('app/common/BinaryIndexedTree');
 const {Sort} = require('app/common/SortSpec');
 
-var dom           = require('../lib/dom');
-var kd            = require('../lib/koDom');
-var kf            = require('../lib/koForm');
-var koDomScrolly  = require('../lib/koDomScrolly');
-var tableUtil     = require('../lib/tableUtil');
-var {addToSort, sortBy}   = require('../lib/sortUtil');
+const dom           = require('../lib/dom');
+const kd            = require('../lib/koDom');
+const kf            = require('../lib/koForm');
+const koDomScrolly  = require('../lib/koDomScrolly');
+const tableUtil     = require('../lib/tableUtil');
+const {addToSort, sortBy}   = require('../lib/sortUtil');
 
-var commands      = require('./commands');
-var viewCommon    = require('./viewCommon');
-var Base          = require('./Base');
-var BaseView      = require('./BaseView');
-var selector      = require('./Selector');
-var {CopySelection} = require('./CopySelection');
+const commands      = require('./commands');
+const viewCommon    = require('./viewCommon');
+const Base          = require('./Base');
+const BaseView      = require('./BaseView');
+const selector      = require('./Selector');
+const {CopySelection} = require('./CopySelection');
+const koUtil      = require('app/client/lib/koUtil');
+const convert       = require('color-convert');
 
 const {renderAllRows} = require('app/client/components/Printing');
 const {reportError} = require('app/client/models/AppModel');
@@ -40,6 +41,8 @@ const {testId} = require('app/client/ui2018/cssVars');
 const {contextMenu} = require('app/client/ui/contextMenu');
 const {menuToggle} = require('app/client/ui/MenuToggle');
 const {showTooltip} = require('app/client/ui/tooltips');
+const {parsePasteForView} = require("./BaseView2");
+const {CombinedStyle} = require("app/client/models/Styles");
 
 
 // A threshold for interpreting a motionless click as a click rather than a drag.
@@ -230,8 +233,13 @@ function GridView(gristDoc, viewSectionModel, isPreview = false) {
   this.onEvent(this.scrollPane, 'scroll', this.onScroll);
 
   //--------------------------------------------------
-  // Command group implementing all grid level commands.
+  // Command group implementing all grid level commands (except cancel)
   this.autoDispose(commands.createGroup(GridView.gridCommands, this, this.viewSection.hasFocus));
+  // Cancel command is registered conditionally, only when there is an active
+  // cell selection. This command is also used by Raw Data Views, to close the Grid popup.
+  const hasSelection = this.autoDispose(ko.pureComputed(() =>
+    !this.cellSelector.isCurrentSelectType('') || this.copySelection()));
+  this.autoDispose(commands.createGroup(GridView.selectionCommands, this, hasSelection));
 
   // Timer to allow short, otherwise non-actionable clicks on column names to trigger renaming.
   this._colClickTime = 0;  // Units: milliseconds.
@@ -243,6 +251,12 @@ _.extend(GridView.prototype, BaseView.prototype);
 
 // ======================================================================================
 // GRID-LEVEL COMMANDS
+
+// Moved out of all commands to support Raw Data Views (which use this command to close
+// the Grid popup).
+GridView.selectionCommands = {
+  cancel: function() { this.clearSelection(); }
+}
 
 GridView.gridCommands = {
   cursorUp: function() {
@@ -285,13 +299,14 @@ GridView.gridCommands = {
     .finally(() => {
       this.cursor.setCursorPos(saved);
       this.cursor.setLive(true);
+      this.clearSelection();
     })
     .catch(reportError);
   },
   insertFieldBefore: function() { this.insertColumn(this.cursor.fieldIndex()); },
   insertFieldAfter: function() { this.insertColumn(this.cursor.fieldIndex() + 1); },
   renameField: function() { this.currentEditingColumnIndex(this.cursor.fieldIndex()); },
-  hideField: function() { this.hideField(this.cursor.fieldIndex()); },
+  hideFields: function() { this.hideFields(this.getSelection()); },
   deleteFields: function() { this.deleteColumns(this.getSelection()); },
   clearValues: function() { this.clearValues(this.getSelection()); },
   clearColumns: function() { this._clearColumns(this.getSelection()); },
@@ -299,10 +314,9 @@ GridView.gridCommands = {
   copy: function() { return this.copy(this.getSelection()); },
   cut: function() { return this.cut(this.getSelection()); },
   paste: async function(pasteObj, cutCallback) {
-    await this.paste(pasteObj, cutCallback);
+    await this.gristDoc.docData.bundleActions(null, () => this.paste(pasteObj, cutCallback));
     await this.scrollToCursor(false);
   },
-  cancel: function() { this.clearSelection(); },
   sortAsc: function() {
     sortBy(this.viewSection.activeSortSpec, this.currentColumn().getRowId(), Sort.ASC);
   },
@@ -372,7 +386,7 @@ GridView.prototype._shiftSelect = function(step, selectObs, exemptType, maxVal) 
  * @param {Function} cutCallback - If provided returns the record removal action needed for
  *  a cut.
  */
-GridView.prototype.paste = function(data, cutCallback) {
+GridView.prototype.paste = async function(data, cutCallback) {
   // TODO: If pasting into columns by which this view is sorted, rows may jump. It is still better
   // to allow it, but we should "freeze" the affected rows to prevent them from jumping, until the
   // user re-applies the sort manually. (This is a particularly bad experience when rows get
@@ -401,7 +415,7 @@ GridView.prototype.paste = function(data, cutCallback) {
   let fields = this.viewSection.viewFields().peek();
   let pasteFields = updateColIndices.map(i => fields[i] || null);
 
-  let richData = this._parsePasteForView(pasteData, pasteFields);
+  const richData = await parsePasteForView(pasteData, pasteFields, this.gristDoc);
   let actions = this._createBulkActionsFromPaste(updateRowIds, richData);
 
   if (actions.length > 0) {
@@ -605,8 +619,21 @@ GridView.prototype.assignCursor = function(elem, elemType) {
     console.error("GridView.assignCursor expects a row/col header, or cell as an input.");
   }
 
-
-  this.cellSelector.currentSelectType(elemType);
+  /* CellSelector already updates the selection whenever rowIndex/fieldIndex is changed, but
+   * since those observables don't currently notify subscribers when an unchanged value is
+   * written, there are cases where the selection doesn't get updated. For example, when doing
+   * a click and drag to select cells and then clicking the "selected" cell that's outlined in
+   * green, the row/column numbers remain highlighted as if they are still selected, while
+   * GridView indicates the cells are not selected. This causes bugs that range from the
+   * aformentioned visual discrepancy to incorrect copy/paste behavior due to out-of-date
+   * selection ranges.
+   *
+   * We address this by calling setToCursor here unconditionally, but another possible approach
+   * might be to extend rowIndex/fieldIndex to always notify their subscribers. Always notifying
+   * currently introduces some bugs, and we'd also need to check that it doesn't cause too
+   * much unnecessary UI recomputation elsewhere, so in the interest of time we use the first
+   * approach. */
+  this.cellSelector.setToCursor(elemType);
 };
 
 /**
@@ -644,15 +671,22 @@ GridView.prototype.addNewColumn = function() {
  .then(() => this.scrollPaneRight());
 };
 
-GridView.prototype.insertColumn = function(index) {
-  var pos = tableUtil.fieldInsertPositions(this.viewSection.viewFields(), index)[0];
+GridView.prototype.insertColumn = async function(index) {
+  const pos = tableUtil.fieldInsertPositions(this.viewSection.viewFields(), index)[0];
   var action = ['AddColumn', null, {"_position": pos}];
-  return this.tableModel.sendTableAction(action)
-  .bind(this).then(function() {
-    this.selectColumn(index);
-    this.currentEditingColumnIndex(index);
-    // this.columnConfigTab.show();
+  await this.gristDoc.docData.bundleActions('Insert column', async () => {
+    const colInfo = await this.tableModel.sendTableAction(action);
+    if (!this.viewSection.isRaw.peek()){
+      const fieldInfo = {
+        colRef: colInfo.colRef,
+        parentPos: pos,
+        parentId: this.viewSection.id.peek()
+      };
+      await this.gristDoc.docModel.viewFields.sendTableAction(['AddRecord', null, fieldInfo]);
+    }
   });
+  this.selectColumn(index);
+  this.currentEditingColumnIndex(index);
 };
 
 GridView.prototype.scrollPaneRight = function() {
@@ -686,14 +720,14 @@ GridView.prototype.deleteColumns = function(selection) {
   let actions = fields.filter(col => !col.disableModify()).map(col => ['RemoveColumn', col.colId()]);
   if (actions.length > 0) {
     this.tableModel.sendTableActions(actions, `Removed columns ${actions.map(a => a[1]).join(', ')} ` +
-      `from ${this.tableModel.tableData.tableId}.`);
+      `from ${this.tableModel.tableData.tableId}.`).then(() => this.clearSelection());
   }
 };
 
-GridView.prototype.hideField = function(index) {
-  var field = this.viewSection.viewFields().at(index);
-  var action = ['RemoveRecord', field.id()];
-  return this.gristDoc.docModel.viewFields.sendTableAction(action);
+GridView.prototype.hideFields = function(selection) {
+  var actions = selection.fields.map(field => ['RemoveRecord', field.id()]);
+  return this.gristDoc.docModel.viewFields.sendTableActions(actions, `Hide columns ${actions.map(a => a[1]).join(', ')} ` +
+  `from ${this.tableModel.tableData.tableId}.`);
 };
 
 GridView.prototype.moveColumns = function(oldIndices, newIndex) {
@@ -709,10 +743,12 @@ GridView.prototype.moveColumns = function(oldIndices, newIndex) {
   var vsfAction = ['BulkUpdateRecord', vsfRowIds, colInfo];
   var viewFieldsTable =  this.gristDoc.docModel.viewFields;
   var numCols = oldIndices.length;
-  var self = this;
-  viewFieldsTable.sendTableAction(vsfAction).then(function() {
-    self._selectMovedElements(self.cellSelector.col.start, self.cellSelector.col.end,
-                              newIndex, numCols, selector.COL);
+  const newPos = newIndex < this.cellSelector.colLower() ? newIndex : newIndex - numCols;
+  viewFieldsTable.sendTableAction(vsfAction).then(() => {
+    this.cursor.fieldIndex(newPos);
+    this.cellSelector.currentSelectType(selector.COL);
+    this.cellSelector.col.start(newPos);
+    this.cellSelector.col.end(newPos + numCols - 1);
   });
 };
 
@@ -727,30 +763,13 @@ GridView.prototype.moveRows = function(oldIndices, newIndex) {
   var colInfo = { 'manualSort': newPositions };
   var action = ['BulkUpdateRecord', rowIds, colInfo];
   var numRows = oldIndices.length;
-  var self = this;
-  this.tableModel.sendTableAction(action).then(function() {
-    self._selectMovedElements(self.cellSelector.row.start, self.cellSelector.row.end,
-                              newIndex, numRows, selector.ROW);
+  const newPos = newIndex < this.cellSelector.rowLower() ? newIndex : newIndex - numRows;
+  this.tableModel.sendTableAction(action).then(() => {
+    this.cursor.rowIndex(newPos);
+    this.cellSelector.currentSelectType(selector.ROW);
+    this.cellSelector.row.start(newPos);
+    this.cellSelector.row.end(newPos + numRows - 1);
   });
-};
-
-/**
- * Return a list of manual sort positions so that inserting {numInsert} rows
- * with the returned positions will place them in between index-1 and index.
- * when the GridView is sorted by MANUALSORT
- **/
-GridView.prototype._getRowInsertPos = function(index, numInserts) {
-  var lowerRowId = this.viewData.getRowId(index-1);
-  var upperRowId = this.viewData.getRowId(index);
-  if (lowerRowId === 'new') {
-    // set the lowerRowId to the rowId of the row before 'new'.
-    lowerRowId = this.viewData.getRowId(index - 2);
-  }
-
-  var lowerPos = this.tableModel.tableData.getValue(lowerRowId, MANUALSORT);
-  var upperPos = this.tableModel.tableData.getValue(upperRowId, MANUALSORT);
-  // tableUtil.insertPositions takes care of cases where upper/lowerPos are non-zero & falsy
-  return tableUtil.insertPositions(lowerPos, upperPos, numInserts);
 };
 
 
@@ -923,7 +942,13 @@ GridView.prototype.buildDom = function() {
     dom('div.frozen_line', kd.show(this.frozenLine)),
     dom('div.gridview_header_backdrop_left'), //these hide behind the actual headers to keep them from flashing
     dom('div.gridview_header_backdrop_top'),
-    dom('div.gridview_left_border'), //these hide behind the actual headers to keep them from flashing
+    // When there are frozen columns, right border for number row will not be visible (as actually there is no border,
+    // it comes from the first cell in the grid) making a gap between row-number and actual column. So when we scroll
+    // the content of the scrolled columns will be visible to the user (as there is blank space there).
+    // This line fills the gap. NOTE that we are using number here instead of a boolean.
+    dom('div.gridview_left_border', kd.show(this.numFrozen),
+      kd.style("left", ROW_NUMBER_WIDTH + 'px')
+    ),
     // left shadow that will be visible on top of frozen columns
     dom('div.scroll_shadow_frozen', kd.show(this.frozenShadow)),
     // When cursor leaves the GridView, remove hover immediately (without debounce).
@@ -1090,8 +1115,41 @@ GridView.prototype.buildDom = function() {
     // rows. IsCellActive is only subscribed to columns for the active row. This way, when
     // the cursor moves, there are (rows+2*columns) calls rather than rows*columns.
     var isRowActive = ko.computed(() => row._index() === self.cursor.rowIndex());
+
+    const computedFlags = ko.pureComputed(() => {
+      return self.viewSection.rulesColsIds().map(colRef => {
+        if (row.cells[colRef]) { return row.cells[colRef]() || false; }
+        return false;
+      });
+    });
+
+    const computedRule = koUtil.withKoUtils(ko.pureComputed(() => {
+      if (row._isAddRow() || !row.id()) { return null; }
+      const flags = computedFlags();
+      if (flags.length === 0) { return null; }
+      const styles = self.viewSection.rulesStyles() || [];
+      return { style : new CombinedStyle(styles, flags) };
+    }, this).extend({deferred: true}));
+
+    const fillColor = buildStyleOption(self, computedRule, 'fillColor');
+    const zebraColor = ko.pureComputed(() => calcZebra(fillColor()));
+    const textColor = buildStyleOption(self, computedRule, 'textColor');
+    const fontBold = buildStyleOption(self, computedRule, 'fontBold');
+    const fontItalic = buildStyleOption(self, computedRule, 'fontItalic');
+    const fontUnderline = buildStyleOption(self, computedRule, 'fontUnderline');
+    const fontStrikethrough = buildStyleOption(self, computedRule, 'fontStrikethrough');
+
     return dom('div.gridview_row',
       dom.autoDispose(isRowActive),
+      dom.autoDispose(computedFlags),
+      dom.autoDispose(computedRule),
+      dom.autoDispose(textColor),
+      dom.autoDispose(fillColor),
+      dom.autoDispose(zebraColor),
+      dom.autoDispose(fontBold),
+      dom.autoDispose(fontItalic),
+      dom.autoDispose(fontUnderline),
+      dom.autoDispose(fontStrikethrough),
 
       // rowid dom
       dom('div.gridview_data_row_num',
@@ -1138,6 +1196,13 @@ GridView.prototype.buildDom = function() {
         kd.toggleClass('record-add', row._isAddRow),
         kd.style('borderLeftWidth', v.borderWidthPx),
         kd.style('borderBottomWidth', v.borderWidthPx),
+        kd.toggleClass('font-bold', fontBold),
+        kd.toggleClass('font-underline', fontUnderline),
+        kd.toggleClass('font-italic', fontItalic),
+        kd.toggleClass('font-strikethrough', fontStrikethrough),
+        kd.style('--grist-row-background-color', fillColor),
+        kd.style('--grist-row-background-color-zebra', zebraColor),
+        kd.style('--grist-row-color', textColor),
         //These are grabbed from v.optionsObj at start of GridView buildDom
         kd.toggleClass('record-hlines', vHorizontalGridlines),
         kd.toggleClass('record-vlines', vVerticalGridlines),
@@ -1202,6 +1267,7 @@ GridView.prototype.buildDom = function() {
 
             kd.toggleClass('selected', isSelected),
             fieldBuilder.buildDomWithCursor(row, isCellActive, isCellSelected),
+            dom('div.field_selection')
           );
         })
       )
@@ -1488,25 +1554,6 @@ GridView.prototype.dropCols = function() {
   this._colClickTime = 0;
 };
 
-/**
- * After rows/cols in the range start() to end() inclusive are moved to newIndex,
- * update the start and end observables so that they stay selected after the move.
- * @param {observable} start - observable denoting the start index of the moved/dropped elements
- * @param {observable} end - observable denoting the end index of the moved/dropped elements
- * @param {integer} numEles - number of elements to move
- * @param {integer} newIndex - new index of the start of the selected range
- */
-GridView.prototype._selectMovedElements = function(start, end, newIndex, numEles, elemType) {
-  console.assert(elemType === selector.ROW || elemType === selector.COL);
-  var newPos = newIndex < Math.min(start(), end()) ? newIndex : newIndex - numEles;
-  if (elemType === selector.COL) this.cursor.fieldIndex(newPos);
-  else if (elemType === selector.ROW) this.cursor.rowIndex(newPos);
-
-  this.cellSelector.currentSelectType(elemType);
-  start(newPos);
-  end(newPos + numEles - 1);
-};
-
 // End of Dragging logic
 
 
@@ -1579,7 +1626,7 @@ GridView.prototype._getRowContextMenuOptions = function() {
     disableInsert: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || this.tableModel.tableMetaRow.onDemand()),
     disableDelete: Boolean(this.gristDoc.isReadonly.get() || this.viewSection.disableAddRemoveRows() || this.getSelection().onlyAddRowSelected()),
     isViewSorted: this.viewSection.activeSortSpec.peek().length > 0,
-    numRows: this.getSelection().rowIds.length
+    numRows: this.getSelection().rowIds.length,
   };
 };
 
@@ -1594,6 +1641,28 @@ GridView.prototype.cellContextMenu = function() {
 
 GridView.prototype.scrollToCursor = function(sync = true) {
   return kd.doScrollChildIntoView(this.scrollPane, this.cursor.rowIndex(), sync);
+}
+
+GridView.prototype._duplicateRows = async function() {
+  const addRowIds = await BaseView.prototype._duplicateRows.call(this);
+  // Highlight duplicated rows if the grid is not sorted (or the sort doesn't affect rowIndex).
+  const topRowIndex = this.viewData.getRowIndex(addRowIds[0]);
+  // Set row on the first record added.
+  this.setCursorPos({rowId: addRowIds[0]});
+  // Highlight inserted area (if we inserted rows in correct order)
+  if (addRowIds.every((r, i) => r === this.viewData.getRowId(topRowIndex + i))) {
+    this.cellSelector.selectArea(topRowIndex, 0,
+      topRowIndex + addRowIds.length - 1, this.viewSection.viewFields().peekLength - 1);
+  }
+}
+
+function buildStyleOption(owner, computedRule, optionName) {
+  return ko.computed(() => {
+    if (owner.isDisposed()) { return null; }
+    const rule = computedRule();
+    if (!rule || !rule.style) { return ''; }
+    return rule.style[optionName] || '';
+  });
 }
 
 // Helper to show tooltip over column selection in the full edit mode.
@@ -1614,6 +1683,22 @@ class HoverColumnTooltip {
   dispose() {
     this.hide();
   }
+}
+
+// Simple function that calculates good color for zebra stripes.
+function calcZebra(hex) {
+  if (!hex || hex.length !== 7) { return hex; }
+  // HSL: [HUE, SATURATION, LIGHTNESS]
+  const hsl = convert.hex.hsl(hex.substr(1));
+  // For bright color, we will make it darker. Value was picked by hand, to
+  // produce #f8f8f8f out of #ffffff.
+  if (hsl[2] > 50) { hsl[2] -= 2.6; }
+  // For darker color, we will make it brighter. Value was picked by hand to look
+  // good for the darkest colors in our palette.
+  else if (hsl[2] > 1) { hsl[2] += 11; }
+  // For very dark colors
+  else { hsl[2] += 16; }
+  return `#${convert.hsl.hex(hsl)}`;
 }
 
 module.exports = GridView;

@@ -11,40 +11,43 @@ import {FilterInfo} from 'app/client/models/entities/ViewSectionRec';
 import {RowId, RowSource} from 'app/client/models/rowset';
 import {ColumnFilterFunc, SectionFilter} from 'app/client/models/SectionFilter';
 import {TableData} from 'app/client/models/TableData';
+import {cssInput} from 'app/client/ui/cssInput';
 import {basicButton, primaryButton} from 'app/client/ui2018/buttons';
 import {cssLabel as cssCheckboxLabel, cssCheckboxSquare, cssLabelText, Indeterminate, labeledTriStateSquareCheckbox
        } from 'app/client/ui2018/checkbox';
-import {colors, vars} from 'app/client/ui2018/cssVars';
+import {theme, vars} from 'app/client/ui2018/cssVars';
 import {icon} from 'app/client/ui2018/icons';
 import {menuCssClass, menuDivider} from 'app/client/ui2018/menus';
 import {CellValue} from 'app/common/DocActions';
 import {isEquivalentFilter} from "app/common/FilterState";
-import {Computed, dom, DomElementArg, DomElementMethod, IDisposableOwner, input, makeTestId, styled} from 'grainjs';
+import {Computed, dom, DomElementArg, DomElementMethod, IDisposableOwner, input, makeTestId, Observable,
+  styled} from 'grainjs';
 import concat = require('lodash/concat');
 import identity = require('lodash/identity');
 import noop = require('lodash/noop');
 import partition = require('lodash/partition');
 import some = require('lodash/some');
 import tail = require('lodash/tail');
+import debounce = require('lodash/debounce');
 import {IOpenController, IPopupOptions, setPopupToCreateDom} from 'popweasel';
 import {decodeObject} from 'app/plugin/objtypes';
-import {isList, isRefListType} from 'app/common/gristTypes';
+import {isDateLikeType, isList, isNumberType, isRefListType} from 'app/common/gristTypes';
 import {choiceToken} from 'app/client/widgets/ChoiceToken';
 import {ChoiceOptions} from 'app/client/widgets/ChoiceTextBox';
-import {cssInvalidToken} from 'app/client/widgets/ChoiceListCell';
 
-interface IFilterMenuOptions {
+export interface IFilterMenuOptions {
   model: ColumnFilterMenuModel;
   valueCounts: Map<CellValue, IFilterCount>;
   doSave: (reset: boolean) => void;
   onClose: () => void;
   renderValue: (key: CellValue, value: IFilterCount) => DomElementArg;
+  rangeInputOptions?: IRangeInputOptions
 }
 
 const testId = makeTestId('test-filter-menu-');
 
 export function columnFilterMenu(owner: IDisposableOwner, opts: IFilterMenuOptions): HTMLElement {
-  const { model, doSave, onClose, renderValue } = opts;
+  const { model, doSave, onClose, rangeInputOptions = {}, renderValue } = opts;
   const { columnFilter } = model;
   // Save the initial state to allow reverting back to it on Cancel
   const initialStateJson = columnFilter.makeFilterJson();
@@ -52,23 +55,27 @@ export function columnFilterMenu(owner: IDisposableOwner, opts: IFilterMenuOptio
   // Map to keep track of displayed checkboxes
   const checkboxMap: Map<CellValue, HTMLInputElement> = new Map();
 
-  // Listen for changes to filterFunc, and update checkboxes accordingly
-  const filterListener = columnFilter.filterFunc.addListener(func => {
+  // Listen for changes to filterFunc, and update checkboxes accordingly. Debounce is needed to
+  // prevent some weirdness when users click on a checkbox while focus was on a range input (causing
+  // sometimes the checkbox to not toggle)
+  const filterListener = columnFilter.filterFunc.addListener(debounce(func => {
     for (const [value, elem] of checkboxMap) {
       elem.checked = func(value);
     }
-  });
+  }));
 
   const {searchValue: searchValueObs, filteredValues, filteredKeys, isSortedByCount} = model;
 
   const isAboveLimitObs = Computed.create(owner, (use) => use(model.valuesBeyondLimit).length > 0);
   const isSearchingObs = Computed.create(owner, (use) => Boolean(use(searchValueObs)));
+  const showRangeFilter = isNumberType(columnFilter.columnType) || isDateLikeType(columnFilter.columnType);
 
   let searchInput: HTMLInputElement;
+  let minRangeInput: HTMLInputElement;
   let reset = false;
 
-  // Gives focus to the searchInput on open
-  setTimeout(() => searchInput.focus(), 0);
+  // Gives focus to the searchInput on open (or to the min input if the range filter is present).
+  setTimeout(() => (minRangeInput || searchInput).select(), 0);
 
   const filterMenu: HTMLElement = cssMenu(
     { tabindex: '-1' }, // Allow menu to be focused
@@ -80,6 +87,18 @@ export function columnFilterMenu(owner: IDisposableOwner, opts: IFilterMenuOptio
       Enter: () => onClose(),
       Escape: () => onClose()
     }),
+
+    // Filter by range
+    dom.maybe(showRangeFilter, () => [
+      cssRangeHeader('Filter by Range'),
+      cssRangeContainer(
+        minRangeInput = rangeInput('Min ', columnFilter.min, rangeInputOptions, testId('min')),
+        cssRangeInputSeparator('→'),
+        rangeInput('Max ', columnFilter.max, rangeInputOptions, testId('max')),
+      ),
+      cssMenuDivider(),
+    ]),
+
     cssMenuHeader(
       cssSearchIcon('Search'),
       searchInput = cssSearch(
@@ -149,8 +168,9 @@ export function columnFilterMenu(owner: IDisposableOwner, opts: IFilterMenuOptio
           cssLabel(
             cssCheckboxSquare(
               {type: 'checkbox'},
-              dom.on('change', (_ev, elem) =>
-                elem.checked ? columnFilter.add(key) : columnFilter.delete(key)),
+              dom.on('change', (_ev, elem) => {
+                elem.checked ? columnFilter.add(key) : columnFilter.delete(key);
+             }),
               (elem) => { elem.checked = columnFilter.includes(key); checkboxMap.set(key, elem); },
               dom.style('position', 'relative'),
             ),
@@ -192,6 +212,41 @@ export function columnFilterMenu(owner: IDisposableOwner, opts: IFilterMenuOptio
     )
   );
   return filterMenu;
+}
+
+export interface IRangeInputOptions {
+  valueParser?: (val: string) => any;
+  valueFormatter?: (val: any) => string;
+}
+
+function rangeInput(placeholder: string, obs: Observable<number|undefined>, opts: IRangeInputOptions,
+                    ...args: DomElementArg[]) {
+  const valueParser = opts.valueParser || Number;
+  const formatValue = opts.valueFormatter || ((val) => val?.toString() || '');
+  let editMode = false;
+  let el: HTMLInputElement;
+  // keep input content in sync only when no edit are going on.
+  const lis = obs.addListener(() => editMode ? null : el.value = formatValue(obs.get()));
+  // handle change
+  const onBlur = () => {
+    onInput.flush();
+    editMode = false;
+    el.value = formatValue(obs.get());
+  };
+  const onInput = debounce(() => {
+    editMode = true;
+    const val = el.value ? valueParser(el.value) : undefined;
+    if (val === undefined || !isNaN(val)) {
+      obs.set(val);
+    }
+  }, 100);
+  return el = cssRangeInput(
+    {inputmode: 'numeric', placeholder, value: formatValue(obs.get())},
+    dom.on('input', onInput),
+    dom.on('blur', onBlur),
+    dom.autoDispose(lis),
+    ...args
+  );
 }
 
 
@@ -277,6 +332,23 @@ function formatUniqueCount(values: Array<[CellValue, IFilterCount]>) {
 }
 
 /**
+ * Returns a new `Map` object to holds pairs of `CellValue` and `IFilterCount`. For `Bool`, `Choice`
+ * and `ChoiceList` type of column, the map is initialized with all possible values in order to make
+ * sure they get shown to the user.
+ */
+function getEmptyCountMap(fieldOrColumn: ViewFieldRec|ColumnRec): Map<CellValue, IFilterCount> {
+  const columnType = fieldOrColumn.origCol().type();
+  let values: any[] = [];
+  if (columnType === 'Bool') {
+    values = [true, false];
+  } else if (['Choice', 'ChoiceList'].includes(columnType)) {
+    const options = fieldOrColumn.origCol().widgetOptionsJson;
+    values = options.prop('choices')() ?? [];
+  }
+  return new Map(values.map((v) => [v, {label: String(v), count: 0, displayValue: v}]));
+}
+
+/**
  * Returns content for the newly created columnFilterMenu; for use with setPopupToCreateDom().
  */
 export function createFilterMenu(openCtl: IOpenController, sectionFilter: SectionFilter, filterInfo: FilterInfo,
@@ -284,8 +356,20 @@ export function createFilterMenu(openCtl: IOpenController, sectionFilter: Sectio
   // Go through all of our shown and hidden rows, and count them up by the values in this column.
   const fieldOrColumn = filterInfo.fieldOrColumn;
   const columnType = fieldOrColumn.origCol.peek().type.peek();
-  const {keyMapFunc, labelMapFunc} = getMapFuncs(columnType, tableData, filterInfo.fieldOrColumn);
+  const visibleColumnType = fieldOrColumn.visibleColModel.peek()?.type.peek() || columnType;
+  const {keyMapFunc, labelMapFunc, valueMapFunc} = getMapFuncs(columnType, tableData, filterInfo.fieldOrColumn);
   const activeFilterBar = sectionFilter.viewSection.activeFilterBar;
+
+  // range input options
+  const valueParser = (fieldOrColumn as any).createValueParser?.();
+  const colFormatter = fieldOrColumn.visibleColFormatter();
+  // formatting values for Numeric columns entail issues. For instance with '%' when users type
+  // 0.499 and press enter, the input now shows 50% and there's no way to know what is the actual
+  // underlying value. Maybe worth, both 0.499 and 0.495 format to 50% but they can have different
+  // effects depending on data. Hence as of writing better to keep it only for Date.
+  const valueFormatter = isDateLikeType(visibleColumnType) ?
+    (val: any) => colFormatter.formatAny(val) :
+    undefined;
 
   function getFilterFunc(col: ViewFieldRec|ColumnRec, colFilter: ColumnFilterFunc|null) {
     return col.getRowId() === fieldOrColumn.getRowId() ? null : colFilter;
@@ -293,17 +377,18 @@ export function createFilterMenu(openCtl: IOpenController, sectionFilter: Sectio
   const filterFunc = Computed.create(null, use => sectionFilter.buildFilterFunc(getFilterFunc, use));
   openCtl.autoDispose(filterFunc);
 
-  const columnFilter = ColumnFilter.create(openCtl, filterInfo.filter.peek(), columnType);
-  sectionFilter.setFilterOverride(fieldOrColumn.getRowId(), columnFilter); // Will be removed on menu disposal
-
   const [allRows, hiddenRows] = partition(Array.from(rowSource.getAllRows()), filterFunc.get());
-  const valueCounts: Map<CellValue, {label: string, count: number}> = new Map();
-  addCountsToMap(valueCounts, allRows, {keyMapFunc, labelMapFunc, columnType});
+  const valueCounts = getEmptyCountMap(fieldOrColumn);
+  addCountsToMap(valueCounts, allRows, {keyMapFunc, labelMapFunc, columnType,
+                                        valueMapFunc});
   addCountsToMap(valueCounts, hiddenRows, {keyMapFunc, labelMapFunc, columnType,
-                                                               areHiddenRows: true});
+                                           areHiddenRows: true, valueMapFunc});
 
-  const model = ColumnFilterMenuModel.create(openCtl, columnFilter, Array.from(valueCounts));
-
+  const valueCountsArr = Array.from(valueCounts);
+  const columnFilter = ColumnFilter.create(openCtl, filterInfo.filter.peek(), columnType, visibleColumnType,
+                                           valueCountsArr.map((arr) => arr[0]));
+  sectionFilter.setFilterOverride(fieldOrColumn.origCol().getRowId(), columnFilter); // Will be removed on menu disposal
+  const model = ColumnFilterMenuModel.create(openCtl, columnFilter, valueCountsArr);
 
   return columnFilterMenu(openCtl, {
     model,
@@ -321,12 +406,17 @@ export function createFilterMenu(openCtl: IOpenController, sectionFilter: Sectio
       }
     },
     renderValue: getRenderFunc(columnType, fieldOrColumn),
+    rangeInputOptions: {
+      valueParser,
+      valueFormatter,
+    }
   });
 }
 
 /**
- * Returns two callback functions, `keyMapFunc` and `labelMapFunc`,
- * which map row ids to cell values and labels respectively.
+ * Returns three callback functions, `keyMapFunc`, `labelMapFunc`
+ * and `valueMapFunc`, which map row ids to cell values, labels
+ * and visible col value respectively.
  *
  * The functions vary based on the `columnType`. For example,
  * Reference Lists have a unique `labelMapFunc` that returns a list
@@ -341,6 +431,8 @@ function getMapFuncs(columnType: string, tableData: TableData, fieldOrColumn: Vi
   const formatter = fieldOrColumn.visibleColFormatter();
 
   let labelMapFunc: (rowId: number) => string | string[];
+  const valueMapFunc: (rowId: number) => any = (rowId: number) => decodeObject(labelGetter(rowId)!);
+
   if (isRefListType(columnType)) {
     labelMapFunc = (rowId: number) => {
       const maybeLabels = labelGetter(rowId);
@@ -351,8 +443,7 @@ function getMapFuncs(columnType: string, tableData: TableData, fieldOrColumn: Vi
   } else {
     labelMapFunc = (rowId: number) => formatter.formatAny(labelGetter(rowId));
   }
-
-  return {keyMapFunc, labelMapFunc};
+  return {keyMapFunc, labelMapFunc, valueMapFunc};
 }
 
 /**
@@ -378,9 +469,13 @@ function getRenderFunc(columnType: string, fieldOrColumn: ViewFieldRec|ColumnRec
         {
           fillColor: choiceOptions[value.label]?.fillColor,
           textColor: choiceOptions[value.label]?.textColor,
+          fontBold: choiceOptions[value.label]?.fontBold ?? false,
+          fontUnderline: choiceOptions[value.label]?.fontUnderline ?? false,
+          fontItalic: choiceOptions[value.label]?.fontItalic ?? false,
+          fontStrikethrough: choiceOptions[value.label]?.fontStrikethrough ?? false,
+          invalid: !choiceSet.has(value.label),
         },
         dom.cls(cssToken.className),
-        cssInvalidToken.cls('-invalid', !choiceSet.has(value.label)),
         testId('choice-token')
       );
     };
@@ -392,21 +487,27 @@ function getRenderFunc(columnType: string, fieldOrColumn: ViewFieldRec|ColumnRec
 
 interface ICountOptions {
   columnType: string;
+  // returns the indexing key for the filter
   keyMapFunc?: (v: any) => any;
+  // returns the string representation of the value (can involves some formatting).
   labelMapFunc?: (v: any) => any;
+  // returns the underlying value (useful for comparison)
+  valueMapFunc: (v: any) => any;
   areHiddenRows?: boolean;
 }
 
 /**
- * For each row id in Iterable, adds a key mapped with `keyMapFunc` and a value object with a `label` mapped
- * with `labelMapFunc` and a `count` representing the total number of times the key has been encountered.
+ * For each row id in Iterable, adds a key mapped with `keyMapFunc` and a value object with a
+ * `label` mapped with `labelMapFunc` and a `count` representing the total number of times the key
+ * has been encountered and a `displayValues` mapped with `valueMapFunc`.
  *
  * The optional column type controls how complex cell values are decomposed into keys (e.g. Choice Lists have
  * the possible choices as keys).
+ * Note that this logic is replicated in BaseView.prototype.filterByThisCellValue.
  */
 function addCountsToMap(valueMap: Map<CellValue, IFilterCount>, rowIds: RowId[],
                         { keyMapFunc = identity, labelMapFunc = identity, columnType,
-                          areHiddenRows = false }: ICountOptions) {
+                          areHiddenRows = false, valueMapFunc }: ICountOptions) {
 
   for (const rowId of rowIds) {
     let key = keyMapFunc(rowId);
@@ -414,8 +515,12 @@ function addCountsToMap(valueMap: Map<CellValue, IFilterCount>, rowIds: RowId[],
     // If row contains a list and the column is a Choice List, treat each choice as a separate key
     if (isList(key) && (columnType === 'ChoiceList')) {
       const list = decodeObject(key) as unknown[];
+      if (!list.length) {
+        // If the list is empty, add an item for the whole list, otherwise the row will be missing from filters.
+        addSingleCountToMap(valueMap, '', () => '', () => '', areHiddenRows);
+      }
       for (const item of list) {
-        addSingleCountToMap(valueMap, item, () => item, areHiddenRows);
+        addSingleCountToMap(valueMap, item, () => item, () => item, areHiddenRows);
       }
       continue;
     }
@@ -423,15 +528,20 @@ function addCountsToMap(valueMap: Map<CellValue, IFilterCount>, rowIds: RowId[],
     // If row contains a Reference List, treat each reference as a separate key
     if (isList(key) && isRefListType(columnType)) {
       const refIds = decodeObject(key) as unknown[];
+      if (!refIds.length) {
+        // If the list is empty, add an item for the whole list, otherwise the row will be missing from filters.
+        addSingleCountToMap(valueMap, null, () => null, () => null, areHiddenRows);
+      }
       const refLabels = labelMapFunc(rowId);
+      const displayValues = valueMapFunc(rowId);
       refIds.forEach((id, i) => {
-        addSingleCountToMap(valueMap, id, () => refLabels[i], areHiddenRows);
+        addSingleCountToMap(valueMap, id, () => refLabels[i], () => displayValues[i], areHiddenRows);
       });
       continue;
     }
     // For complex values, serialize the value to allow them to be properly stored
     if (Array.isArray(key)) { key = JSON.stringify(key); }
-    addSingleCountToMap(valueMap, key, () => labelMapFunc(rowId), areHiddenRows);
+    addSingleCountToMap(valueMap, key, () => labelMapFunc(rowId), () => valueMapFunc(rowId), areHiddenRows);
   }
 }
 
@@ -439,10 +549,10 @@ function addCountsToMap(valueMap: Map<CellValue, IFilterCount>, rowIds: RowId[],
  * Adds the `value` to `valueMap` using `labelGetter` to get the label and increments `count` unless
  * isHiddenRow is true.
  */
-function addSingleCountToMap(valueMap: Map<CellValue, IFilterCount>, value: any, labelGetter: () => any,
-                       isHiddenRow: boolean) {
+function addSingleCountToMap(valueMap: Map<CellValue, IFilterCount>, value: any, label: () => any,
+                             displayValue: () => any, isHiddenRow: boolean) {
   if (!valueMap.has(value)) {
-    valueMap.set(value, { label: labelGetter(), count: 0 });
+    valueMap.set(value, { label: label(), count: 0, displayValue: displayValue() });
   }
   if (!isHiddenRow) {
     valueMap.get(value)!.count++;
@@ -484,7 +594,7 @@ const cssMenu = styled('div', `
   max-width: 400px;
   max-height: 90vh;
   outline: none;
-  background-color: white;
+  background-color: ${theme.menuBg};
   padding-top: 0;
   padding-bottom: 12px;
 `);
@@ -499,15 +609,15 @@ const cssMenuHeader = styled('div', `
 `);
 const cssSelectAll = styled('div', `
   display: flex;
-  color: ${colors.lightGreen};
+  color: ${theme.controlFg};
   cursor: default;
   user-select: none;
   &-disabled {
-    color: ${colors.slate};
+    color: ${theme.controlSecondaryFg};
   }
 `);
 const cssDotSeparator = styled('span', `
-  color: ${colors.lightGreen};
+  color: ${theme.controlFg};
   margin: 0 4px;
   user-select: none;
 `);
@@ -528,14 +638,13 @@ const cssMenuItem = styled('div', `
 `);
 export const cssItemValue = styled(cssLabelText, `
   margin-right: 12px;
-  color: ${colors.dark};
   white-space: pre;
 `);
 const cssItemCount = styled('div', `
   flex-grow: 1;
   align-self: normal;
   text-align: right;
-  color: ${colors.slate};
+  color: ${theme.lightText};
 `);
 const cssMenuFooter = styled('div', `
   display: flex;
@@ -547,6 +656,8 @@ const cssApplyButton = styled(primaryButton, `
   margin-right: 4px;
 `);
 const cssSearch = styled(input, `
+  color: ${theme.inputFg};
+  background-color: ${theme.inputBg};
   flex-grow: 1;
   min-width: 1px;
   -webkit-appearance: none;
@@ -559,22 +670,26 @@ const cssSearch = styled(input, `
   border: none;
   outline: none;
 
+  &::placeholder {
+    color: ${theme.inputPlaceholderFg};
+  }
 `);
 const cssSearchIcon = styled(icon, `
+  --icon-color: ${theme.lightText};
   flex-shrink: 0;
   margin-left: auto;
   margin-right: 4px;
 `);
 const cssNoResults = styled(cssMenuItem, `
   font-style: italic;
-  color: ${colors.slate};
+  color: ${theme.lightText};
   justify-content: center;
 `);
 const cssSortIcon = styled(icon, `
-  --icon-color: ${colors.slate};
+  --icon-color: ${theme.controlSecondaryFg};
   margin-left: auto;
   &-active {
-    --icon-color: ${colors.lightGreen}
+    --icon-color: ${theme.controlFg}
   }
 `);
 const cssLabel = styled(cssCheckboxLabel, `
@@ -584,4 +699,26 @@ const cssLabel = styled(cssCheckboxLabel, `
 const cssToken = styled('div', `
   margin-left: 8px;
   margin-right: 12px;
+`);
+const cssRangeHeader = styled(cssMenuItem, `
+  color: ${theme.text};
+  padding: unset;
+  border-radius: 0 0 3px 0;
+  text-transform: uppercase;
+  font-size: var(--grist-x-small-font-size);
+  margin: 16px 16px 6px 16px;
+`);
+const cssRangeContainer = styled(cssMenuItem, `
+  display: flex;
+  justify-content: left;
+  align-items: center;
+  column-gap: 10px;
+`);
+const cssRangeInputSeparator = styled('span', `
+  font-weight: 600;
+  color: ${theme.lightText};
+`);
+const cssRangeInput = styled(cssInput, `
+  height: unset;
+  width: 120px;
 `);

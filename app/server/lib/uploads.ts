@@ -8,7 +8,7 @@ import {expressWrap} from 'app/server/lib/expressWrap';
 import {downloadFromGDrive, isDriveUrl} from 'app/server/lib/GoogleImport';
 import {GristServer, RequestWithGrist} from 'app/server/lib/GristServer';
 import {guessExt} from 'app/server/lib/guessExt';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {optStringParam} from 'app/server/lib/requestUtils';
 import {isPathWithin} from 'app/server/lib/serverUtils';
 import * as shutdown from 'app/server/lib/shutdown';
@@ -54,7 +54,11 @@ export function addUploadRoute(server: GristServer, expressApp: Application, ...
       res.status(200).send(JSON.stringify(uploadResult));
     } catch (err) {
       req.resume();
-      log.error("Error uploading file", err);
+      if (err.message && /Request aborted/.test(err.message)) {
+        log.warn("File upload request aborted", err);
+      } else {
+        log.error("Error uploading file", err);
+      }
       // Respond with a JSON error like jsonErrorHandler does for API calls,
       // to make it easier for the caller to parse it.
       res.status(err.status || 500).json({error: err.message || 'internal error'});
@@ -116,6 +120,7 @@ export async function handleOptionalUpload(req: Request, res: Response): Promise
     org: mreq.org,
     email: mreq.user && mreq.user.loginEmail,
     userId: mreq.userId,
+    altSessionId: mreq.altSessionId,
   };
 
   log.rawDebug(`Prepared to receive upload into tmp dir ${tmpDir}`, meta);
@@ -412,7 +417,7 @@ async function fetchDoc(server: GristServer, docId: string, req: Request, access
   await _checkForError(response);
   const docWorkerUrl = getDocWorkerUrl(server.getOwnUrl(), await response.json());
   // Download the document, in full or as a template.
-  const url = new URL(`download?doc=${docId}&template=${Number(template)}`,
+  const url = new URL(`api/docs/${docId}/download?template=${Number(template)}`,
                       docWorkerUrl.replace(/\/*$/, '/'));
   return _fetchURL(url.href, accessId, {headers});
 }

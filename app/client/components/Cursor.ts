@@ -4,9 +4,9 @@
  */
 
 
-import * as BaseView from 'app/client/components/BaseView';
+import BaseView from 'app/client/components/BaseView';
 import * as commands from 'app/client/components/commands';
-import * as BaseRowModel from 'app/client/models/BaseRowModel';
+import BaseRowModel from 'app/client/models/BaseRowModel';
 import {LazyArrayModel} from 'app/client/models/DataTableModel';
 import type {RowId} from 'app/client/models/rowset';
 import {Disposable} from 'grainjs';
@@ -81,7 +81,7 @@ export class Cursor extends Disposable {
     this.viewData = baseView.viewData;
 
     this._sectionId = this.autoDispose(ko.computed(() => baseView.viewSection.id()));
-    this._rowId = ko.observable(optCursorPos.rowId || 0);
+    this._rowId = ko.observable<RowId|null>(optCursorPos.rowId || 0);
     this.rowIndex = this.autoDispose(ko.computed({
       read: () => {
         if (!this._isLive()) { return this.rowIndex.peek(); }

@@ -1,12 +1,14 @@
 import re
 import test_engine
 import testsamples
+import testutil
+
 
 class TestUndo(test_engine.EngineTestCase):
   def test_bad_undo(self):
     # Sometimes undo can make metadata inconsistent with schema. Check that we disallow it.
     self.load_sample(testsamples.sample_students)
-    out_actions1 = self.apply_user_action(['AddEmptyTable'])
+    out_actions1 = self.apply_user_action(['AddEmptyTable', None])
     self.assertPartialData("_grist_Tables", ["id", "tableId", "columns"], [
       [1,   "Students", [1,2,4,5,6]],
       [2,   "Schools", [10,12]],
@@ -60,7 +62,7 @@ class TestUndo(test_engine.EngineTestCase):
     # during undo of imports when the undo could omit part of the action bundle.
     self.load_sample(testsamples.sample_students)
 
-    out_actions1 = self.apply_user_action(['AddEmptyTable'])
+    out_actions1 = self.apply_user_action(['AddEmptyTable', None])
     out_actions2 = self.add_column('Table1', 'D', type='Text')
     out_actions3 = self.remove_column('Table1', 'D')
     out_actions4 = self.apply_user_action(['RemoveTable', 'Table1'])
@@ -79,4 +81,44 @@ class TestUndo(test_engine.EngineTestCase):
       [2,   "Schools", [10,12]],
       [3,   "Address", [21]],
       [4,   "Table1", [22, 23]],
+    ])
+
+  @test_engine.test_undo
+  def test_auto_remove_undo(self):
+    """
+    Test that a formula using docmodel.setAutoRemove doesn't break when undoing.
+    We don't actually recommend using docmodel.setAutoRemove in formulas,
+    but it'd be nice, and this is really testing that a bugfix about summary tables
+    also helps outside of summary tables.
+    """
+    self.load_sample(testutil.parse_test_sample({
+      "SCHEMA": [
+        [1, "Table", [
+          [11, "amount", "Numeric", False, "", "", ""],
+          [12, "amount2", "Numeric", True, "$amount", "", ""],
+          [13, "remove", "Any", True,
+           "table.table._engine.docmodel.setAutoRemove(rec, not $amount2)", "", ""],
+        ]]
+      ],
+      "DATA": {
+        "Table": [
+          ["id", "amount", "amount2"],
+          [21, 1, 1],
+          [22, 2, 2],
+        ]
+      }
+    }))
+    out_actions = self.update_record('Table', 21, amount=0)
+    self.assertOutActions(out_actions, {
+      'calc': [],
+      'direct': [True, False],
+      'stored': [['UpdateRecord', 'Table', 21, {'amount': 0.0}],
+                 ['RemoveRecord', 'Table', 21]],
+      'undo': [['UpdateRecord', 'Table', 21, {'amount2': 1.0}],
+               ['UpdateRecord', 'Table', 21, {'amount': 1.0}],
+               ['AddRecord', 'Table', 21, {}]],
+    })
+    self.assertTableData('Table', cols="subset", data=[
+      ["id", "amount", "amount2"],
+      [22, 2, 2],
     ])

@@ -2,7 +2,7 @@ import {drive} from '@googleapis/drive';
 import {ActiveDoc} from 'app/server/lib/ActiveDoc';
 import {RequestWithLogin} from 'app/server/lib/Authorizer';
 import {makeXLSX} from 'app/server/lib/ExportXLSX';
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {optStringParam} from 'app/server/lib/requestUtils';
 import {Request, Response} from 'express';
 import {PassThrough} from 'stream';
@@ -22,9 +22,11 @@ export async function exportToDrive(
     throw new Error("No access token - Can't send file to Google Drive");
   }
 
+  const mreq = req as RequestWithLogin;
   const meta = {
-    docId : activeDoc.docName,
-    userId : (req as RequestWithLogin).userId
+    docId: activeDoc.docName,
+    userId: mreq.userId,
+    altSessionId: mreq.altSessionId,
   };
   // Prepare file for exporting.
   log.debug(`Export to drive - Preparing file for export`, meta);

@@ -1,6 +1,6 @@
 import { allCommands } from 'app/client/components/commands';
 import { ViewFieldRec } from 'app/client/models/entities/ViewFieldRec';
-import { testId, vars } from 'app/client/ui2018/cssVars';
+import { testId, theme } from 'app/client/ui2018/cssVars';
 import { icon } from 'app/client/ui2018/icons';
 import { menuDivider, menuItem, menuItemCmd } from 'app/client/ui2018/menus';
 import { Sort } from 'app/common/SortSpec';
@@ -112,7 +112,7 @@ export function ColumnContextMenu(options: IColumnContextMenu) {
     menuItem(allCommands.sortFilterTabOpen.run, 'More sort options ...', testId('more-sort-options')),
     menuDivider({style: 'margin-top: 0;'}),
     menuItemCmd(allCommands.renameField, 'Rename column', disableForReadonlyColumn),
-    menuItemCmd(allCommands.hideField, 'Hide column', dom.cls('disabled', isReadonly || isRaw)),
+    menuItemCmd(allCommands.hideFields, 'Hide column', dom.cls('disabled', isReadonly || isRaw)),
     freezeMenuItemCmd(options),
     menuDivider(),
     MultiColumnMenu((options.disableFrozenMenu = true, options)),
@@ -136,10 +136,9 @@ export function MultiColumnMenu(options: IMultiColumnContextMenu) {
     (num > 1 ? `Clear ${num} entire columns` : 'Clear entire column') :
     (num > 1 ? `Clear ${num} columns` : 'Clear column');
   const nameDeleteColumns = num > 1 ? `Delete ${num} columns` : 'Delete column';
+  const nameHideColumns = num > 1 ? `Hide ${num} columns` : 'Hide column';
   const frozenMenu = options.disableFrozenMenu ? null : freezeMenuItemCmd(options);
   return [
-    // TODO This should be made to work too for multiple columns.
-    // menuItemCmd(allCommands.hideField, 'Hide column', disableForReadonlyView),
     frozenMenu ? [frozenMenu, menuDivider()]: null,
     // Offered only when selection includes formula columns, and converts only those.
     (options.isFormula ?
@@ -150,6 +149,7 @@ export function MultiColumnMenu(options: IMultiColumnContextMenu) {
     (options.isFormula !== true ?
       menuItemCmd(allCommands.clearValues, 'Clear values', disableForReadonlyColumn) : null),
 
+    menuItemCmd(allCommands.hideFields, nameHideColumns, disableForReadonlyView),
     menuItemCmd(allCommands.clearColumns, nameClearColumns, disableForReadonlyColumn),
     menuItemCmd(allCommands.deleteFields, nameDeleteColumns, disableForReadonlyColumn),
 
@@ -297,9 +297,9 @@ const cssCustomMenuItem = styled('div', `
   padding: 8px 8px;
   display: flex;
   &:not(:hover) {
-    background-color: white;
-    color: black;
-    --icon-color: black;
+    background-color: ${theme.menuBg};
+    color: ${theme.menuItemFg};
+    --icon-color: ${theme.menuItemFg};
   }
   &:last-of-type {
     padding-right: 24px;
@@ -310,9 +310,9 @@ const cssCustomMenuItem = styled('div', `
     flex: 1 0 auto;
   }
   &-selected, &-selected:not(:hover) {
-    background-color: ${vars.primaryBg};
-    color: white;
-    --icon-color: white;
+    background-color: ${theme.menuItemSelectedBg};
+    color: ${theme.menuItemSelectedFg};
+    --icon-color: ${theme.menuItemSelectedFg};
   }
 `);
 

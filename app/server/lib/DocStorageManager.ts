@@ -1,19 +1,20 @@
 import * as bluebird from 'bluebird';
 import * as chokidar from 'chokidar';
 import * as fse from 'fs-extra';
-import * as moment from 'moment';
+import moment from 'moment';
 import * as path from 'path';
 
 import {DocEntry, DocEntryTag} from 'app/common/DocListAPI';
 import {DocSnapshots} from 'app/common/DocSnapshot';
+import {DocumentUsage} from 'app/common/DocUsage';
 import * as gutil from 'app/common/gutil';
-import * as Comm from 'app/server/lib/Comm';
+import {Comm} from 'app/server/lib/Comm';
 import * as docUtils from 'app/server/lib/docUtils';
 import {GristServer} from 'app/server/lib/GristServer';
 import {IDocStorageManager} from 'app/server/lib/IDocStorageManager';
 import {IShell} from 'app/server/lib/IShell';
-import * as log from 'app/server/lib/log';
-import * as uuidv4 from "uuid/v4";
+import log from 'app/server/lib/log';
+import uuidv4 from "uuid/v4";
 
 
 /**
@@ -41,8 +42,8 @@ export class DocStorageManager implements IDocStorageManager {
               private _comm?: Comm, gristServer?: GristServer) {
     // If we have a way to communicate with clients, watch the docsRoot for changes.
     this._watcher = null;
-    this._shell = (gristServer && gristServer.create.Shell()) || {
-      moveItemToTrash()  { throw new Error('Unable to move document to trash'); },
+    this._shell = gristServer?.create.Shell?.() || {
+      trashItem() { throw new Error('Unable to move document to trash'); },
       showItemInFolder() { throw new Error('Unable to show item in folder'); }
     };
     if (_comm) {
@@ -117,16 +118,15 @@ export class DocStorageManager implements IDocStorageManager {
    * @param {String} docName: docName of the document to delete.
    * @returns {Promise} Resolved on success.
    */
-  public deleteDoc(docName: string, deletePermanently?: boolean): Promise<void> {
+  public async deleteDoc(docName: string, deletePermanently?: boolean): Promise<void> {
     const docPath = this.getPath(docName);
     // Keep this check, to protect against wiping out the whole disk or the user's home.
     if (path.extname(docPath) !== '.grist') {
       return Promise.reject(new Error("Refusing to delete path which does not end in .grist"));
     } else if (deletePermanently) {
-      return fse.remove(docPath);
+      await fse.remove(docPath);
     } else {
-      this._shell.moveItemToTrash(docPath);  // this is a synchronous action
-      return Promise.resolve();
+      await this._shell.trashItem(docPath);
     }
   }
 
@@ -214,6 +214,14 @@ export class DocStorageManager implements IDocStorageManager {
   }
 
   public markAsEdited(docName: string): void {
+    // nothing to do
+  }
+
+  public scheduleUsageUpdate(
+    docName: string,
+    docUsage: DocumentUsage,
+    minimizeDelay = false
+  ): void {
     // nothing to do
   }
 

@@ -1,3 +1,15 @@
+export interface SnapshotWindow {
+  count: number;
+  unit: 'days' | 'month' | 'year';
+}
+
+// Information about the product associated with an org or orgs.
+export interface Product {
+  name: string;
+  features: Features;
+}
+
+
 // A product is essentially a list of flags and limits that we may enforce/support.
 export interface Features {
   vanityDomain?: boolean;   // are user-selected domains allowed (unenforced) (default: true)
@@ -35,17 +47,17 @@ export interface Features {
 
   readOnlyDocs?: boolean;   // if set, docs can only be read, not written.
 
-  snapshotWindow?: {        // if set, controls how far back snapshots are kept.
-    count: number;          // TODO: not honored at time of writing.
-    unit: 'month'|'year';
-  };
+  snapshotWindow?: SnapshotWindow;  // if set, controls how far back snapshots are kept.
 
   baseMaxRowsPerDocument?: number;  // If set, establishes a default maximum on the
                                  // number of rows (total) in a single document.
                                  // Actual max for a document may be higher.
-                                 // TODO: not honored at time of writing.
-                                 // TODO: nuances about how rows are counted.
   baseMaxApiUnitsPerDocumentPerDay?: number;  // Similar for api calls.
+  baseMaxDataSizePerDocument?: number;  // Similar maximum for number of bytes of 'normal' data in a document
+  baseMaxAttachmentsBytesPerDocument?: number;  // Similar maximum for total number of bytes used
+                                                // for attached files in a document
+
+  gracePeriodDays?: number;  // Duration of the grace period in days, before entering delete-only mode
 }
 
 // Check whether it is possible to add members at the org level.  There's no flag
@@ -54,4 +66,57 @@ export interface Features {
 // to org (even though this is not enforced).
 export function canAddOrgMembers(features: Features): boolean {
   return features.maxWorkspacesPerOrg !== 1;
+}
+
+
+export const PERSONAL_LEGACY_PLAN = 'starter';
+export const PERSONAL_FREE_PLAN = 'personalFree';
+export const TEAM_FREE_PLAN = 'teamFree';
+export const TEAM_PLAN = 'team';
+
+export const displayPlanName: { [key: string]: string } = {
+  [PERSONAL_LEGACY_PLAN]: 'Free Personal (Legacy)',
+  [PERSONAL_FREE_PLAN]: 'Free Personal',
+  [TEAM_FREE_PLAN]: 'Team Free',
+  [TEAM_PLAN]: 'Team'
+} as const;
+
+// Returns true if `planName` is for a personal product.
+export function isPersonalPlan(planName: string): boolean {
+  return isFreePersonalPlan(planName);
+}
+
+// Returns true if `planName` is for a free personal product.
+export function isFreePersonalPlan(planName: string): boolean {
+  return [PERSONAL_LEGACY_PLAN, PERSONAL_FREE_PLAN].includes(planName);
+}
+
+// Returns true if `planName` is for a legacy product.
+export function isLegacyPlan(planName: string): boolean {
+  return isFreeLegacyPlan(planName);
+}
+
+// Returns true if `planName` is for a free legacy product.
+export function isFreeLegacyPlan(planName: string): boolean {
+  return [PERSONAL_LEGACY_PLAN].includes(planName);
+}
+
+// Returns true if `planName` is for a team product.
+export function isTeamPlan(planName: string): boolean {
+  return !isPersonalPlan(planName);
+}
+
+// Returns true if `planName` is for a free team product.
+export function isFreeTeamPlan(planName: string): boolean {
+  return [TEAM_FREE_PLAN].includes(planName);
+}
+
+// Returns true if `planName` is for a free product.
+export function isFreePlan(planName: string): boolean {
+  return (
+    isFreePersonalPlan(planName) ||
+    isFreeTeamPlan(planName) ||
+    isFreeLegacyPlan(planName) ||
+    planName === 'Free'
+  );
 }

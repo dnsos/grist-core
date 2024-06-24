@@ -2,7 +2,9 @@ import { ColumnRec, DocModel, TableRec, ViewSectionRec } from 'app/client/models
 import { IPageWidget } from 'app/client/ui/PageWidgetPicker';
 import { getReferencedTableId } from 'app/common/gristTypes';
 import { IOptionFull } from 'grainjs';
-import * as assert from 'assert';
+import assert from 'assert';
+import * as gutil from "app/common/gutil";
+import isEqual = require('lodash/isEqual');
 
 // some unicode characters
 const BLACK_CIRCLE = '\u2022';
@@ -40,6 +42,9 @@ interface LinkNode {
   // is the table a summary table
   isSummary: boolean;
 
+  // For a summary table, the set of col refs of the groupby columns of the underlying table
+  groupbyColumns?: Set<number>;
+
   // list of ids of the sections that are ancestors to this section according to the linked section
   // relationship
   ancestors: Set<number>;
@@ -56,6 +61,12 @@ interface LinkNode {
 }
 
 
+// Returns true if this node corresponds to the special 'group' reflist column of a summary table
+function isSummaryGroup(node: LinkNode): boolean {
+  return node.isSummary && node.column?.colId.peek() === "group";
+}
+
+
 // Returns true is the link from `source` to `target` is valid, false otherwise.
 function isValidLink(source: LinkNode, target: LinkNode) {
 
@@ -69,8 +80,37 @@ function isValidLink(source: LinkNode, target: LinkNode) {
     return false;
   }
 
-  // summary table can only link to and from the main node (node with no column)
-  if ((source.isSummary || target.isSummary) && (source.column || target.column)) {
+  // Can only link to the somewhat special 'group' reflist column of summary tables
+  // with another ref/reflist column that isn't also a group column
+  // because otherwise it's equivalent to the usual summary table linking but potentially slower
+  if (
+    isSummaryGroup(source) && (!target.column || isSummaryGroup(target)) ||
+    isSummaryGroup(target)
+  ) {
+    return false;
+  }
+
+  // Cannot directly link a summary table to a column referencing the source table.
+  // Instead the ref column must link against the group column of the summary table, which is allowed above.
+  // The 'group' column name will be hidden from the options so it feels like linking using summaryness.
+  if (
+    (source.isSummary && !source.column && target.column) ||
+    (target.isSummary && !target.column && source.column)
+  ) {
+    return false;
+  }
+
+  // If the target is a summary table and we're linking based on 'summaryness' (i.e. there are no ref columns)
+  // then the source must be a less detailed summary table, i.e. having a subset of the groupby columns.
+  // (or they should be the same summary table for same-record linking, which this check allows through)
+  if (
+    !source.column &&
+    !target.column &&
+    target.isSummary && !(
+      source.isSummary &&
+      gutil.isSubset(source.groupbyColumns!, target.groupbyColumns!)
+    )
+  ) {
     return false;
   }
 
@@ -131,11 +171,19 @@ export function selectBy(docModel: DocModel, sources: ViewSectionRec[],
       // a human readable description
       let label = srcNode.section.titleDef();
 
-      // add the source node col name or nothing for table node
-      label += srcNode.column ? ` ${BLACK_CIRCLE} ${srcNode.column.label.peek()}` : '';
+      // add the source node col name (except for 'group') or nothing for table node
+      if (srcNode.column && !isSummaryGroup(srcNode)) {
+        label += ` ${BLACK_CIRCLE} ${srcNode.column.label.peek()}`;
+      }
 
-      // add the target column name only if target has multiple valid nodes
-      label += hasMany && tgtNode.column ? ` ${RIGHT_ARROW} ${tgtNode.column.label.peek()}` : '';
+      // add the target column name (except for 'group') when clarification is needed, i.e. if either:
+      // - target has multiple valid nodes, or
+      // - source col is 'group' and is thus hidden.
+      //     Need at least one column name to distinguish from simply selecting by summary table.
+      //     This is relevant when a table has a column referencing itself.
+      if (tgtNode.column && !isSummaryGroup(tgtNode) && (hasMany || isSummaryGroup(srcNode))) {
+        label += ` ${RIGHT_ARROW} ${tgtNode.column.label.peek()}`;
+      }
 
       // add the new option
       options.push({ label, value });
@@ -163,6 +211,9 @@ function createNodes(docModel: DocModel, sections: MaybeSection[]) {
 
 // Creates an array of LinkNode from a view section record.
 function fromViewSectionRec(section: ViewSectionRec): LinkNode[] {
+  if (section.isDisposed()) {
+    return [];
+  }
   const table = section.table.peek();
   const ancestors = new Set<number>();
 
@@ -175,9 +226,11 @@ function fromViewSectionRec(section: ViewSectionRec): LinkNode[] {
     ancestors.add(sec.getRowId());
   }
 
-  const mainNode = {
+  const isSummary = table.primaryTableId.peek() !== table.tableId.peek();
+  const mainNode: LinkNode = {
     tableId: table.primaryTableId.peek(),
-    isSummary: table.primaryTableId.peek() !== table.tableId.peek(),
+    isSummary,
+    groupbyColumns: isSummary ? table.summarySourceColRefs.peek() : undefined,
     widgetType: section.parentKey.peek(),
     ancestors,
     section,
@@ -191,23 +244,44 @@ function fromPageWidget(docModel: DocModel, pageWidget: IPageWidget): LinkNode[]
 
   if (typeof pageWidget.table !== 'number') { return []; }
 
-  const table = docModel.tables.getRowModel(pageWidget.table);
+  let table = docModel.tables.getRowModel(pageWidget.table);
+  const isSummary = pageWidget.summarize;
+  const groupbyColumns = isSummary ? new Set(pageWidget.columns) : undefined;
+  let tableExists = true;
+  if (isSummary) {
+    const summaryTable = docModel.tables.rowModels.find(
+      t => t?.summarySourceTable.peek() && isEqual(t.summarySourceColRefs.peek(), groupbyColumns));
+    if (summaryTable) {
+      // The selected source table and groupby columns correspond to this existing summary table.
+      table = summaryTable;
+    } else {
+      // This summary table doesn't exist yet. `fromColumns` will be using columns from the source table.
+      // Make sure it only uses columns that are in the selected groupby columns.
+      // The resulting targetColRef will incorrectly be from the source table,
+      // but will be corrected in GristDoc.saveLink after the summary table is created.
+      tableExists = false;
+    }
+  }
 
   const mainNode: LinkNode = {
     tableId: table.primaryTableId.peek(),
-    isSummary: pageWidget.summarize,
+    isSummary,
+    groupbyColumns,
     widgetType: pageWidget.type,
     ancestors: new Set(),
     section: docModel.viewSections.getRowModel(pageWidget.section),
   };
 
-  return fromColumns(table, mainNode);
+  return fromColumns(table, mainNode, tableExists);
 }
 
-function fromColumns(table: TableRec, mainNode: LinkNode): LinkNode[] {
+function fromColumns(table: TableRec, mainNode: LinkNode, tableExists: boolean = true): LinkNode[] {
   const nodes = [mainNode];
   const columns = table.columns.peek().peek();
   for (const column of columns) {
+    if (!tableExists && !mainNode.groupbyColumns!.has(column.getRowId())) {
+      continue;
+    }
     const tableId = getReferencedTableId(column.type.peek());
     if (tableId) {
       nodes.push({...mainNode, tableId, column});
@@ -254,16 +328,25 @@ export class LinkConfig {
     // Use null for unset cols (rather than an empty ColumnRec) for easier comparisons below.
     const srcCol = this.srcCol?.getRowId() ? this.srcCol : null;
     const tgtCol = this.tgtCol?.getRowId() ? this.tgtCol : null;
-    const srcTableId = (srcCol ? getReferencedTableId(srcCol.type.peek()) :
-      this.srcSection.table.peek().primaryTableId.peek());
-    const tgtTableId = (tgtCol ? getReferencedTableId(tgtCol.type.peek()) :
-      this.tgtSection.table.peek().primaryTableId.peek());
+    const srcTableId = (srcCol ? getReferencedTableId(srcCol.type()) :
+      this.srcSection.table().primaryTableId());
+    const tgtTableId = (tgtCol ? getReferencedTableId(tgtCol.type()) :
+      this.tgtSection.table().primaryTableId());
+    const srcTableSummarySourceTable = this.srcSection.table().summarySourceTable();
+    const tgtTableSummarySourceTable = this.tgtSection.table().summarySourceTable();
     try {
-      assert(!tgtCol || tgtCol.parentId.peek() === this.tgtSection.tableRef.peek(), "tgtCol belongs to wrong table");
-      assert(!srcCol || srcCol.parentId.peek() === this.srcSection.tableRef.peek(), "srcCol belongs to wrong table");
+      assert(Boolean(this.srcSection.getRowId()), "srcSection was disposed");
+      assert(!tgtCol || tgtCol.parentId() === this.tgtSection.tableRef(), "tgtCol belongs to wrong table");
+      assert(!srcCol || srcCol.parentId() === this.srcSection.tableRef(), "srcCol belongs to wrong table");
       assert(this.srcSection.getRowId() !== this.tgtSection.getRowId(), "srcSection links to itself");
-      assert(tgtTableId, "tgtCol not a valid reference");
-      assert(srcTableId, "srcCol not a valid reference");
+
+      // We usually expect srcTableId and tgtTableId to be non-empty, but there's one exception:
+      // when linking two summary tables that share a source table (which we can check directly)
+      // and the source table is hidden by ACL, so its tableId is empty from our perspective.
+      if (!(srcTableSummarySourceTable !== 0 && srcTableSummarySourceTable === tgtTableSummarySourceTable)) {
+        assert(tgtTableId, "tgtCol not a valid reference");
+        assert(srcTableId, "srcCol not a valid reference");
+      }
       assert(srcTableId === tgtTableId, "mismatched tableIds");
     } catch (e) {
       throw new Error(`LinkConfig invalid: ` +

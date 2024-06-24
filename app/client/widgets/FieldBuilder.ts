@@ -4,7 +4,7 @@ import { FormulaTransform } from 'app/client/components/FormulaTransform';
 import { GristDoc } from 'app/client/components/GristDoc';
 import { addColTypeSuffix } from 'app/client/components/TypeConversion';
 import { TypeTransform } from 'app/client/components/TypeTransform';
-import * as dom from 'app/client/lib/dom';
+import dom from 'app/client/lib/dom';
 import { KoArray } from 'app/client/lib/koArray';
 import * as kd from 'app/client/lib/koDom';
 import * as kf from 'app/client/lib/koForm';
@@ -13,13 +13,16 @@ import { reportError } from 'app/client/models/AppModel';
 import { DataRowModel } from 'app/client/models/DataRowModel';
 import { ColumnRec, DocModel, ViewFieldRec } from 'app/client/models/DocModel';
 import { SaveableObjObservable, setSaveValue } from 'app/client/models/modelUtil';
+import { CombinedStyle, Style } from 'app/client/models/Styles';
 import { FieldSettingsMenu } from 'app/client/ui/FieldMenus';
-import { cssBlockedCursor, cssLabel, cssRow } from 'app/client/ui/RightPanel';
+import { cssBlockedCursor, cssLabel, cssRow } from 'app/client/ui/RightPanelStyles';
 import { buttonSelect } from 'app/client/ui2018/buttonSelect';
+import { theme } from 'app/client/ui2018/cssVars';
 import { IOptionFull, menu, select } from 'app/client/ui2018/menus';
 import { DiffBox } from 'app/client/widgets/DiffBox';
 import { buildErrorDom } from 'app/client/widgets/ErrorDom';
-import { FieldEditor, openFormulaEditor, saveWithoutEditor, setupEditorCleanup } from 'app/client/widgets/FieldEditor';
+import { FieldEditor, saveWithoutEditor, setupEditorCleanup } from 'app/client/widgets/FieldEditor';
+import { openFormulaEditor } from 'app/client/widgets/FormulaEditor';
 import { NewAbstractWidget } from 'app/client/widgets/NewAbstractWidget';
 import { NewBaseEditor } from "app/client/widgets/NewBaseEditor";
 import * as UserType from 'app/client/widgets/UserType';
@@ -49,6 +52,24 @@ export function createAllFieldWidgets(gristDoc: GristDoc, viewFields: ko.Compute
 function getTypeDefinition(type: string | false) {
   if (!type) { return UserType.typeDefs.Text; }
   return UserType.typeDefs[type] || UserType.typeDefs.Text;
+}
+
+type ComputedStyle = {style?: Style; error?: true} | null | undefined;
+
+/**
+ * Builds a font option computed property.
+ */
+function buildFontOptions(
+  builder: FieldBuilder,
+  computedRule: ko.Computed<ComputedStyle>,
+  optionName: keyof Style) {
+
+  return koUtil.withKoUtils(ko.computed(() => {
+    if (builder.isDisposed()) { return false; }
+    const style = computedRule()?.style;
+    const styleFlag = style?.[optionName] || builder.field[optionName]();
+    return styleFlag;
+  })).onlyNotifyUnequal();
 }
 
 /**
@@ -112,13 +133,14 @@ export class FieldBuilder extends Disposable {
     });
 
     // Observable which evaluates to a *function* that decides if a value is valid.
-    this._isRightType = ko.pureComputed(function() {
+    this._isRightType = ko.pureComputed<(value: CellValue, options?: any) => boolean>(() => {
       return gristTypes.isRightType(this._readOnlyPureType()) || _.constant(false);
-    }, this);
+    });
 
     // Returns a boolean indicating whether the column is type Reference or ReferenceList.
     this._isRef = this.autoDispose(ko.computed(() => {
-      return isFullReferencingType(this.field.column().type());
+      const type = this.field.column().type();
+      return type !== "Attachments" && isFullReferencingType(type);
     }));
 
     // Gives the table ID to which the reference points.
@@ -134,7 +156,7 @@ export class FieldBuilder extends Disposable {
       }
     }));
 
-    this.widget = ko.pureComputed({
+    this.widget = ko.pureComputed<object>({
       owner: this,
       read() { return this.options().widget; },
       write(widget) {
@@ -176,10 +198,10 @@ export class FieldBuilder extends Disposable {
     this._rowMap = new Map();
 
     // Returns the constructor for the widget, and only notifies subscribers on changes.
-    this._widgetCons = this.autoDispose(koUtil.withKoUtils(ko.computed(function() {
+    this._widgetCons = this.autoDispose(koUtil.withKoUtils(ko.computed(() => {
       return UserTypeImpl.getWidgetConstructor(this.options().widget,
                                                this._readOnlyPureType());
-    }, this)).onlyNotifyUnequal());
+    })).onlyNotifyUnequal());
 
     // Computed builder for the widget.
     this.widgetImpl = this.autoDispose(koUtil.computedBuilder(() => {
@@ -267,7 +289,7 @@ export class FieldBuilder extends Disposable {
   // Builds the reference type table selector. Built when the column is type reference.
   public _buildRefTableSelect() {
     const allTables = Computed.create(null, (use) =>
-                                      use(this._docModel.allTableIds.getObservable()).map(tableId => ({
+                                      use(this._docModel.visibleTableIds.getObservable()).map(tableId => ({
                                         value: tableId,
                                         label: tableId,
                                         icon: 'FieldTable' as const
@@ -337,7 +359,8 @@ export class FieldBuilder extends Disposable {
       kd.maybe(() => !this._isTransformingType() && this.widgetImpl(), (widget: NewAbstractWidget) =>
         dom('div',
             widget.buildConfigDom(),
-            widget.buildColorConfigDom(),
+            cssSeparator(),
+            widget.buildColorConfigDom(this.gristDoc),
 
             // If there is more than one field for this column (i.e. present in multiple views).
             kd.maybe(() => this.origColumn.viewFields().all().length > 1, () =>
@@ -413,27 +436,88 @@ export class FieldBuilder extends Disposable {
    * Builds the cell and editor DOM for the chosen UserType. Calls the buildDom and
    *  buildEditorDom functions of its widgetImpl.
    */
-  public buildDomWithCursor(row: DataRowModel, isActive: boolean, isSelected: boolean) {
-    const widgetObs = koUtil.withKoUtils(ko.computed(function() {
+  public buildDomWithCursor(row: DataRowModel, isActive: ko.Computed<boolean>, isSelected: ko.Computed<boolean>) {
+    const computedFlags = koUtil.withKoUtils(ko.pureComputed(() => {
+      return this.field.rulesColsIds().map(colRef => row.cells[colRef]?.() ?? false);
+    }, this).extend({ deferred: true }));
+    // Here we are using computedWithPrevious helper, to return
+    // the previous value of computed rule. When user adds or deletes
+    // rules there is a brief moment that rule is still not evaluated
+    // (rules.length != value.length), in this case return last value
+    // and wait for the update.
+    const computedRule = koUtil.withKoUtils(ko.pureComputed<ComputedStyle>(() => {
+      if (this.isDisposed()) { return null; }
+      // If this is add row or a blank row (not loaded yet with all fields = '')
+      // don't use rules.
+      if (row._isAddRow() || !row.id()) { return null; }
+      const styles: Style[] = this.field.rulesStyles();
+      // Make sure that rules where computed.
+      if (!Array.isArray(styles) || styles.length === 0) { return null; }
+      const flags = computedFlags();
+      // Make extra sure that all rules are up to date.
+      // If not, fallback to the previous value.
+      // We need to make sure that all rules columns are created,
+      // sometimes there are more styles for a brief moment.
+      if (styles.length < flags.length) { return/* undefined */; }
+      // We will combine error information in the same computed value.
+      // If there is an error in rules - return it instead of the style.
+      const error = flags.some(f => !gristTypes.isValidRuleValue(f));
+      if (error) {
+        return { error };
+      }
+      // Combine them into a single style option.
+      return { style : new CombinedStyle(styles, flags) };
+    }, this).extend({ deferred: true })).previousOnUndefined();
+
+    const widgetObs = koUtil.withKoUtils(ko.computed(() => {
       // TODO: Accessing row values like this doesn't always work (row and field might not be updated
       // simultaneously).
       if (this.isDisposed()) { return null; }   // Work around JS errors during field removal.
       const value = row.cells[this.field.colId()];
       const cell = value && value();
-      if (value && this._isRightType()(cell, this.options) || row._isAddRow.peek()) {
+      if ((value) && this._isRightType()(cell, this.options) || row._isAddRow.peek()) {
         return this.widgetImpl();
       } else if (gristTypes.isVersions(cell)) {
         return this.diffImpl;
       } else {
         return null;
       }
-    }, this).extend({ deferred: true })).onlyNotifyUnequal();
+    }).extend({ deferred: true })).onlyNotifyUnequal();
 
+    const textColor = koUtil.withKoUtils(ko.computed(() => {
+      if (this.isDisposed()) { return null; }
+      const fromRules = computedRule()?.style?.textColor;
+      return fromRules || this.field.textColor() || '';
+    })).onlyNotifyUnequal();
+
+    const fillColor = koUtil.withKoUtils(ko.computed(() => {
+      if (this.isDisposed()) { return null; }
+      const fromRules = computedRule()?.style?.fillColor;
+      let fill = fromRules || this.field.fillColor();
+      fill = fill ? fill.toUpperCase() : fill;
+      return fill || '';
+    })).onlyNotifyUnequal();
+
+    const fontBold = buildFontOptions(this, computedRule, 'fontBold');
+    const fontItalic = buildFontOptions(this, computedRule, 'fontItalic');
+    const fontUnderline = buildFontOptions(this, computedRule, 'fontUnderline');
+    const fontStrikethrough = buildFontOptions(this, computedRule, 'fontStrikethrough');
+
+    const errorInStyle = ko.pureComputed(() => Boolean(computedRule()?.error));
 
     return (elem: Element) => {
       this._rowMap.set(row, elem);
       dom(elem,
           dom.autoDispose(widgetObs),
+          dom.autoDispose(computedFlags),
+          dom.autoDispose(errorInStyle),
+          dom.autoDispose(textColor),
+          dom.autoDispose(computedRule),
+          dom.autoDispose(fillColor),
+          dom.autoDispose(fontBold),
+          dom.autoDispose(fontItalic),
+          dom.autoDispose(fontUnderline),
+          dom.autoDispose(fontStrikethrough),
           this._options.isPreview ? null : kd.cssClass(this.field.formulaCssClass),
           kd.toggleClass("readonly", toKo(ko, this._readonly)),
           kd.maybe(isSelected, () => dom('div.selected_cursor',
@@ -443,8 +527,13 @@ export class FieldBuilder extends Disposable {
             if (this.isDisposed()) { return null; }   // Work around JS errors during field removal.
             const cellDom = widget ? widget.buildDom(row) : buildErrorDom(row, this.field);
             return dom(cellDom, kd.toggleClass('has_cursor', isActive),
-                       kd.style('--grist-cell-color', () => this.field.textColor() || ''),
-                       kd.style('--grist-cell-background-color', this.field.fillColor));
+                       kd.toggleClass('field-error-from-style', errorInStyle),
+                       kd.toggleClass('font-bold', fontBold),
+                       kd.toggleClass('font-underline', fontUnderline),
+                       kd.toggleClass('font-italic', fontItalic),
+                       kd.toggleClass('font-strikethrough', fontStrikethrough),
+                       kd.style('--grist-cell-color', textColor),
+                       kd.style('--grist-cell-background-color', fillColor));
           })
          );
     };
@@ -531,7 +620,8 @@ export class FieldBuilder extends Disposable {
     onCancel?: () => void) {
     const editorHolder = openFormulaEditor({
       gristDoc: this.gristDoc,
-      field: this.field,
+      column: this.field.column(),
+      editingFormula: this.field.editingFormula,
       setupCleanup: setupEditorCleanup,
       editRow,
       refElem,
@@ -546,4 +636,9 @@ export class FieldBuilder extends Disposable {
 
 const cssTypeSelectMenu = styled('div', `
   max-height: 500px;
+`);
+
+const cssSeparator = styled('div', `
+  border-bottom: 1px solid ${theme.pagePanelsBorder};
+  margin-top: 16px;
 `);

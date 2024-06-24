@@ -1,11 +1,13 @@
 import {FocusLayer} from 'app/client/lib/FocusLayer';
-import * as Mousetrap from 'app/client/lib/Mousetrap';
 import {reportError} from 'app/client/models/errors';
+import {cssInput} from 'app/client/ui/cssInput';
+import {prepareForTransition, TransitionWatcher} from 'app/client/ui/transitions';
 import {bigBasicButton, bigPrimaryButton, cssButton} from 'app/client/ui2018/buttons';
-import {colors, mediaSmall, testId, vars} from 'app/client/ui2018/cssVars';
+import {mediaSmall, testId, theme, vars} from 'app/client/ui2018/cssVars';
 import {loadingSpinner} from 'app/client/ui2018/loaders';
 import {waitGrainObs} from 'app/common/gutil';
-import {Computed, Disposable, dom, DomContents, DomElementArg, MultiHolder, Observable, styled} from 'grainjs';
+import {Computed, Disposable, dom, DomContents, DomElementArg, input, keyframes,
+  MultiHolder, Observable, styled} from 'grainjs';
 
 // IModalControl is passed into the function creating the body of the modal.
 export interface IModalControl {
@@ -36,7 +38,7 @@ export interface IModalControl {
   ): (...args: Args) => Promise<void>;
 }
 
-class ModalControl extends Disposable implements IModalControl {
+export class ModalControl extends Disposable implements IModalControl {
   private _inProgress = Observable.create<number>(this, 0);
   private _workInProgress = Computed.create(this, this._inProgress, (use, n) => (n > 0));
   private _closePromise: Promise<boolean>|undefined;
@@ -44,13 +46,13 @@ class ModalControl extends Disposable implements IModalControl {
 
   constructor(
     private _doClose: () => void,
-    private _doFocus: () => void,
+    private _doFocus?: () => void,
   ) {
     super();
   }
 
   public focus() {
-    this._doFocus();
+    this._doFocus?.();
   }
 
   public close(): void {
@@ -111,10 +113,25 @@ class ModalControl extends Disposable implements IModalControl {
   }
 }
 
-export interface IModalOptions {
-  noEscapeKey?: boolean;      // If set, escape key does not close the dialog
-  noClickAway?: boolean;      // If set, clicking into background does not close dialog.
+/**
+ * The modal variant.
+ *
+ * Fade-in modals open with a fade-in background animation, and close immediately.
+ *
+ * Collapsing modals open with a expanding animation from a referenced DOM element, and
+ * close with a collapsing animation into the referenced element.
+ */
+export type IModalVariant = 'fade-in' | 'collapsing';
 
+export interface IModalOptions {
+  // The modal variant. Defaults to "fade-in".
+  variant?: IModalVariant;
+  // Required for "collapsing" variant modals. This is the anchor element for animations.
+  refElement?: HTMLElement;
+  // If set, escape key does not close the dialog.
+  noEscapeKey?: boolean;
+  // If set, clicking into background does not close dialog.
+  noClickAway?: boolean;
   // If given, call and wait for this before closing the dialog. If it returns false, don't close.
   // Error also prevents closing, and is reported as an unexpected error.
   beforeClose?: () => Promise<boolean>;
@@ -152,43 +169,78 @@ export function modal(
   createFn: (ctl: IModalControl, owner: MultiHolder) => DomElementArg,
   options: IModalOptions = {}
 ): void {
+  const {noEscapeKey, noClickAway, refElement = document.body, variant = 'fade-in'} = options;
 
   function doClose() {
     if (!modalDom.isConnected) { return; }
+
+    variant === 'collapsing' ? collapseAndCloseModal() : closeModal();
+  }
+
+  function closeModal() {
     document.body.removeChild(modalDom);
     // Ensure we run the disposers for the DOM contained in the modal.
     dom.domDispose(modalDom);
   }
+
+  function collapseAndCloseModal() {
+    const watcher = new TransitionWatcher(dialogDom);
+    watcher.onDispose(() => closeModal());
+    modalDom.classList.add(cssModalBacker.className + '-collapsing');
+    collapseModal();
+  }
+
+  function expandModal() {
+    prepareForTransition(dialogDom, () => collapseModal());
+    Object.assign(dialogDom.style, {
+      transform: '',
+      opacity: '',
+      visibility: 'visible',
+    });
+  }
+
+  function collapseModal() {
+    const rect = dialogDom.getBoundingClientRect();
+    const collapsedRect = refElement.getBoundingClientRect();
+    const originX = (collapsedRect.left + collapsedRect.width / 2) - rect.left;
+    const originY = (collapsedRect.top + collapsedRect.height / 2) - rect.top;
+    Object.assign(dialogDom.style, {
+      transform: `scale(${collapsedRect.width / rect.width}, ${collapsedRect.height / rect.height})`,
+      transformOrigin: `${originX}px ${originY}px`,
+      opacity: '0',
+    });
+  }
+
   let close = doClose;
+  let dialogDom: HTMLElement;
 
   const modalDom = cssModalBacker(
     dom.create((owner) => {
-      // Pause mousetrap keyboard shortcuts while the modal is shown. Without this, arrow keys
-      // will navigate in a grid underneath the modal, and Enter may open a cell there.
-      Mousetrap.setPaused(true);
-      owner.onDispose(() => Mousetrap.setPaused(false));
-
-      const focus = () => dialog.focus();
+      const focus = () => dialogDom.focus();
       const ctl = ModalControl.create(owner, doClose, focus);
       close = () => ctl.close();
 
-      const dialog = cssModalDialog(
+      dialogDom = cssModalDialog(
         createFn(ctl, owner),
+        cssModalDialog.cls('-collapsing', variant === 'collapsing'),
         dom.on('click', (ev) => ev.stopPropagation()),
-        options.noEscapeKey ? null : dom.onKeyDown({ Escape: close }),
-        testId('modal-dialog')
+        noEscapeKey ? null : dom.onKeyDown({ Escape: close }),
+        testId('modal-dialog'),
       );
       FocusLayer.create(owner, {
-        defaultFocusElem: dialog,
+        defaultFocusElem: dialogDom,
         allowFocus: (elem) => (elem !== document.body),
+        // Pause mousetrap keyboard shortcuts while the modal is shown. Without this, arrow keys
+        // will navigate in a grid underneath the modal, and Enter may open a cell there.
+        pauseMousetrap: true
       });
-      return dialog;
+      return dialogDom;
     }),
-    options.noClickAway ? null : dom.on('click', () => close()),
+    noClickAway ? null : dom.on('click', () => close()),
   );
 
-
   document.body.appendChild(modalDom);
+  if (variant === 'collapsing') { expandModal(); }
 }
 
 export interface ISaveModalOptions {
@@ -290,6 +342,93 @@ export function confirmModal(
   }));
 }
 
+
+/**
+ * Creates a simple prompt modal (replacement for the native one).
+ * Closed via clicking anywhere outside the modal or Cancel button.
+ *
+ * Example usage:
+ *  promptModal(
+ *    "Enter your name",
+ *    (name: string) => alert(`Hello ${name}`),
+ *    "Ok" // Confirm button name,
+ *    "John doe", // Initial text (can be empty or undefined)
+ *    "Enter your name", // input placeholder
+ *    () => console.log('User cancelled') // Called when user cancels, or clicks outside.
+ *  )
+ *
+ * @param title: Prompt text.
+ * @param onConfirm: Handler for Confirm button.
+ * @param btnText: Text of the confirm button.
+ * @param initial: Initial value in the input element.
+ * @param placeholder: Placeholder for the input element.
+ * @param onCancel: Optional cancel handler.
+ */
+export function promptModal(
+  title: string,
+  onConfirm: (text: string) => Promise<unknown>,
+  btnText: string,
+  initial?: string,
+  placeholder?: string,
+  onCancel?: () => void
+): void {
+  saveModal((ctl, owner): ISaveModalOptions => {
+    let confirmed = false;
+    const text = Observable.create(owner, initial ?? '');
+    const txtInput = input(text, { onInput : true }, { placeholder }, cssInput.cls(''), testId('modal-prompt'));
+    const options: ISaveModalOptions = {
+      title,
+      body: txtInput,
+      saveLabel: btnText,
+      saveFunc: () => {
+        // Mark that confirm was invoked.
+        confirmed = true;
+        return onConfirm(text.get() || '');
+      },
+      width: 'normal'
+    };
+    owner.onDispose(() => {
+      if (confirmed) { return; }
+      onCancel?.();
+    });
+    setTimeout(() => txtInput.focus(), 10);
+    return options;
+  });
+}
+
+/**
+ * Wraps prompt modal in a promise that is resolved either when user confirms or cancels.
+ * When user cancels the returned value is always undefined.
+ *
+ * Example usage:
+ *  async handler() {
+ *    const name = await invokePrompt("Please enter your name");
+ *    if (name !== undefined) alert(`Hello ${name}`);
+ *  }
+ *
+ * @param title: Prompt text.
+ * @param btnText: Text of the confirm button, default is "Ok".
+ * @param initial: Initial value in the input element.
+ * @param placeholder: Placeholder for the input element.
+ */
+export function invokePrompt(
+  title: string,
+  btnText?: string,
+  initial?: string,
+  placeholder?: string
+): Promise<string|undefined> {
+  let onResolve: (text: string|undefined) => any;
+  const prom = new Promise<string|undefined>((resolve) => {
+    onResolve = resolve;
+  });
+  promptModal(title, onResolve!, btnText ?? 'Ok', initial, placeholder, () => {
+    if (onResolve) {
+      onResolve(undefined);
+    }
+  });
+  return prom;
+}
+
 /**
  * Builds a simple spinner modal. The modal gets removed when `promise` resolves.
  */
@@ -331,13 +470,16 @@ export function cssModalWidth(style: ModalWidth) {
 
 /* CSS styled components */
 
+// For centering, we use 'margin: auto' on the flex item instead of 'justify-content: center' on
+// the flex container, to ensure the full item can be scrolled in case of overflow.
+// See https://stackoverflow.com/a/33455342/328565
 const cssModalDialog = styled('div', `
-  background-color: white;
+  background-color: ${theme.modalBg};
   min-width: 428px;
-  color: black;
+  color: ${theme.darkText};
   margin: auto;
   border-radius: 3px;
-  box-shadow: 0 2px 18px 0 rgba(31,37,50,0.31), 0 0 1px 0 rgba(76,86,103,0.24);
+  box-shadow: 0 2px 18px 0 ${theme.modalInnerShadow}, 0 0 1px 0 ${theme.modalOuterShadow};
   padding: 40px 64px;
   outline: none;
 
@@ -346,6 +488,11 @@ const cssModalDialog = styled('div', `
   }
   &-fixed-wide {
     width: 600px;
+  }
+  &-collapsing {
+    transition-property: opacity, transform;
+    transition-duration: 0.4s;
+    transition-timing-function: ease-in-out;
   }
   @media ${mediaSmall} {
     & {
@@ -359,12 +506,14 @@ const cssModalDialog = styled('div', `
 export const cssModalTitle = styled('div', `
   font-size: ${vars.xxxlargeFontSize};
   font-weight: ${vars.headerControlTextWeight};
-  color: ${colors.dark};
+  color: ${theme.text};
   margin: 0 0 16px 0;
   line-height: 32px;
+  overflow-wrap: break-word;
 `);
 
 export const cssModalBody = styled('div', `
+  color: ${theme.text};
   margin: 16px 0;
 `);
 
@@ -377,9 +526,14 @@ export const cssModalButtons = styled('div', `
   }
 `);
 
-// For centering, we use 'margin: auto' on the flex item instead of 'justify-content: center' on
-// the flex container, to ensure the full item can be scrolled in case of overflow.
-// See https://stackoverflow.com/a/33455342/328565
+const cssFadeIn = keyframes(`
+  from {background-color: transparent}
+`);
+
+const cssFadeOut = keyframes(`
+  from {background-color: ${theme.modalBackdrop}}
+`);
+
 const cssModalBacker = styled('div', `
   position: fixed;
   display: flex;
@@ -390,8 +544,15 @@ const cssModalBacker = styled('div', `
   left: 0;
   padding: 16px;
   z-index: 999;
-  background-color: ${colors.backdrop};
+  background-color: ${theme.modalBackdrop};
   overflow-y: auto;
+  animation-name: ${cssFadeIn};
+  animation-duration: 0.4s;
+
+  &-collapsing {
+    animation-name: ${cssFadeOut};
+    background-color: transparent;
+  }
 `);
 
 const cssSpinner = styled('div', `

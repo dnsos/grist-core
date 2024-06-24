@@ -135,7 +135,7 @@ class TestUserActions(test_engine.EngineTestCase):
     ])
 
     # Add a new column with a formula.
-    self.apply_user_action(['AddColumn', 'Favorites', 'fav_viewers', {
+    self.apply_user_action(['AddVisibleColumn', 'Favorites', 'fav_viewers', {
       'formula': '$favorite.viewers'
     }])
     # Add a field back for the favorites table and set its display formula to the
@@ -388,7 +388,7 @@ class TestUserActions(test_engine.EngineTestCase):
         ["RemoveRecord", "_grist_Tables_column", 28],
         ["RemoveColumn", "People", "gristHelper_Display2"],
       ],
-      "direct": [True, True, True, True, True, True],
+      "direct": [True, True, True, True, False, False],
       "undo": [
         ["BulkUpdateRecord", "People", [1, 2, 3], {"gristHelper_Display2": ["Netflix", "HBO", "NBC"]}],
         ["BulkUpdateRecord", "People", [1, 2, 3], {"gristHelper_Display": ["Narcos", "Game of Thrones", "Today"]}],

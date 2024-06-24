@@ -15,7 +15,7 @@
  * Run `bin/mocha 'test/nbrowser/*.ts' -b --no-exit` to open a command-line prompt on
  * first-failure for debugging and quick reruns.
  */
-import * as log from 'app/server/lib/log';
+import log from 'app/server/lib/log';
 import {addToRepl, assert, driver, enableDebugCapture, Key, setOptionsModifyFunc, useServer} from 'mocha-webdriver';
 import * as gu from 'test/nbrowser/gristUtils';
 import {server} from 'test/nbrowser/testServer';
@@ -82,7 +82,9 @@ export function setupTestSuite(options?: TestSuiteOptions) {
   checkForExtraWindows();
 
   // After every suite, clear sessionStorage and localStorage to avoid affecting other tests.
-  after(clearCurrentWindowStorage);
+  if (!process.env.NO_CLEANUP) {
+    after(clearCurrentWindowStorage);
+  }
   // Also, log out, to avoid logins interacting, unless NO_CLEANUP is requested (useful for
   // debugging tests).
   if (!process.env.NO_CLEANUP) {
@@ -97,6 +99,10 @@ export function setupTestSuite(options?: TestSuiteOptions) {
   // Though unlikely it is possible that the server was left paused by a previous test, so let's
   // always call resume.
   afterEach(() => server.resume());
+
+  // Close database until next test explicitly needs it, to avoid conflicts
+  // with tests that don't use the same server.
+  after(async () => server.closeDatabase());
 
   return setupRequirement({team: true, ...options});
 }
